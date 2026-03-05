@@ -1,0 +1,13 @@
+{
+    "name": "vendor/pml",
+    "description": "Description of project pml.",
+    "authors": [
+        {
+            "name": "ghost",
+            "email": "your@email.here"
+        }
+    ],
+    "require": {
+        "rubix/ml": "dev-master"
+    }
+}
