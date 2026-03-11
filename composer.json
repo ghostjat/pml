@@ -7,7 +7,13 @@
             "email": "your@email.here"
         }
     ],
+    "autoload": {
+        "psr-4": {
+            "Pml\\": "src/"
+        }
+    },
     "require": {
-        "rubix/ml": "dev-master"
+        "rubix/ml": "dev-master",
+        "codeigniter4/appstarter": "dev-master"
     }
 }

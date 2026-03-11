@@ -54,17 +54,28 @@ class ComposerStaticInita980f9fae28165ba78745db18ffee105
         'P' => 
         array (
             'Psr\\Log\\' => 8,
+            'Pml\\' => 4,
         ),
         'O' => 
         array (
             'OkBloomer\\' => 10,
         ),
+        'L' => 
+        array (
+            'Laminas\\Escaper\\' => 16,
+        ),
         'J' => 
         array (
             'Joomla\\String\\' => 14,
         ),
+        'C' => 
+        array (
+            'Config\\' => 7,
+            'CodeIgniter\\' => 12,
+        ),
         'A' => 
         array (
+            'App\\' => 4,
             'Amp\\Sync\\' => 9,
             'Amp\\Serialization\\' => 18,
             'Amp\\Process\\' => 12,
@@ -112,13 +123,33 @@ class ComposerStaticInita980f9fae28165ba78745db18ffee105
         array (
             0 => __DIR__ . '/..' . '/psr/log/src',
         ),
+        'Pml\\' => 
+        array (
+            0 => __DIR__ . '/../..' . '/src',
+        ),
         'OkBloomer\\' => 
         array (
             0 => __DIR__ . '/..' . '/andrewdalpino/okbloomer/src',
         ),
+        'Laminas\\Escaper\\' => 
+        array (
+            0 => __DIR__ . '/..' . '/laminas/laminas-escaper/src',
+        ),
         'Joomla\\String\\' => 
         array (
             0 => __DIR__ . '/..' . '/joomla/string/src',
+        ),
+        'Config\\' => 
+        array (
+            0 => __DIR__ . '/..' . '/codeigniter4/appstarter/app/Config',
+        ),
+        'CodeIgniter\\' => 
+        array (
+            0 => __DIR__ . '/..' . '/codeigniter4/framework/system',
+        ),
+        'App\\' => 
+        array (
+            0 => __DIR__ . '/..' . '/codeigniter4/appstarter/app',
         ),
         'Amp\\Sync\\' => 
         array (
