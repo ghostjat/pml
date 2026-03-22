@@ -7,4 +7,14 @@ $baseDir = dirname($vendorDir);
 
 return array(
     'Composer\\InstalledVersions' => $vendorDir . '/composer/InstalledVersions.php',
+    'Pml\\BlasEngine' => $baseDir . '/src/BlasEngine.php',
+    'Pml\\Generation\\Sampler' => $baseDir . '/src/Generation/Sampler.php',
+    'Pml\\Generation\\SimpleTokenizer' => $baseDir . '/src/Generation/SimpleTokenizer.php',
+    'Pml\\IO\\SafetensorsLoader' => $baseDir . '/src/IO/SafetensorsLoader.php',
+    'Pml\\LLM' => $baseDir . '/src/LLM.php',
+    'Pml\\Layers\\SelfAttention' => $baseDir . '/src/Layers/SelfAttention.php',
+    'Pml\\Layers\\TransformerBlock' => $baseDir . '/src/Layers/TransformerBlock.php',
+    'Pml\\LinAlg' => $baseDir . '/src/LinAlg.php',
+    'Pml\\Ops' => $baseDir . '/src/Ops.php',
+    'Pml\\Tensor' => $baseDir . '/src/Tensor.php',
 );
