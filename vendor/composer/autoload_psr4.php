@@ -6,27 +6,5 @@ $vendorDir = dirname(__DIR__);
 $baseDir = dirname($vendorDir);
 
 return array(
-    'Zephir\\Optimizers\\FunctionCall\\' => array($vendorDir . '/rubix/tensor/optimizers'),
-    'Wamania\\Snowball\\' => array($vendorDir . '/wamania/php-stemmer/src'),
-    'Tensor\\' => array($vendorDir . '/rubix/tensor/src'),
-    'Symfony\\Polyfill\\Php83\\' => array($vendorDir . '/symfony/polyfill-php83'),
-    'Symfony\\Polyfill\\Php82\\' => array($vendorDir . '/symfony/polyfill-php82'),
-    'Symfony\\Polyfill\\Php80\\' => array($vendorDir . '/symfony/polyfill-php80'),
-    'Symfony\\Polyfill\\Mbstring\\' => array($vendorDir . '/symfony/polyfill-mbstring'),
-    'Rubix\\ML\\' => array($vendorDir . '/rubix/ml/src'),
-    'Psr\\Log\\' => array($vendorDir . '/psr/log/src'),
     'Pml\\' => array($baseDir . '/src'),
-    'OkBloomer\\' => array($vendorDir . '/andrewdalpino/okbloomer/src'),
-    'Laminas\\Escaper\\' => array($vendorDir . '/laminas/laminas-escaper/src'),
-    'Joomla\\String\\' => array($vendorDir . '/joomla/string/src'),
-    'Config\\' => array($vendorDir . '/codeigniter4/appstarter/app/Config'),
-    'CodeIgniter\\' => array($vendorDir . '/codeigniter4/framework/system'),
-    'App\\' => array($vendorDir . '/codeigniter4/appstarter/app'),
-    'Amp\\Sync\\' => array($vendorDir . '/amphp/sync/src'),
-    'Amp\\Serialization\\' => array($vendorDir . '/amphp/serialization/src'),
-    'Amp\\Process\\' => array($vendorDir . '/amphp/process/lib'),
-    'Amp\\Parser\\' => array($vendorDir . '/amphp/parser/src'),
-    'Amp\\Parallel\\' => array($vendorDir . '/amphp/parallel/lib'),
-    'Amp\\ByteStream\\' => array($vendorDir . '/amphp/byte-stream/lib'),
-    'Amp\\' => array($vendorDir . '/amphp/amp/lib'),
 );
