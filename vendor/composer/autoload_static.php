@@ -23,6 +23,7 @@ class ComposerStaticInita980f9fae28165ba78745db18ffee105
     public static $classMap = array (
         'Composer\\InstalledVersions' => __DIR__ . '/..' . '/composer/InstalledVersions.php',
         'Pml\\BlasEngine' => __DIR__ . '/../..' . '/src/BlasEngine.php',
+        'Pml\\Generation\\KVCache' => __DIR__ . '/../..' . '/src/Generation/KVCache.php',
         'Pml\\Generation\\Sampler' => __DIR__ . '/../..' . '/src/Generation/Sampler.php',
         'Pml\\Generation\\SimpleTokenizer' => __DIR__ . '/../..' . '/src/Generation/SimpleTokenizer.php',
         'Pml\\IO\\SafetensorsLoader' => __DIR__ . '/../..' . '/src/IO/SafetensorsLoader.php',

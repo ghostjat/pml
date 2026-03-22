@@ -8,6 +8,7 @@ $baseDir = dirname($vendorDir);
 return array(
     'Composer\\InstalledVersions' => $vendorDir . '/composer/InstalledVersions.php',
     'Pml\\BlasEngine' => $baseDir . '/src/BlasEngine.php',
+    'Pml\\Generation\\KVCache' => $baseDir . '/src/Generation/KVCache.php',
     'Pml\\Generation\\Sampler' => $baseDir . '/src/Generation/Sampler.php',
     'Pml\\Generation\\SimpleTokenizer' => $baseDir . '/src/Generation/SimpleTokenizer.php',
     'Pml\\IO\\SafetensorsLoader' => $baseDir . '/src/IO/SafetensorsLoader.php',
