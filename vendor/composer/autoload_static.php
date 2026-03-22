@@ -22,17 +22,6 @@ class ComposerStaticInita980f9fae28165ba78745db18ffee105
 
     public static $classMap = array (
         'Composer\\InstalledVersions' => __DIR__ . '/..' . '/composer/InstalledVersions.php',
-        'Pml\\BlasEngine' => __DIR__ . '/../..' . '/src/BlasEngine.php',
-        'Pml\\Generation\\KVCache' => __DIR__ . '/../..' . '/src/Generation/KVCache.php',
-        'Pml\\Generation\\Sampler' => __DIR__ . '/../..' . '/src/Generation/Sampler.php',
-        'Pml\\Generation\\SimpleTokenizer' => __DIR__ . '/../..' . '/src/Generation/SimpleTokenizer.php',
-        'Pml\\IO\\SafetensorsLoader' => __DIR__ . '/../..' . '/src/IO/SafetensorsLoader.php',
-        'Pml\\LLM' => __DIR__ . '/../..' . '/src/LLM.php',
-        'Pml\\Layers\\SelfAttention' => __DIR__ . '/../..' . '/src/Layers/SelfAttention.php',
-        'Pml\\Layers\\TransformerBlock' => __DIR__ . '/../..' . '/src/Layers/TransformerBlock.php',
-        'Pml\\LinAlg' => __DIR__ . '/../..' . '/src/LinAlg.php',
-        'Pml\\Ops' => __DIR__ . '/../..' . '/src/Ops.php',
-        'Pml\\Tensor' => __DIR__ . '/../..' . '/src/Tensor.php',
     );
 
     public static function getInitializer(ClassLoader $loader)

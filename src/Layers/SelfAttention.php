@@ -5,6 +5,7 @@ namespace Pml\Layers;
 
 use Pml\Tensor;
 use Pml\Ops;
+use Pml\Generation\KVCache;
 
 class SelfAttention 
 {
@@ -21,34 +22,45 @@ class SelfAttention
         $this->headDim = $wq->shape[1] / $nHeads;
     }
 
-    public function forward(Tensor $x): Tensor 
+    /**
+     * Unified forward pass. 
+     * If $cache is provided, it processes a single token and updates the cache.
+     * If $cache is null, it performs standard full-sequence attention.
+     */
+    public function forward(Tensor $x, ?KVCache $cache = null): Tensor 
     {
         // 1. Project Q, K, V
-        $q = Ops::matmul($x, $this->wq);
-        $k = Ops::matmul($x, $this->wk);
-        $v = Ops::matmul($x, $this->wv);
+        $q = Ops::matmul($x, $this->wq); 
+        $k = Ops::matmul($x, $this->wk); 
+        $v = Ops::matmul($x, $this->wv); 
 
-        // NOTE: In a full implementation, you would apply RoPE (Rotary Embeddings) 
-        // to Q and K here, and reshape them for Multi-Head Attention.
-        // For this skeletal representation, we perform standard attention.
+        if ($cache !== null) {
+            // --- CACHED ROUTING (O(N) single token step) ---
+            $cache->append($k, $v);
+            $kActive = $cache->getActiveK();
+            $vActive = $cache->getActiveV();
 
-        // 2. Q * K^T
-        $scores = Ops::matmul($q, $k, false, true);
+            $scores = Ops::matmul($q, $kActive, false, true);
+            $this->scaleAndSoftmax($scores);
+            $context = Ops::matmul($scores, $vActive);
+            
+        } else {
+            // --- STANDARD ROUTING (O(N^2) full sequence) ---
+            $scores = Ops::matmul($q, $k, false, true);
+            $this->scaleAndSoftmax($scores);
+            $context = Ops::matmul($scores, $v);
+        }
 
-        // 3. Scale by 1/sqrt(d_k)
+        // Final output projection
+        return Ops::matmul($context, $this->wo);
+    }
+
+    private function scaleAndSoftmax(Tensor $scores): void 
+    {
         $scale = 1.0 / sqrt($this->headDim);
         for ($i = 0; $i < $scores->size; $i++) {
             $scores->buffer[$i] *= $scale;
         }
-
-        // 4. Softmax
         Ops::softmax($scores);
-
-        // 5. Scores * V
-        $context = Ops::matmul($scores, $v);
-
-        // 6. Final output projection
-        return Ops::matmul($context, $this->wo);
     }
 }
-

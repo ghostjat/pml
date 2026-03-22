@@ -1,39 +1,44 @@
 <?php
 
 declare(strict_types=1);
+
 namespace Pml\Layers;
 
-use Pml\Layers\SelfAttention;
+use Pml\{Tensor, Ops, BlasEngine};
+use Pml\Layers\{MultiHeadAttention,FeedForward,KVCache};
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  TRANSFORMER BLOCK (LLaMA/Mistral-style with RMSNorm + SwiGLU)
+// ═══════════════════════════════════════════════════════════════════════════
 
 class TransformerBlock
 {
-    private SelfAttention $attention;
-    private Tensor $norm1Weight;
-    // ... MLP weights (w1, w2, w3) would go here ...
+    public function __construct(
+        private readonly MultiHeadAttention $attention,
+        private readonly FeedForward        $ffn,
+        private readonly Tensor             $normAttn,  // RMSNorm weight [d_model]
+        private readonly Tensor             $normFFN,   // RMSNorm weight [d_model]
+        private readonly float              $rmsEps = 1e-5,
+    ) {}
 
-    public function __construct(SelfAttention $attn, Tensor $norm1) 
+    /**
+     * Pre-norm residual block:
+     *   x = x + Attention(RMSNorm(x))
+     *   x = x + FFN(RMSNorm(x))
+     */
+    public function forward(Tensor $x, ?KVCache $cache = null, int $pos = 0): Tensor
     {
-        $this->attention = $attn;
-        $this->norm1Weight = $norm1;
-    }
+        // ── Attention sub-layer ─────────────────────────────────────────────
+        $residual = $x->clone();
+        Ops::rmsNormInPlace($x, $this->normAttn, $this->rmsEps);
+        $attnOut = $this->attention->forward($x, $cache, $pos);
+        Ops::saxpy($attnOut, $residual, 1.0); // residual += attnOut
 
-    public function forward(Tensor $x): Tensor 
-    {
-        // Save residual
-        $residual = new Tensor($x->shape);
-        \FFI::memcpy($residual->buffer, $x->buffer, $x->size * 4);
-
-        // Pre-normalization
-        Ops::rmsNorm($x, $this->norm1Weight);
-
-        // Attention
-        $attnOut = $this->attention->forward($x);
-
-        // Add residual (x = x + attnOut)
-        Ops::addInPlace($residual, $attnOut);
-
-        // ... Feed Forward Network (MLP) would go here, 
-        // following the same Norm -> MLP -> Add Residual pattern ...
+        // ── FFN sub-layer ───────────────────────────────────────────────────
+        $x2 = $residual->clone();
+        Ops::rmsNormInPlace($x2, $this->normFFN, $this->rmsEps);
+        $ffnOut = $this->ffn->forward($x2);
+        Ops::saxpy($ffnOut, $residual, 1.0); // residual += ffnOut
 
         return $residual;
     }
