@@ -1,0 +1,94 @@
+## YAML Template.
+---
+name: PML Native Build (FFI + BLAS + LAPACK + XGBoost)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      LD_LIBRARY_PATH: /usr/local/lib:/usr/lib
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------
+      # PHP + FFI
+      # --------------------------------------------------
+      - name: Setup PHP with FFI
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: 8.2
+          extensions: ffi
+          ini-values: ffi.enable=1
+          coverage: none
+          tools: composer
+
+      - name: Verify PHP + FFI
+        run: |
+          php -v
+          php -m | grep ffi
+
+      # --------------------------------------------------
+      # Install optimized math backend
+      # --------------------------------------------------
+      - name: Install OpenBLAS + LAPACK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libopenblas-dev \
+            liblapack-dev \
+            gfortran \
+            build-essential \
+            cmake \
+            pkg-config
+
+      - name: Verify BLAS
+        run: ldconfig -p | grep blas || true
+
+      # --------------------------------------------------
+      # Build XGBoost (prebuilt native library)
+      # --------------------------------------------------
+      - name: Build XGBoost C library
+        run: |
+          git clone --recursive https://github.com/dmlc/xgboost.git
+          cd xgboost
+          mkdir build && cd build
+          cmake .. -DUSE_OPENMP=ON -DBUILD_SHARED_LIBS=ON
+          make -j$(nproc)
+          sudo make install
+
+      - name: Verify XGBoost install
+        run: ldconfig -p | grep xgboost || true
+
+      # --------------------------------------------------
+      # Composer dependencies
+      # --------------------------------------------------
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist
+
+      # --------------------------------------------------
+      # Run tests (numeric stability tests)
+      # --------------------------------------------------
+      - name: Run PHPUnit
+        run: |
+          if [ -f vendor/bin/phpunit ]; then
+            vendor/bin/phpunit
+          else
+            echo "No tests found yet"
+          fi
+
+      # --------------------------------------------------
+      # Benchmark (optional but useful for ML library)
+      # --------------------------------------------------
+      - name: Run performance tests
+        run: |
+          if [ -f benchmark/run.php ]; then
+            php benchmark/run.php
+          fi

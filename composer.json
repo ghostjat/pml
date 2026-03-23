@@ -29,5 +29,9 @@
         "files": [
             "src/Classic/Pipeline/make_pipeline.php"
         ]
-    }
+    },
+    "require": {
+    "php": "^8.1",
+    "ext-ffi": "*"
+  }
 }
