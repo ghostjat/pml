@@ -35,11 +35,25 @@ final class Ops
         float  $beta  = 0.0,
         ?Tensor $C    = null
     ): Tensor {
-        // Resolve effective transpose flags (Tensor::T() sets _transposed)
+        // ── JIT Int8 Dequantisation ────────────────────────────────────────
+        // Keep references to the ORIGINAL tensors for the autograd graph.
+        // INT8 tensors have requiresGrad=false, so the backward will skip
+        // them automatically — no gradient flows through quantised weights.
+        $origA = $A;
+        $origB = $B;
+        if ($A->dtype === Tensor::INT8) { $A = $A->dequantize(); }
+        if ($B->dtype === Tensor::INT8) { $B = $B->dequantize(); }
+
+        // ── Resolve effective transpose flags ─────────────────────────────
+        // Tensor::T() sets _transposed=true; the $transA/$transB parameters
+        // provide an alternative: pass the weight matrix directly and set the
+        // flag here.  Both paths set the BLAS CblasTrans/CblasNoTrans bit.
         $effTransA = $transA || $A->_transposed;
         $effTransB = $transB || $B->_transposed;
 
-        // Effective shapes after transpose
+        // Effective (mathematical) dimensions of op(A)[M,K] and op(B)[K,N].
+        // When _transposed is set, the stored shape is already reversed by T(),
+        // so we reverse it back to get the physical [rows, cols].
         [$Arows, $Acols] = $A->_transposed
             ? [$A->shape[1], $A->shape[0]]
             : [$A->shape[0], $A->shape[1]];
@@ -47,9 +61,9 @@ final class Ops
             ? [$B->shape[1], $B->shape[0]]
             : [$B->shape[0], $B->shape[1]];
 
-        $M = $effTransA ? $Acols : $Arows;
-        $K = $effTransA ? $Arows : $Acols;
-        $N = $effTransB ? $Brows : $Bcols;
+        $M  = $effTransA ? $Acols : $Arows;
+        $K  = $effTransA ? $Arows : $Acols;
+        $N  = $effTransB ? $Brows : $Bcols;
         $K2 = $effTransB ? $Bcols : $Brows;
 
         if ($K !== $K2) {
@@ -60,7 +74,7 @@ final class Ops
 
         $out = $C ?? new Tensor([$M, $N]);
 
-        // Leading dimensions are always the PHYSICAL column count
+        // Leading dimensions are always the PHYSICAL column count.
         $lda = $A->shape[1];
         $ldb = $B->shape[1];
         $ldc = $N;
@@ -76,6 +90,142 @@ final class Ops
             $beta,
             $out->buffer, $ldc
         );
+
+        // ── Build computational graph (autograd) ─────────────────────────
+        // Only pay the graph-construction cost when at least one input is a
+        // learnable parameter (requiresGrad=true).  During pure inference
+        // everything is false and this block is a no-op.
+        if ($origA->requiresGrad || $origB->requiresGrad) {
+            $out->requiresGrad = true;
+            $out->_prev        = [$origA, $origB];
+
+            // Physical column counts — BLAS "leading dimension" for each buffer.
+            //
+            // For op(A)[M,K]:
+            //   !effTransA → A_phys is [M,K], physical cols = K
+            //    effTransA → A_phys is [K,M], physical cols = M
+            // For op(B)[K,N]:
+            //   !effTransB → B_phys is [K,N], physical cols = N
+            //    effTransB → B_phys is [N,K], physical cols = K
+            $physACols = $effTransA ? $M : $K;
+            $physBCols = $effTransB ? $K : $N;
+
+            // Snapshot values the closure needs; closures are long-lived.
+            $fA = $effTransA;
+            $fB = $effTransB;
+            $_M = $M;
+            $_K = $K;
+            $_N = $N;
+
+            // ── _backward closure ─────────────────────────────────────────
+            //
+            // Forward:  C[M,N]   = op(A)[M,K] @ op(B)[K,N]
+            //
+            // Backward rules (chain rule through matrix multiply):
+            //
+            //   dL/d(op(A))[M,K] = dC[M,N] @ op(B)^T[N,K]
+            //   dL/d(op(B))[K,N] = op(A)^T[K,M] @ dC[M,N]
+            //
+            // When an operand was PHYSICALLY transposed (effTransA/B), the
+            // stored buffer has shape [K,M] or [N,K] respectively.  We must
+            // further transpose the effective gradient back to match the
+            // physical storage layout before accumulating.
+            //
+            // All four combinations are covered below:
+            //
+            //  Case ─────── dA_phys computation (BLAS call) ──────────────────────────────────────
+            //  !fA !fB   dA[M,K] = dC[M,N] @ B_phys[K,N]^T      → sgemm(NT,T,  M,K,N, dC,N, B,N)
+            //  !fA  fB   dA[M,K] = dC[M,N] @ B_phys[N,K]        → sgemm(NT,NT, M,K,N, dC,N, B,K)
+            //   fA !fB   dA[K,M] = B_phys[K,N] @ dC[M,N]^T      → sgemm(NT,T,  K,M,N, B,N,  dC,N)
+            //   fA  fB   dA[K,M] = B_phys[N,K]^T @ dC[M,N]^T    → sgemm(T, T,  K,M,N, B,K,  dC,N)
+            //
+            //  Case ─────── dB_phys computation (BLAS call) ──────────────────────────────────────
+            //  !fA !fB   dB[K,N] = A_phys[M,K]^T @ dC[M,N]      → sgemm(T, NT, K,N,M, A,K,  dC,N)
+            //   fA !fB   dB[K,N] = A_phys[K,M]   @ dC[M,N]      → sgemm(NT,NT, K,N,M, A,M,  dC,N)
+            //  !fA  fB   dB[N,K] = dC[M,N]^T @ A_phys[M,K]      → sgemm(T, NT, N,K,M, dC,N, A,K)
+            //   fA  fB   dB[N,K] = dC[M,N]^T @ A_phys[K,M]^T    → sgemm(T, T,  N,K,M, dC,N, A,M)
+            //
+            // All calls accumulate (beta=1.0) so gradients from multiple uses
+            // of the same parameter are correctly summed.
+
+            $out->_backward = static function()
+                use ($origA, $origB, $A, $B, $out,
+                     $fA, $fB, $_M, $_K, $_N, $physACols, $physBCols): void
+            {
+                $ffi = BlasEngine::get()->ffi;
+                $dC  = $out->grad; // incoming gradient: shape [M,N], ldc=N
+
+                // ── Gradient for A ────────────────────────────────────────
+                if ($origA->requiresGrad) {
+                    $origA->initGrad();
+
+                    if (!$fA) {
+                        // dA_phys[M,K] = dC[M,N] @ op(B)^T[N,K]
+                        // op(B)^T = B_phys^T if !fB, else B_phys
+                        $ffi->cblas_sgemm(
+                            101,           // RowMajor
+                            111,           // NoTrans  — dC
+                            $fB ? 111 : 112, // NoTrans B_phys (already gives K cols) OR Trans
+                            $_M, $_K, $_N,
+                            1.0,
+                            $dC, $_N,                         // lda = N (dC cols)
+                            $B->buffer, $physBCols,           // ldb = physBCols
+                            1.0,                              // accumulate
+                            $origA->grad, $physACols          // ldc = K (!fA)
+                        );
+                    } else {
+                        // dA_phys[K,M] = op(B)[K,N] @ dC^T[N,M]
+                        // op(B) = B_phys if !fB, else B_phys^T
+                        $ffi->cblas_sgemm(
+                            101,
+                            $fB ? 112 : 111, // Trans B_phys → op(B) when fB, else NoTrans
+                            112,             // Trans  — dC
+                            $_K, $_M, $_N,
+                            1.0,
+                            $B->buffer, $physBCols,
+                            $dC, $_N,
+                            1.0,
+                            $origA->grad, $physACols          // ldc = M (fA)
+                        );
+                    }
+                }
+
+                // ── Gradient for B ────────────────────────────────────────
+                if ($origB->requiresGrad) {
+                    $origB->initGrad();
+
+                    if (!$fB) {
+                        // dB_phys[K,N] = op(A)^T[K,M] @ dC[M,N]
+                        // op(A)^T = A_phys^T if !fA, else A_phys
+                        $ffi->cblas_sgemm(
+                            101,
+                            $fA ? 111 : 112, // NoTrans A_phys (already K×M) OR Trans
+                            111,             // NoTrans — dC
+                            $_K, $_N, $_M,
+                            1.0,
+                            $A->buffer, $physACols,
+                            $dC, $_N,
+                            1.0,
+                            $origB->grad, $physBCols          // ldc = N (!fB)
+                        );
+                    } else {
+                        // dB_phys[N,K] = dC^T[N,M] @ op(A)[M,K]
+                        // op(A) = A_phys^T if !fA, else A_phys
+                        $ffi->cblas_sgemm(
+                            101,
+                            112,             // Trans — dC
+                            $fA ? 112 : 111, // Trans A_phys → op(A) when fA, else NoTrans
+                            $_N, $_K, $_M,
+                            1.0,
+                            $dC, $_N,
+                            $A->buffer, $physACols,
+                            1.0,
+                            $origB->grad, $physBCols          // ldc = K (fB)
+                        );
+                    }
+                }
+            };
+        }
 
         return $out;
     }
@@ -151,11 +301,41 @@ final class Ops
 
     /**
      * Add: C = A + B (element-wise). Returns new tensor.
+     *
+     * Forward:   C[i] = A[i] + B[i]
+     *
+     * Backward (chain rule, addition distributes gradient equally):
+     *   dL/dA[i] += dL/dC[i]    (saxpy alpha=1.0)
+     *   dL/dB[i] += dL/dC[i]    (saxpy alpha=1.0)
+     *
+     * A and B must have identical sizes (no broadcasting).
      */
     public static function add(Tensor $A, Tensor $B): Tensor
     {
         $C = $A->clone();
         self::saxpy($B, $C, 1.0);
+
+        if ($A->requiresGrad || $B->requiresGrad) {
+            $C->requiresGrad = true;
+            $C->_prev        = [$A, $B];
+
+            $C->_backward = static function() use ($A, $B, $C): void {
+                $ffi = BlasEngine::get()->ffi;
+
+                // dA += dC  — gradient flows through addition unchanged
+                if ($A->requiresGrad) {
+                    $A->initGrad();
+                    $ffi->cblas_saxpy($C->size, 1.0, $C->grad, 1, $A->grad, 1);
+                }
+
+                // dB += dC  — same gradient, same alpha
+                if ($B->requiresGrad) {
+                    $B->initGrad();
+                    $ffi->cblas_saxpy($C->size, 1.0, $C->grad, 1, $B->grad, 1);
+                }
+            };
+        }
+
         return $C;
     }
 
@@ -442,6 +622,300 @@ final class Ops
         }
     }
 
+    // ── Differentiable Normalization ──────────────────────────────────────
+
+    /**
+     * Differentiable Root Mean Square Normalization (RMSNorm).
+     *
+     * Used in LLaMA / Mistral / Gemma as a lightweight alternative to LayerNorm.
+     * Applied row-by-row on a 2D input [rows, d]; $w is a learnable scale vector [d].
+     *
+     * ── Forward (per row t) ──────────────────────────────────────────────
+     *
+     *   ss_t   = (1/d) · Σ_i x[t,i]²          (mean of squares)
+     *   rms_t  = √(ss_t + ε)                   (root mean square + stability)
+     *   xhat[t,i] = x[t,i] / rms_t             (normalised value)
+     *   y[t,i]    = xhat[t,i] · w[i]           (scale by learnable weight)
+     *
+     * ── Backward ────────────────────────────────────────────────────────
+     *
+     *   dL/dw[i] = Σ_t ( dL/dy[t,i] · xhat[t,i] )
+     *            = Σ_t ( dL/dy[t,i] · x[t,i] / rms_t )
+     *
+     *   For x (per row t), let dP[t,i] = dL/dy[t,i] · w[i]  (grad w.r.t. xhat):
+     *
+     *     DOT_t = Σ_i ( dP[t,i] · x[t,i] )          (dot product in feature space)
+     *
+     *     dL/dx[t,i] = (1/rms_t) · dP[t,i]
+     *                - (x[t,i] / (d · rms_t³)) · DOT_t
+     *
+     *   Derivation: d(x_k / rms) / dx_i uses the quotient rule with dr/dx_i = x_i/(d·rms),
+     *   which yields the cross-term (x_i·DOT)/(d·rms³) subtracted from the diagonal term.
+     *
+     * @param Tensor $x    [seqLen, d] — 2D input, requiresGrad may be true.
+     * @param Tensor $w    [d]         — learnable scale, requiresGrad may be true.
+     * @param float  $eps  Stability epsilon (default 1e-6).
+     * @return Tensor      [seqLen, d] — normalised + scaled output.
+     */
+    public static function rmsNorm(Tensor $x, Tensor $w, float $eps = 1e-6): Tensor
+    {
+        if (count($x->shape) !== 2) {
+            throw new \InvalidArgumentException('rmsNorm: $x must be a 2D tensor [rows, d].');
+        }
+        [$rows, $d] = $x->shape;
+
+        if ($w->size !== $d) {
+            throw new \InvalidArgumentException(
+                "rmsNorm: weight size {$w->size} does not match last dimension d={$d}."
+            );
+        }
+
+        $out = Tensor::zeros([$rows, $d]);
+
+        // rmsVals[$t] = rms_t for the backward pass.
+        // Storing them avoids recomputing sum(x²) during backward.
+        $rmsVals = [];
+
+        for ($t = 0; $t < $rows; $t++) {
+            $off = $t * $d;
+
+            // ── Step 1: mean of squares (ss_t) ───────────────────────────
+            // Use a PHP loop: BLAS sdot(x, x) also works but adds an FFI cast;
+            // the loop is simpler and the d dimension is small (64).
+            $ss = 0.0;
+            for ($i = 0; $i < $d; $i++) {
+                $v   = (float) $x->buffer[$off + $i];
+                $ss += $v * $v;
+            }
+            $rms         = sqrt($ss / $d + $eps);
+            $rmsVals[$t] = $rms;
+
+            // ── Step 2: y[t,i] = (x[t,i] / rms_t) * w[i] ───────────────
+            for ($i = 0; $i < $d; $i++) {
+                $out->buffer[$off + $i] =
+                    ((float) $x->buffer[$off + $i] / $rms) * (float) $w->buffer[$i];
+            }
+        }
+
+        // ── Autograd graph ────────────────────────────────────────────────
+        if ($x->requiresGrad || $w->requiresGrad) {
+            $out->requiresGrad = true;
+            $out->_prev        = [$x, $w];
+
+            $capturedRms = $rmsVals; // PHP copies the array by value — safe.
+
+            $out->_backward = static function ()
+                use ($x, $w, $out, $rows, $d, $capturedRms): void
+            {
+                // ── dL/dw: accumulate over all rows ──────────────────────
+                //
+                //   dL/dw[i] += dL/dy[t,i] * x[t,i] / rms_t   for each row t
+                //
+                if ($w->requiresGrad) {
+                    $w->initGrad();
+                }
+
+                // ── dL/dx: per-row backward pass ─────────────────────────
+                //
+                //   dP[t,i] = dL/dy[t,i] * w[i]          (upstream grad w.r.t. xhat)
+                //   DOT_t   = Σ_i ( dP[t,i] * x[t,i] )   (feature-space dot product)
+                //
+                //   dL/dx[t,i] = (1/rms_t) * dP[t,i]
+                //              - (x[t,i] / (d * rms_t³)) * DOT_t
+                //
+                if ($x->requiresGrad) {
+                    $x->initGrad();
+                }
+
+                for ($t = 0; $t < $rows; $t++) {
+                    $off  = $t * $d;
+                    $rms  = $capturedRms[$t];
+                    $rms3 = $rms * $rms * $rms; // rms_t³ — used in x gradient
+
+                    // ── Pass 1: compute DOT_t and accumulate dL/dw ───────
+                    $dot = 0.0;
+                    for ($i = 0; $i < $d; $i++) {
+                        $dy  = (float) $out->grad[$off + $i];
+                        $xi  = (float) $x->buffer[$off + $i];
+                        $wi  = (float) $w->buffer[$i];
+                        $dPi = $dy * $wi; // dL/dxhat[t,i]
+
+                        $dot += $dPi * $xi;
+
+                        // dL/dw[i] += dL/dy[t,i] * (x[t,i] / rms_t) = dy * xhat[t,i]
+                        if ($w->requiresGrad) {
+                            $w->grad[$i] = (float) $w->grad[$i]
+                                         + $dy * ($xi / $rms);
+                        }
+                    }
+
+                    // ── Pass 2: compute dL/dx[t,i] for each feature i ────
+                    if ($x->requiresGrad) {
+                        for ($i = 0; $i < $d; $i++) {
+                            $dy  = (float) $out->grad[$off + $i];
+                            $xi  = (float) $x->buffer[$off + $i];
+                            $wi  = (float) $w->buffer[$i];
+                            $dPi = $dy * $wi;
+
+                            // dL/dx[t,i] = (1/rms)*dP_i  -  (x_i / (d*rms³))*DOT
+                            $dxi = $dPi / $rms - $xi * $dot / ($d * $rms3);
+                            $x->grad[$off + $i] = (float) $x->grad[$off + $i] + $dxi;
+                        }
+                    }
+                }
+            };
+        }
+
+        return $out;
+    }
+
+    // ── Differentiable Slice / Concat (for Multi-Head Attention) ─────────
+
+    /**
+     * Slice a contiguous column range from a 2D tensor.
+     *
+     * Forward:   out[i, j] = x[i, colStart + j]   for j in [0, colEnd − colStart)
+     * Backward:  x.grad[i, colStart + j] += out.grad[i, j]
+     *
+     * Used to split the full Q/K/V matrix [seqLen, dModel] into per-head
+     * slices [seqLen, headDim] without any data copies beyond the minimum.
+     *
+     * @param Tensor $x        2D tensor [rows, cols]
+     * @param int    $colStart Inclusive start column (0-based).
+     * @param int    $colEnd   Exclusive end column.
+     * @return Tensor          [rows, colEnd − colStart]
+     */
+    public static function sliceCols(Tensor $x, int $colStart, int $colEnd): Tensor
+    {
+        [$rows, $cols] = $x->shape;
+        $headDim = $colEnd - $colStart;
+
+        if ($headDim <= 0 || $colEnd > $cols) {
+            throw new \InvalidArgumentException(
+                "sliceCols: invalid range [{$colStart}, {$colEnd}) for cols={$cols}."
+            );
+        }
+
+        $out = new Tensor([$rows, $headDim]);
+        $ffi = BlasEngine::get()->ffi;
+
+        // Forward: copy $headDim contiguous floats starting at column $colStart
+        // for each row.  cblas_scopy uses incX=1, incY=1 — stride-1 float copy.
+        for ($i = 0; $i < $rows; $i++) {
+            $srcPtr = \FFI::cast('float*', \FFI::addr($x->buffer[$i * $cols + $colStart]));
+            $dstPtr = \FFI::cast('float*', \FFI::addr($out->buffer[$i * $headDim]));
+            $ffi->cblas_scopy($headDim, $srcPtr, 1, $dstPtr, 1);
+        }
+
+        if ($x->requiresGrad) {
+            $out->requiresGrad = true;
+            $out->_prev        = [$x];
+
+            $out->_backward = static function ()
+                use ($x, $out, $rows, $cols, $headDim, $colStart, $ffi): void
+            {
+                $x->initGrad();
+
+                // Scatter out.grad back into the same column range of x.grad.
+                // saxpy(n, 1.0, src, 1, dst, 1) ≡ dst += src (element-wise).
+                for ($i = 0; $i < $rows; $i++) {
+                    $gSrc = \FFI::cast('float*', \FFI::addr($out->grad[$i * $headDim]));
+                    $gDst = \FFI::cast('float*', \FFI::addr($x->grad[$i * $cols + $colStart]));
+                    $ffi->cblas_saxpy($headDim, 1.0, $gSrc, 1, $gDst, 1);
+                }
+            };
+        }
+
+        return $out;
+    }
+
+    /**
+     * Concatenate 2D tensors along the column axis.
+     *
+     * Forward:   out[i, offset_k + j] = tensors[k][i, j]
+     *            where offset_k = Σ_{m<k} tensors[m]->shape[1]
+     * Backward:  tensors[k].grad[i, j] += out.grad[i, offset_k + j]
+     *
+     * Used to merge per-head attention outputs [seqLen, headDim] × nHeads
+     * back into [seqLen, dModel] before the final Wo projection.
+     *
+     * @param Tensor[] $tensors  All must be 2D with the same row count.
+     * @return Tensor            [rows, Σ cols_k]
+     */
+    public static function concatCols(array $tensors): Tensor
+    {
+        if (empty($tensors)) {
+            throw new \InvalidArgumentException('concatCols: tensor array must not be empty.');
+        }
+
+        $rows      = $tensors[0]->shape[0];
+        $totalCols = 0;
+        $colOffsets = []; // colOffsets[$k] = start column of tensors[$k] in the output
+
+        foreach ($tensors as $k => $t) {
+            if (count($t->shape) !== 2) {
+                throw new \InvalidArgumentException("concatCols: tensor[{$k}] must be 2D.");
+            }
+            if ($t->shape[0] !== $rows) {
+                throw new \InvalidArgumentException(
+                    "concatCols: tensor[{$k}] has {$t->shape[0]} rows; expected {$rows}."
+                );
+            }
+            $colOffsets[] = $totalCols;
+            $totalCols   += $t->shape[1];
+        }
+
+        $out = new Tensor([$rows, $totalCols]);
+        $ffi = BlasEngine::get()->ffi;
+        $requiresGrad = false;
+
+        // Forward: copy each tensor's data into its column range in $out
+        foreach ($tensors as $k => $t) {
+            $headDim = $t->shape[1];
+            $colOff  = $colOffsets[$k];
+
+            for ($i = 0; $i < $rows; $i++) {
+                $srcPtr = \FFI::cast('float*', \FFI::addr($t->buffer[$i * $headDim]));
+                $dstPtr = \FFI::cast('float*', \FFI::addr($out->buffer[$i * $totalCols + $colOff]));
+                $ffi->cblas_scopy($headDim, $srcPtr, 1, $dstPtr, 1);
+            }
+
+            if ($t->requiresGrad) {
+                $requiresGrad = true;
+            }
+        }
+
+        if ($requiresGrad) {
+            $out->requiresGrad = true;
+            $out->_prev        = $tensors;
+
+            $capturedOffsets = $colOffsets; // copied by value
+
+            $out->_backward = static function ()
+                use ($tensors, $out, $rows, $totalCols, $capturedOffsets, $ffi): void
+            {
+                // Split out.grad back into each input tensor's grad.
+                foreach ($tensors as $k => $t) {
+                    if (!$t->requiresGrad) {
+                        continue;
+                    }
+                    $t->initGrad();
+
+                    $headDim = $t->shape[1];
+                    $colOff  = $capturedOffsets[$k];
+
+                    for ($i = 0; $i < $rows; $i++) {
+                        $gSrc = \FFI::cast('float*', \FFI::addr($out->grad[$i * $totalCols + $colOff]));
+                        $gDst = \FFI::cast('float*', \FFI::addr($t->grad[$i * $headDim]));
+                        $ffi->cblas_saxpy($headDim, 1.0, $gSrc, 1, $gDst, 1);
+                    }
+                }
+            };
+        }
+
+        return $out;
+    }
+
     // ── Loss Functions ────────────────────────────────────────────────────
 
     /**
@@ -612,6 +1086,22 @@ final class Ops
         if ($info !== 0) throw new \RuntimeException("lstsq/sgels failed with info={$info}.");
 
         return $X;
+    }
+
+    /**
+     * Named alias for lstsq() — exposed under the scikit-learn-familiar name.
+     *
+     * Solves the linear least-squares problem  min ||A*x − B||₂  using
+     * LAPACKE_sgels (QR / LQ factorisation).
+     *
+     * @param Tensor $A  [m, n] coefficient matrix
+     * @param Tensor $B  [m] or [m, nrhs] right-hand side(s)
+     * @return Tensor    Solution x in the first n rows of the returned buffer.
+     *                   Subsequent rows contain residual information.
+     */
+    public static function leastSquares(Tensor $A, Tensor $B): Tensor
+    {
+        return self::lstsq($A, $B);
     }
 
     // ── Embeddings / Indexing ─────────────────────────────────────────────

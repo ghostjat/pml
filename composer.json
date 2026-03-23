@@ -1,15 +1,33 @@
 {
-    "name": "vendor/pml",
-    "description": "Description of project pml.",
+    "name": "ghostjat/pml",
+    "description": "High-performance Machine Learning and Deep Learning framework for PHP. Powered by FFI, OpenBLAS, LibSVM, and XGBoost with a scikit-learn compatible API.",
+    "keywords": [
+        "machine-learning",
+        "php",
+        "ffi",
+        "openblas",
+        "scikit-learn",
+        "deep-learning",
+        "neural-networks",
+        "xgboost",
+        "svm",
+        "tensor",
+        "data-science"
+    ],
+    "type": "library",
+    "license": "MIT",
     "authors": [
         {
-            "name": "ghost",
-            "email": "your@email.here"
+            "name": "Shubham Chaudhary",
+            "email": "ghost.jat@gmai.com"
         }
     ],
     "autoload": {
         "psr-4": {
             "Pml\\": "src/"
-        }
+        },
+        "files": [
+            "src/Classic/Pipeline/make_pipeline.php"
+        ]
     }
 }

@@ -6,6 +6,10 @@ namespace Composer\Autoload;
 
 class ComposerStaticInita980f9fae28165ba78745db18ffee105
 {
+    public static $files = array (
+        '7d326cff5d4e6ea6b702d54076e4e144' => __DIR__ . '/../..' . '/src/Classic/Pipeline/make_pipeline.php',
+    );
+
     public static $prefixLengthsPsr4 = array (
         'P' => 
         array (
@@ -22,6 +26,70 @@ class ComposerStaticInita980f9fae28165ba78745db18ffee105
 
     public static $classMap = array (
         'Composer\\InstalledVersions' => __DIR__ . '/..' . '/composer/InstalledVersions.php',
+        'Pml\\BlasEngine' => __DIR__ . '/../..' . '/src/BlasEngine.php',
+        'Pml\\Classic\\Cluster\\DBSCAN' => __DIR__ . '/../..' . '/src/Classic/Cluster/DBSCAN.php',
+        'Pml\\Classic\\Cluster\\KMeans' => __DIR__ . '/../..' . '/src/Classic/Cluster/KMeans.php',
+        'Pml\\Classic\\Decomposition\\PCA' => __DIR__ . '/../..' . '/src/Classic/Decomposition/PCA.php',
+        'Pml\\Classic\\Ensemble\\AdaBoostClassifier' => __DIR__ . '/../..' . '/src/Classic/Ensemble/AdaBoostClassifier.php',
+        'Pml\\Classic\\Ensemble\\BaggingClassifier' => __DIR__ . '/../..' . '/src/Classic/Ensemble/BaggingClassifier.php',
+        'Pml\\Classic\\Ensemble\\RandomForestClassifier' => __DIR__ . '/../..' . '/src/Classic/Ensemble/RandomForestClassifier.php',
+        'Pml\\Classic\\Ensemble\\XGBClassifier' => __DIR__ . '/../..' . '/src/Classic/Ensemble/XGBClassifier.php',
+        'Pml\\Classic\\Ensemble\\XGBoostBridge' => __DIR__ . '/../..' . '/src/Classic/Ensemble/XGBoostBridge.php',
+        'Pml\\Classic\\Estimator' => __DIR__ . '/../..' . '/src/Classic/Estimator.php',
+        'Pml\\Classic\\FeatureSelection\\VarianceThreshold' => __DIR__ . '/../..' . '/src/Classic/FeatureSelection/VarianceThreshold.php',
+        'Pml\\Classic\\Impute\\SimpleImputer' => __DIR__ . '/../..' . '/src/Classic/Impute/SimpleImputer.php',
+        'Pml\\Classic\\LinearModel\\ElasticNet' => __DIR__ . '/../..' . '/src/Classic/LinearModel/ElasticNet.php',
+        'Pml\\Classic\\LinearModel\\Lasso' => __DIR__ . '/../..' . '/src/Classic/LinearModel/Lasso.php',
+        'Pml\\Classic\\LinearModel\\LinearRegression' => __DIR__ . '/../..' . '/src/Classic/LinearModel/LinearRegression.php',
+        'Pml\\Classic\\LinearModel\\LogisticRegression' => __DIR__ . '/../..' . '/src/Classic/LinearModel/LogisticRegression.php',
+        'Pml\\Classic\\LinearModel\\Ridge' => __DIR__ . '/../..' . '/src/Classic/LinearModel/Ridge.php',
+        'Pml\\Classic\\Metrics\\Metrics' => __DIR__ . '/../..' . '/src/Classic/Metrics/Metrics.php',
+        'Pml\\Classic\\ModelSelection\\DataSplit' => __DIR__ . '/../..' . '/src/Classic/ModelSelection/DataSplit.php',
+        'Pml\\Classic\\ModelSelection\\GridSearchCV' => __DIR__ . '/../..' . '/src/Classic/ModelSelection/GridSearchCV.php',
+        'Pml\\Classic\\ModelSelection\\KFold' => __DIR__ . '/../..' . '/src/Classic/ModelSelection/KFold.php',
+        'Pml\\Classic\\ModelSelection\\Validation' => __DIR__ . '/../..' . '/src/Classic/ModelSelection/Validation.php',
+        'Pml\\Classic\\NaiveBayes\\GaussianNB' => __DIR__ . '/../..' . '/src/Classic/NaiveBayes/GaussianNB.php',
+        'Pml\\Classic\\Neighbors\\KNeighborsClassifier' => __DIR__ . '/../..' . '/src/Classic/Neighbors/KNeighborsClassifier.php',
+        'Pml\\Classic\\NeuralNetwork\\MLPClassifier' => __DIR__ . '/../..' . '/src/Classic/NeuralNetwork/MLPClassifier.php',
+        'Pml\\Classic\\Pipeline\\Pipeline' => __DIR__ . '/../..' . '/src/Classic/Pipeline/Pipeline.php',
+        'Pml\\Classic\\Predictor' => __DIR__ . '/../..' . '/src/Classic/Predictor.php',
+        'Pml\\Classic\\Preprocess\\MinMaxScaler' => __DIR__ . '/../..' . '/src/Classic/Preprocess/MinMaxScaler.php',
+        'Pml\\Classic\\Preprocess\\OneHotEncoder' => __DIR__ . '/../..' . '/src/Classic/Preprocess/OneHotEncoder.php',
+        'Pml\\Classic\\Preprocess\\StandardScaler' => __DIR__ . '/../..' . '/src/Classic/Preprocess/StandardScaler.php',
+        'Pml\\Classic\\SVM\\LibSVMBridge' => __DIR__ . '/../..' . '/src/Classic/SVM/LibSVMBridge.php',
+        'Pml\\Classic\\SVM\\SVC' => __DIR__ . '/../..' . '/src/Classic/SVM/SVC.php',
+        'Pml\\Classic\\SVM\\SVR' => __DIR__ . '/../..' . '/src/Classic/SVM/SVR.php',
+        'Pml\\Classic\\Transformer' => __DIR__ . '/../..' . '/src/Classic/Transformer.php',
+        'Pml\\Classic\\Tree\\DecisionTreeClassifier' => __DIR__ . '/../..' . '/src/Classic/Tree/DecisionTreeClassifier.php',
+        'Pml\\Classic\\Utils\\Joblib' => __DIR__ . '/../..' . '/src/Classic/Utils/Joblib.php',
+        'Pml\\Generation\\BPETokenizer' => __DIR__ . '/../..' . '/src/Generation/BPETokenizer.php',
+        'Pml\\Generation\\GenerationConfig' => __DIR__ . '/../..' . '/src/Generation/GenerationConfig.php',
+        'Pml\\Generation\\KVCache' => __DIR__ . '/../..' . '/src/Generation/KVCache.php',
+        'Pml\\Generation\\LLM' => __DIR__ . '/../..' . '/src/Generation/LLM.php',
+        'Pml\\Generation\\Sampler' => __DIR__ . '/../..' . '/src/Generation/Sampler.php',
+        'Pml\\Generation\\SimpleTokenizer' => __DIR__ . '/../..' . '/src/Generation/SimpleTokenizer.php',
+        'Pml\\IO\\MmapLoader' => __DIR__ . '/../..' . '/src/IO/MmapLoader.php',
+        'Pml\\IO\\NpyLoader' => __DIR__ . '/../..' . '/src/IO/NpyLoader.php',
+        'Pml\\IO\\SafetensorsLoader' => __DIR__ . '/../..' . '/src/IO/SafetensorsLoader.php',
+        'Pml\\IO\\SafetensorsWriter' => __DIR__ . '/../..' . '/src/IO/SafetensorsWriter.php',
+        'Pml\\LLM' => __DIR__ . '/../..' . '/src/LLM.php',
+        'Pml\\Layers\\Dropout' => __DIR__ . '/../..' . '/src/Layers/Dropout.php',
+        'Pml\\Layers\\Embedding' => __DIR__ . '/../..' . '/src/Layers/Embedding.php',
+        'Pml\\Layers\\FeedForward' => __DIR__ . '/../..' . '/src/Layers/FeedForward.php',
+        'Pml\\Layers\\FeedForwardGELU' => __DIR__ . '/../..' . '/src/Layers/FeedForwardGELU.php',
+        'Pml\\Layers\\KVCache' => __DIR__ . '/../..' . '/src/Layers/KVCache.php',
+        'Pml\\Layers\\Linear' => __DIR__ . '/../..' . '/src/Layers/Linear.php',
+        'Pml\\Layers\\MultiHeadAttention' => __DIR__ . '/../..' . '/src/Layers/MultiHeadAttention.php',
+        'Pml\\Layers\\RoPE' => __DIR__ . '/../..' . '/src/Layers/RoPE.php',
+        'Pml\\Layers\\SelfAttention' => __DIR__ . '/../..' . '/src/Layers/SelfAttention.php',
+        'Pml\\Layers\\TransformerBlock' => __DIR__ . '/../..' . '/src/Layers/TransformerBlock.php',
+        'Pml\\LinAlg' => __DIR__ . '/../..' . '/src/LinAlg.php',
+        'Pml\\Metrics' => __DIR__ . '/../..' . '/src/Metrics.php',
+        'Pml\\Ops' => __DIR__ . '/../..' . '/src/Ops.php',
+        'Pml\\Tensor' => __DIR__ . '/../..' . '/src/Tensor.php',
+        'Pml\\Training\\AdamW' => __DIR__ . '/../..' . '/src/Training/AdamW.php',
+        'Pml\\Training\\CrossEntropyLoss' => __DIR__ . '/../..' . '/src/Training/CrossEntropyLoss.php',
+        'Pml\\Training\\DataLoader' => __DIR__ . '/../..' . '/src/Training/DataLoader.php',
     );
 
     public static function getInitializer(ClassLoader $loader)

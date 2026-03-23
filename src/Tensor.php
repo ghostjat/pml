@@ -8,18 +8,32 @@ namespace Pml;
  * Tensor: The foundation of PhpTensor.
  *
  * Design Principles:
- * - SINGLE 1D flat buffer in C memory (float32). NO PHP arrays for data.
+ * - SINGLE 1D flat buffer in C memory (float32 OR int8_t). NO PHP arrays for data.
  * - Shape + strides live in PHP-land as int[]. They are cheap metadata.
  * - GC-managed: buffer is owned by PHP GC (FFI::new(..., true)).
  * - Zero-copy operations use strides/transpose flags rather than re-allocating.
  * - Data never leaves C memory unless explicitly requested via toArray().
+ *
+ * Int8 quantisation:
+ * - When dtype === self::INT8, $buffer is int8_t[N] holding symmetric quantised values.
+ * - $quantScale is the per-tensor scale: float32_val ≈ int8_val * scale.
+ * - Ops::matmul() detects INT8 inputs and JIT-dequantises before calling sgemm.
  */
 class Tensor
 {
+    // ── Dtype constants ───────────────────────────────────────────────────
+    public const FLOAT32 = 0;
+    public const INT8    = 1;
+
     public readonly \FFI\CData $buffer;
     public readonly array $shape;    // e.g. [batch, seq, d_model]
-    public readonly array $strides;  // row-major byte strides (in elements, not bytes)
+    public readonly array $strides;  // row-major strides (in elements, not bytes)
     public readonly int   $size;     // total element count = product(shape)
+
+    // ── Quantisation metadata (only meaningful when dtype === INT8) ────────
+    public readonly int   $dtype;         // FLOAT32 | INT8
+    public readonly float $quantScale;    // float32 ≈ int8 * scale
+    public readonly int   $quantZeroPoint;// asymmetric zero-point (0 for symmetric)
 
     // Transpose metadata — avoids re-allocating on transposition
     /** @internal */
@@ -27,14 +41,70 @@ class Tensor
     /** @internal */
     public array $_transposedShape = [];
 
+    // ── Autograd graph ────────────────────────────────────────────────────
+    //
+    // Design (reverse-mode automatic differentiation / "autograd tape"):
+    //
+    //   Every Tensor that participates in a differentiable computation carries:
+    //
+    //   $requiresGrad — true for learnable parameters and any tensor derived
+    //                   from them.  Tensors without this flag are treated as
+    //                   constants: no grad buffer is allocated and no backward
+    //                   closure is ever registered for them.
+    //
+    //   $grad         — Float32 FFI buffer of the same size as $buffer.
+    //                   Allocated lazily by initGrad() on the first backward
+    //                   pass; starts at zero (FFI::new zero-initialises).
+    //                   Gradients *accumulate* here (+=) so you must call
+    //                   zeroGrad() (or $optimizer->zeroGrad()) before each
+    //                   training step.
+    //
+    //   $_prev        — Tensor[] of immediate parents in the computational
+    //                   graph.  Only populated when $requiresGrad is true and
+    //                   a differentiable Op produced this tensor.
+    //
+    //   $_backward    — Closure registered by the Op that produced this tensor.
+    //                   When called it reads $this->grad (the upstream gradient
+    //                   flowing into this node) and accumulates the appropriate
+    //                   contribution into each parent's $grad buffer.
+    //
+    // Leaf tensors (e.g. model weights created by the user) have empty $_prev
+    // and null $_backward — they are the endpoints of backpropagation.
+
+    /** Whether gradient tracking is active for this tensor. */
+    public bool $requiresGrad = false;
+
+    /** Gradient buffer: float[$size], null until initGrad() is first called. */
+    public ?\FFI\CData $grad = null;
+
+    /**
+     * Immediate parent tensors in the computational graph.
+     * @var Tensor[]
+     */
+    public array $_prev = [];
+
+    /**
+     * Backward closure registered by the Op that produced this tensor.
+     * Called during backward() in reverse topological order.
+     */
+    public ?\Closure $_backward = null;
+
     // ── Construction ──────────────────────────────────────────────────────
 
     /**
-     * @param array $shape  e.g. [3, 4] or [2, 3, 4]
-     * @param \FFI\CData|null $buffer  If provided, tensor is a VIEW into existing memory.
+     * @param array           $shape     e.g. [3, 4] or [2, 3, 4]
+     * @param \FFI\CData|null $buffer    If provided, tensor is a VIEW into existing memory.
+     * @param int             $dtype     self::FLOAT32 (default) or self::INT8
+     * @param float           $scale     Quantisation scale (INT8 only)
+     * @param int             $zeroPoint Quantisation zero-point (INT8 only, 0 = symmetric)
      */
-    public function __construct(array $shape, ?\FFI\CData $buffer = null)
-    {
+    public function __construct(
+        array        $shape,
+        ?\FFI\CData  $buffer    = null,
+        int          $dtype     = self::FLOAT32,
+        float        $scale     = 1.0,
+        int          $zeroPoint = 0
+    ) {
         if (empty($shape)) {
             throw new \InvalidArgumentException('Tensor shape must not be empty.');
         }
@@ -42,16 +112,89 @@ class Tensor
             if ($dim <= 0) throw new \InvalidArgumentException("All dimensions must be > 0, got {$dim}.");
         }
 
-        $this->shape   = array_map('intval', $shape);
-        $this->size    = (int) array_product($this->shape);
-        $this->strides = self::computeStrides($this->shape);
+        $this->shape          = array_map('intval', $shape);
+        $this->size           = (int) array_product($this->shape);
+        $this->strides        = self::computeStrides($this->shape);
+        $this->dtype          = $dtype;
+        $this->quantScale     = $scale;
+        $this->quantZeroPoint = $zeroPoint;
 
         if ($buffer !== null) {
             $this->buffer = $buffer;
+        } elseif ($dtype === self::INT8) {
+            // int8_t[N] — 1 byte per element; 4× smaller than float32
+            $this->buffer = BlasEngine::get()->allocInt8($this->size, true);
         } else {
-            // GC-owned: PHP will call FFI destructor when Tensor goes out of scope
+            // GC-owned float[N]: PHP will call FFI destructor when Tensor goes out of scope
             $this->buffer = BlasEngine::get()->allocFloat($this->size, true);
         }
+    }
+
+    // ── Int8 quantisation factory methods ─────────────────────────────────
+
+    /**
+     * Quantise a FLOAT32 tensor to INT8 using symmetric per-tensor quantisation.
+     *
+     * Algorithm:
+     *   scale = max(|x|) / 127
+     *   q[i]  = clamp( round(x[i] / scale), -128, 127 )
+     *
+     * This is a one-time, load-time cost.  At inference time Ops::matmul()
+     * will dequantise on the fly into a temporary F32 buffer, call sgemm,
+     * and free the temporary.
+     *
+     * @param float|null $scale  Override the auto-computed scale (e.g. from
+     *                           a stored calibration file).
+     */
+    public static function quantize(self $src, ?float $scale = null, int $zeroPoint = 0): self
+    {
+        if ($src->dtype !== self::FLOAT32) {
+            throw new \InvalidArgumentException('quantize() requires a FLOAT32 source tensor.');
+        }
+
+        // Find max absolute value to compute the scale
+        $absMax = 0.0;
+        for ($i = 0; $i < $src->size; $i++) {
+            $v = abs((float) $src->buffer[$i]);
+            if ($v > $absMax) $absMax = $v;
+        }
+
+        $scale ??= $absMax / 127.0;
+        if ($scale < 1e-9) $scale = 1e-9; // avoid division by zero for zero tensors
+
+        $out      = new self($src->shape, null, self::INT8, $scale, $zeroPoint);
+        $invScale = 1.0 / $scale;
+
+        for ($i = 0; $i < $src->size; $i++) {
+            $q = (int) round(((float) $src->buffer[$i]) * $invScale - $zeroPoint);
+            $out->buffer[$i] = max(-128, min(127, $q));
+        }
+
+        return $out;
+    }
+
+    /**
+     * Dequantise an INT8 tensor back to FLOAT32.
+     *
+     *   float32[i] = (int8[i] + zeroPoint) * scale
+     *
+     * Ops::matmul() calls this internally; you rarely need it directly.
+     */
+    public function dequantize(): self
+    {
+        if ($this->dtype !== self::INT8) {
+            throw new \InvalidArgumentException('dequantize() requires an INT8 tensor.');
+        }
+
+        $out    = new self($this->shape); // FLOAT32 by default
+        $scale  = $this->quantScale;
+        $zp     = $this->quantZeroPoint;
+
+        for ($i = 0; $i < $this->size; $i++) {
+            $out->buffer[$i] = ((float)((int) $this->buffer[$i]) + $zp) * $scale;
+        }
+
+        return $out;
     }
 
     // ── Factory Methods ───────────────────────────────────────────────────
@@ -553,6 +696,101 @@ class Tensor
         return $copy;
     }
 
+    // ── Autograd Methods ──────────────────────────────────────────────────
+
+    /**
+     * Allocate the gradient buffer if it doesn't exist yet.
+     *
+     * Called by backward closures on the PARENT tensors before accumulating
+     * into them with saxpy.  FFI::new zero-initialises, so the first backward
+     * pass starts accumulating from 0.0 — correct behaviour.
+     *
+     * Idempotent: a second call does nothing.
+     */
+    public function initGrad(): void
+    {
+        if ($this->grad === null) {
+            // GC-owned float[size] — initialised to 0.0 by the C allocator
+            $this->grad = BlasEngine::get()->allocFloat($this->size, true);
+        }
+    }
+
+    /**
+     * Zero the gradient buffer in-place using FFI memset.
+     *
+     * Call this (or AdamW::zeroGrad()) before every training step so that
+     * gradients from the previous step do not accumulate into the current one.
+     *
+     * IEEE 754: the bit-pattern 0x00000000 is exactly 0.0f, so a byte-level
+     * memset to zero is safe for float32 buffers.
+     */
+    public function zeroGrad(): void
+    {
+        if ($this->grad !== null) {
+            \FFI::memset($this->grad, 0, $this->size * 4);
+        }
+    }
+
+    /**
+     * Run reverse-mode automatic differentiation from this (scalar) tensor.
+     *
+     * Algorithm:
+     *   1. Topologically sort all tensors reachable via _prev links.
+     *   2. Seed $this->grad = 1.0  (dL/dL = 1).
+     *   3. Walk the sorted list in REVERSE order, calling each _backward
+     *      closure.  Each closure reads its own $grad (the upstream signal)
+     *      and uses BLAS to accumulate contributions into its parents' $grad.
+     *
+     * Only call this on the final scalar loss tensor (size === 1).
+     *
+     * @throws \LogicException if the tensor does not require grad or is not scalar.
+     */
+    public function backward(): void
+    {
+        if (!$this->requiresGrad) {
+            throw new \LogicException(
+                'backward() called on a tensor with requiresGrad=false. '
+                . 'Mark leaf parameters with $tensor->requiresGrad = true.'
+            );
+        }
+        if ($this->size !== 1) {
+            throw new \LogicException(
+                "backward() requires a scalar (size=1) loss tensor, got size={$this->size}. "
+                . 'Call backward() on the scalar loss returned by CrossEntropyLoss::forward().'
+            );
+        }
+
+        // ── 1. Topological sort ───────────────────────────────────────────
+        $topo    = [];
+        $visited = new \SplObjectStorage();
+        self::buildTopo($this, $topo, $visited);
+
+        // ── 2. Seed gradient: dL/dL = 1.0 ────────────────────────────────
+        $this->initGrad();
+        $this->grad[0] = 1.0;
+
+        // ── 3. Reverse-mode gradient propagation ─────────────────────────
+        foreach (array_reverse($topo) as $node) {
+            if ($node->_backward !== null) {
+                ($node->_backward)();
+            }
+        }
+    }
+
+    /**
+     * Return a copy of this tensor detached from the computational graph.
+     *
+     * The returned tensor shares the same DATA buffer (zero-copy) but has
+     * requiresGrad=false and no backward closure.  Use this to stop gradient
+     * flow (e.g. when passing targets to a loss function).
+     */
+    public function detach(): self
+    {
+        $view               = new self($this->shape, $this->buffer);
+        $view->requiresGrad = false;
+        return $view;
+    }
+
     // ── Utility ───────────────────────────────────────────────────────────
 
     public function ndim(): int    { return count($this->shape); }
@@ -582,6 +820,49 @@ class Tensor
             $flat += $indices[$dim] * $stride;
         }
         return $flat;
+    }
+
+    /**
+     * Iterative post-order DFS to build a topological ordering of the graph.
+     *
+     * We use an explicit stack to avoid PHP call-stack limits on deep graphs.
+     * The SplObjectStorage acts as a visited-set with O(1) identity lookups.
+     *
+     * Post-order: a node is appended to $topo only AFTER all its children
+     * have been visited.  Reversing $topo then gives a valid reverse-topo
+     * order for the backward pass.
+     *
+     * @param Tensor[]              $topo    Output: nodes in post-order
+     * @param \SplObjectStorage     $visited Set of already-processed nodes
+     */
+    private static function buildTopo(self $root, array &$topo, \SplObjectStorage $visited): void
+    {
+        // Each stack entry: [Tensor $node, int $childIndex]
+        // We process children one at a time so we can resume after recursing.
+        $stack = [[$root, 0]];
+
+        while (!empty($stack)) {
+            /** @var array{0:Tensor,1:int} $frame */
+            $frame  = &$stack[count($stack) - 1];
+            $node   = $frame[0];
+            $childI = $frame[1];
+
+            if (!$visited->contains($node) && $childI < count($node->_prev)) {
+                // Advance to the next unvisited child
+                $frame[1]++;
+                $child = $node->_prev[$childI];
+                if (!$visited->contains($child)) {
+                    $stack[] = [$child, 0];
+                }
+            } else {
+                // All children done — finalise this node
+                array_pop($stack);
+                if (!$visited->contains($node)) {
+                    $visited->attach($node);
+                    $topo[] = $node;
+                }
+            }
+        }
     }
 
     private static function computeStrides(array $shape): array

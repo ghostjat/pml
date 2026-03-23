@@ -65,6 +65,10 @@ final class BlasEngine
                          int M, int N,
                          float alpha, const float *A, int lda, float *B, int ldb);
 
+        /* ── Integer types needed for Int8 quantisation ─────────────────── */
+        typedef signed char   int8_t;
+        typedef unsigned char uint8_t;
+
         /* ── Memory Allocation Helpers ──────────────────────────────────── */
         void *malloc(size_t size);
         void  free(void *ptr);
@@ -85,6 +89,9 @@ final class BlasEngine
                            float *vt, int ldvt, float *superb);
         int LAPACKE_sgels (int matrix_layout, char trans, int m, int n, int nrhs,
                            float *a, int lda, float *b, int ldb);
+        /* QR factorization: A = Q * R; tau[min(m,n)] stores Householder scalars */
+        int LAPACKE_sgeqrf(int matrix_layout, int m, int n,
+                           float *a, int lda, float *tau);
     C;
 
     // ── OpenBLAS shared library search paths ──────────────────────────────
@@ -185,6 +192,15 @@ final class BlasEngine
     public function allocInt(int $n, bool $owned = true): \FFI\CData
     {
         return $this->ffi->new("int[{$n}]", $owned);
+    }
+
+    /**
+     * Convenience: allocate an int8_t[N] CData buffer for quantised weights.
+     * GC-owned by default — PHP frees on scope exit.
+     */
+    public function allocInt8(int $n, bool $owned = true): \FFI\CData
+    {
+        return $this->ffi->new("int8_t[{$n}]", $owned);
     }
 
     /** LAPACKE row-major layout constant */
