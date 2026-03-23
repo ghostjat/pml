@@ -20,6 +20,12 @@ use Pml\Classic\{Estimator, Transformer};
 //               Pass 1: accumulate column sums and non-NaN counts.
 //               Pass 2 (transform): replace NaN elements in-place.
 //
+//  'median'   Replace NaN with the per-column median computed over non-NaN
+//             training samples.  Collects non-NaN values per column, sorts
+//             them in PHP, then takes the middle value (or average of the
+//             two middle values for even-count columns).
+//             Robust to outliers — preferred for skewed distributions.
+//
 //  'constant' Replace NaN with a fixed scalar $fill_value (default 0.0).
 //             fit() stores fill_value for every column; transform() applies it.
 //
@@ -59,17 +65,17 @@ final class SimpleImputer implements Estimator, Transformer
     // ── Constructor ───────────────────────────────────────────────────────
 
     /**
-     * @param string $strategy   Imputation strategy: 'mean' or 'constant'.
+     * @param string $strategy   Imputation strategy: 'mean', 'median', or 'constant'.
      * @param float  $fill_value Fill value for strategy='constant'.  Ignored
-     *                           for strategy='mean'.  Default = 0.0.
+     *                           for 'mean' and 'median'.  Default = 0.0.
      */
     public function __construct(
         private readonly string $strategy   = 'mean',
         private readonly float  $fill_value = 0.0,
     ) {
-        if (!in_array($strategy, ['mean', 'constant'], true)) {
+        if (!in_array($strategy, ['mean', 'median', 'constant'], true)) {
             throw new \InvalidArgumentException(
-                "SimpleImputer: unknown strategy '{$strategy}'. Use 'mean' or 'constant'."
+                "SimpleImputer: unknown strategy '{$strategy}'. Use 'mean', 'median', or 'constant'."
             );
         }
     }
@@ -94,6 +100,37 @@ final class SimpleImputer implements Estimator, Transformer
         if ($this->strategy === 'constant') {
             // ── Constant strategy: every column gets fill_value ─────────
             $this->statistics_ = array_fill(0, $d, $this->fill_value);
+            return $this;
+        }
+
+        if ($this->strategy === 'median') {
+            // ── Median strategy: sort non-NaN column values ────────────
+            //
+            // For each column j, collect all non-NaN floats, sort them,
+            // then take the middle value (or average of the two middle
+            // values for even-length arrays).  The median is robust to
+            // outliers and well-suited for skewed numeric features like
+            // Age or Fare in tabular datasets.
+            $stats = [];
+            for ($j = 0; $j < $d; $j++) {
+                $colVals = [];
+                for ($i = 0; $i < $n; $i++) {
+                    $v = (float) $X->buffer[$i * $d + $j];
+                    if (!is_nan($v)) {
+                        $colVals[] = $v;
+                    }
+                }
+                sort($colVals);
+                $cnt = count($colVals);
+                if ($cnt === 0) {
+                    $stats[$j] = 0.0;
+                } elseif ($cnt % 2 === 1) {
+                    $stats[$j] = $colVals[intdiv($cnt, 2)];
+                } else {
+                    $stats[$j] = ($colVals[$cnt / 2 - 1] + $colVals[$cnt / 2]) / 2.0;
+                }
+            }
+            $this->statistics_ = $stats;
             return $this;
         }
 
