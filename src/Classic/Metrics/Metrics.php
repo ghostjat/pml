@@ -67,6 +67,46 @@ final class Metrics
     // ── Regression ─────────────────────────────────────────────────────────
 
     /**
+     * Mean Absolute Error: MAE = (1/n) · Σ|y_true − y_pred|
+     *
+     * The average magnitude of prediction errors, in the same units as the
+     * target.  Unlike MSE, MAE weights all errors equally — it is robust to
+     * outliers because large residuals do not receive disproportionately high
+     * penalties.
+     *
+     * BLAS note: cblas_sasum computes Σ|x| over a vector, but it operates on
+     * a single buffer.  We need Σ|y_true[i] − y_pred[i]|, which requires the
+     * residual to be materialised first.  We therefore:
+     *   1. Copy y_true into a diff buffer      — cblas_scopy
+     *   2. diff -= y_pred                      — cblas_saxpy(n, −1, y_pred, diff)
+     *   3. MAE = cblas_sasum(diff) / n         — single BLAS-1 call on residual
+     *
+     * @param Tensor $y_true  Ground-truth targets  [n_samples]
+     * @param Tensor $y_pred  Predicted values       [n_samples]
+     * @return float          MAE ≥ 0, in target units
+     * @throws \InvalidArgumentException if array sizes differ.
+     */
+    public static function mean_absolute_error(Tensor $y_true, Tensor $y_pred): float
+    {
+        $n = $y_true->size;
+        if ($y_pred->size !== $n) {
+            throw new \InvalidArgumentException(
+                "mean_absolute_error: y_true ({$n}) and y_pred ({$y_pred->size}) must be the same length."
+            );
+        }
+
+        $blas = BlasEngine::get()->ffi;
+
+        // diff = y_true − y_pred
+        $diff = new Tensor([$n]);
+        $blas->cblas_scopy($n, $y_true->buffer, 1, $diff->buffer, 1);
+        $blas->cblas_saxpy($n, -1.0, $y_pred->buffer, 1, $diff->buffer, 1);
+
+        // sasum(diff) = Σ|diff[i]|  — signed residuals, so absolute value is correct
+        return (float) $blas->cblas_sasum($n, $diff->buffer, 1) / $n;
+    }
+
+    /**
      * Mean Squared Error: MSE = (1/n) · ||y_true − y_pred||²
      *
      * BLAS steps:
@@ -80,7 +120,13 @@ final class Metrics
      */
     public static function mean_squared_error(Tensor $y_true, Tensor $y_pred): float
     {
-        $n    = $y_true->size;
+        $n = $y_true->size;
+        if ($y_pred->size !== $n) {
+            throw new \InvalidArgumentException(
+                "mean_squared_error: y_true ({$n}) and y_pred ({$y_pred->size}) must be the same length."
+            );
+        }
+
         $blas = BlasEngine::get()->ffi;
 
         // diff = y_true − y_pred
@@ -113,7 +159,13 @@ final class Metrics
      */
     public static function r2_score(Tensor $y_true, Tensor $y_pred): float
     {
-        $n    = $y_true->size;
+        $n = $y_true->size;
+        if ($y_pred->size !== $n) {
+            throw new \InvalidArgumentException(
+                "r2_score: y_true ({$n}) and y_pred ({$y_pred->size}) must be the same length."
+            );
+        }
+
         $blas = BlasEngine::get()->ffi;
 
         // ── SS_res = ||y_true − y_pred||² ─────────────────────────────────
@@ -140,9 +192,11 @@ final class Metrics
         $blas->cblas_saxpy($n, -$yMean, $ones->buffer, 1, $tot->buffer, 1);
         $ss_tot = (float) $blas->cblas_sdot($n, $tot->buffer, 1, $tot->buffer, 1);
 
-        // Constant target vector: SS_tot = 0 → perfect fit by convention
+        // Constant target vector: all true values are identical → SS_tot = 0.
+        // R² is undefined in this case; sklearn returns 0.0 (not 1.0) because
+        // the model cannot be said to explain variance that does not exist.
         if ($ss_tot === 0.0) {
-            return 1.0;
+            return 0.0;
         }
 
         return 1.0 - $ss_res / $ss_tot;

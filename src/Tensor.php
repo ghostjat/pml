@@ -412,6 +412,22 @@ class Tensor
     }
 
     /**
+     * Physical (copying) 2-D transpose: shape [M, N] → [N, M].
+     *
+     * Alias for transposePhysical() — provided for NumPy naming parity
+     * (np.ndarray.transpose / np.transpose).
+     *
+     * Re-lays out data so that result->buffer[col × M + row] = this->buffer[row × N + col].
+     * For BLAS GEMM, prefer T() which is zero-copy and passes CblasTrans instead of copying.
+     *
+     * @throws \RuntimeException on non-2D tensor.
+     */
+    public function transpose(): self
+    {
+        return $this->transposePhysical();
+    }
+
+    /**
      * Permute axes for N-D tensors (physical copy).
      * e.g. $t->permuteAxes([0, 2, 1]) on shape [2,3,4] → [2,4,3]
      */
@@ -501,6 +517,53 @@ class Tensor
     }
 
     /**
+     * Slice along axis 0, returning a physical copy of the selected rows.
+     *
+     * Works for any N-D tensor; axis 0 is sliced and all trailing axes are
+     * preserved intact.  The result is a new allocation — safe to hold after
+     * $this is freed or mutated.
+     *
+     * Byte arithmetic (row-major float32, 4 bytes per element):
+     *   stride₀        = $this->strides[0]   — elements per axis-0 index
+     *   first element  = $start  × stride₀
+     *   bytes to copy  = $length × stride₀ × 4
+     *
+     * @param int      $start  First axis-0 index (0-indexed, inclusive).
+     * @param int|null $length Rows to copy; null = from $start to the last row.
+     * @return self  New tensor with shape [$length, …original tail shape].
+     * @throws \InvalidArgumentException if the range is out-of-bounds.
+     */
+    public function slice(int $start, ?int $length = null): self
+    {
+        $axis0  = $this->shape[0];
+        $length ??= $axis0 - $start;
+
+        if ($start < 0 || $length < 1 || $start + $length > $axis0) {
+            throw new \InvalidArgumentException(
+                "slice(): out-of-bounds — tensor has {$axis0} rows on axis 0, "
+                . "requested start={$start}, length={$length}."
+            );
+        }
+
+        $newShape    = $this->shape;
+        $newShape[0] = $length;
+
+        // stride₀ = elements per axis-0 index (product of all trailing dimensions)
+        $stride0 = $this->strides[0];
+
+        // Bytes to copy: $length rows × stride₀ elements/row × 4 bytes/float32
+        $nBytes = $length * $stride0 * 4;
+        $out    = new self($newShape);
+
+        // \FFI::addr($buffer[$offset]) returns a C pointer to element $offset,
+        // letting memcpy treat the slice as a contiguous byte block.
+        $srcPtr = \FFI::cast('float*', \FFI::addr($this->buffer[$start * $stride0]));
+        \FFI::memcpy($out->buffer, $srcPtr, $nBytes);
+
+        return $out;
+    }
+
+    /**
      * Copy columns [$start, $end) from a 2D tensor. Returns a new [rows, end-start] tensor.
      */
     public function sliceCols(int $start, int $end): self
@@ -551,6 +614,59 @@ class Tensor
         $cols = $this->shape[1];
         $dst  = \FFI::cast('float*', \FFI::addr($this->buffer[$index * $cols]));
         BlasEngine::get()->ffi->cblas_scopy($cols, $row->buffer, 1, $dst, 1);
+    }
+
+    /**
+     * Vertically stack $other below $this (concatenate along axis 0).
+     *
+     * Both tensors must have identical shapes on every axis after axis 0.
+     * For 2D [M₁, C] and [M₂, C] this means column count C must match;
+     * for 1D there is no tail axis to validate.
+     *
+     * Two FFI::memcpy() calls perform the full concatenation without any
+     * PHP element-level loops:
+     *
+     *   Copy 1 — top half:
+     *     src  = $this->buffer  (element 0)
+     *     dst  = $out->buffer   (element 0)
+     *     size = $this->size × 4 bytes
+     *
+     *   Copy 2 — bottom half:
+     *     src  = $other->buffer  (element 0)
+     *     dst  = $out->buffer    (element $this->size)   ← pointer arithmetic
+     *     size = $other->size × 4 bytes
+     *
+     * @param Tensor $other Tensor to append below $this.
+     * @return self  New tensor with shape [$this->shape[0] + $other->shape[0], …tail].
+     * @throws \InvalidArgumentException if the tail shapes differ.
+     */
+    public function vstack(self $other): self
+    {
+        $tailThis  = array_slice($this->shape,  1);
+        $tailOther = array_slice($other->shape, 1);
+
+        if ($tailThis !== $tailOther) {
+            throw new \InvalidArgumentException(
+                'vstack(): tail shape mismatch — '
+                . 'this=[' . implode(', ', $this->shape) . '], '
+                . 'other=[' . implode(', ', $other->shape) . '].'
+            );
+        }
+
+        $newShape    = $this->shape;
+        $newShape[0] = $this->shape[0] + $other->shape[0];
+        $out         = new self($newShape);
+
+        // Copy 1: $this fills the top half of $out — simple pointer-to-pointer copy.
+        \FFI::memcpy($out->buffer, $this->buffer, $this->size * 4);
+
+        // Copy 2: $other fills the bottom half.
+        // \FFI::addr($out->buffer[$this->size]) is the C pointer to the first
+        // element that belongs to $other's data, cast to float* for memcpy.
+        $dstPtr = \FFI::cast('float*', \FFI::addr($out->buffer[$this->size]));
+        \FFI::memcpy($dstPtr, $other->buffer, $other->size * 4);
+
+        return $out;
     }
 
     // ── Element Access ────────────────────────────────────────────────────
