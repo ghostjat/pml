@@ -301,10 +301,10 @@ final class XGBClassifier implements Estimator, Predictor
         $out   = new Tensor([$m]);
 
         if ($K === 2) {
-            // binary: proba[i] = P(class=1); threshold at 0.5
+            // binary: predict_proba returns [m, 2]; P(class=1) is column 1
             for ($i = 0; $i < $m; $i++) {
                 $out->buffer[$i] = (float)$this->classes_[
-                    (float)$proba->buffer[$i] >= 0.5 ? 1 : 0
+                    (float)$proba->buffer[$i * 2 + 1] >= 0.5 ? 1 : 0
                 ];
             }
         } else {
@@ -327,17 +327,23 @@ final class XGBClassifier implements Estimator, Predictor
      * Predict class probabilities for $X.
      *
      * Returns a Tensor of shape:
-     *   [n_samples]         for binary classification (P(class=1))
+     *   [n_samples, 2]      for binary classification — column 0 = P(class=0),
+     *                       column 1 = P(class=1).  Sklearn API parity.
      *   [n_samples, K]      for K-class classification (softmax probs)
+     *
+     * XGBoost natively emits a 1D float[n_samples] for binary:logistic.
+     * We expand it to [n_samples, 2] so callers can use the same
+     * $proba->buffer[$i * 2 + k] indexing regardless of binary vs multi.
      *
      * Workflow:
      *   1. Create a temporary DMatrix from $X (zero-copy).
      *   2. Call XGBoosterPredict → XGBoost writes a const float* into out_result.
      *   3. \FFI::memcpy the output into a new Pml Tensor immediately.
-     *   4. Free the temporary DMatrix.
+     *   4. For binary: expand 1D P(1) array → 2D [m, 2] with P(0) = 1 − P(1).
+     *   5. Free the temporary DMatrix.
      *
      * @param Tensor $X  [n_samples, n_features]
-     * @return Tensor    [n_samples] or [n_samples, n_classes]
+     * @return Tensor    [n_samples, 2] for binary, [n_samples, K] for multi-class
      */
     public function predict_proba(Tensor $X): Tensor
     {
@@ -403,24 +409,41 @@ final class XGBClassifier implements Estimator, Predictor
         // $outPtrBox[0] is now a float* pointing to XGBoost's internal buffer.
         // We MUST copy immediately — the buffer is invalidated on the next call.
         //
-        // Output shape:
-        //   binary:logistic → out_len = m,    shape [m]
-        //   multi:softprob  → out_len = m * K, shape [m, K]  (row-major)
-        //   multi:softmax   → out_len = m,    shape [m]
+        // Native XGBoost output shapes:
+        //   binary:logistic → out_len = m,      float[m]     P(class=1) only
+        //   multi:softprob  → out_len = m * K,  float[m * K] row-major probs
+        //   multi:softmax   → out_len = m,      float[m]     class indices
         $totalFloats = (int)(float)$outLen->cdata;  // bst_ulong → PHP int
 
         if ($this->n_classes_ === 2) {
-            $out = new Tensor([$m]);
+            // ── Binary: expand 1D P(1) → 2D [m, 2] ───────────────────
+            //
+            // XGBoost emits only P(class=1) for binary:logistic.
+            // Sklearn's contract requires [n_samples, 2]:
+            //   out[i, 0] = 1 − p   (P class=0)
+            //   out[i, 1] = p        (P class=1)
+            //
+            // This lets every downstream consumer use the uniform
+            // $proba->buffer[$i * 2 + k] indexing for both binary and multi.
+            $raw = new Tensor([$m]);
+            \FFI::memcpy($raw->buffer, $outPtrBox[0], $m * 4);
+
+            $out = new Tensor([$m, 2]);
+            for ($i = 0; $i < $m; $i++) {
+                $p                       = (float) $raw->buffer[$i];
+                $out->buffer[$i * 2]     = 1.0 - $p;   // P(class=0)
+                $out->buffer[$i * 2 + 1] = $p;          // P(class=1)
+            }
         } else {
+            // ── Multi-class: copy raw buffer as-is ────────────────────
             // For multi:softprob, shape is [m, K]; for multi:softmax it's [m]
-            $K = $this->n_classes_;
+            $K   = $this->n_classes_;
             $out = ($totalFloats === $m * $K)
                 ? new Tensor([$m, $K])
                 : new Tensor([$m]);
-        }
 
-        // Zero-overhead copy: $outPtrBox[0] is the raw float* source
-        \FFI::memcpy($out->buffer, $outPtrBox[0], $totalFloats * 4);
+            \FFI::memcpy($out->buffer, $outPtrBox[0], $totalFloats * 4);
+        }
 
         // ── Step 4: Free temporary test DMatrix ───────────────────────
         $ffi->XGDMatrixFree($dmatBox[0]);
