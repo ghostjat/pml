@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit bootstrap="vendor/autoload.php" colors="true">
+    <testsuites>
+        <testsuite name="Framework QA">
+            <directory>tests</directory>
+        </testsuite>
+    </testsuites>
+    <php>
+        <ini name="memory_limit" value="2G"/>
+        <ini name="opcache.enable_cli" value="1"/>
+        <ini name="opcache.jit" value="1255"/>
+        <ini name="opcache.jit_buffer_size" value="256M"/>
+    </php>
+</phpunit>
