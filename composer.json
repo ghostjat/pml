@@ -1,6 +1,6 @@
 {
     "name": "ghostjat/pml",
-    "description": "High-performance Machine Learning and Deep Learning framework for PHP. Powered by FFI, OpenBLAS, LibSVM, and XGBoost with a scikit-learn compatible API.",
+    "description": "High-performance Tensor library for PHP utilizing FFI, OpenBLAS, and zero-copy memory operations.",
     "keywords": [
         "machine-learning",
         "php",
@@ -22,13 +22,28 @@
             "email": "ghost.jat@gmai.com"
         }
     ],
+    "require-dev": {
+        "phpunit/phpunit": "^11.0",
+        "phpbench/phpbench": "^1.2"
+    },
     "autoload": {
         "psr-4": {
-            "Pml\\": "src/"
-        },
-        "files": [
-            "src/Classic/Pipeline/make_pipeline.php"
-        ]
+            "PML\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "PML\\Tests\\": "tests/",
+            "PML\\Benchmarks\\": "benchmarks/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit --colors=always",
+        "bench": "phpbench run --report=aggregate"
+    },
+    "config": {
+        "optimize-autoloader": true,
+        "sort-packages": true
     },
     "require": {
     "php": "^8.1",
