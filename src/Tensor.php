@@ -49,8 +49,12 @@ class Tensor {
             : $ffi->tensor_create_dtype($ndim, $ffi->cast("int*", $cShape), $dtype);
         
         self::checkError();
-        $this->owned = true;
-        
+        // Arena tensors: both the struct and its data live inside the arena
+        // memory block.  arena_destroy() bulk-frees everything at once, so
+        // the PHP destructor must NOT call tensor_free() — that would be a
+        // use-after-free on already-freed arena memory.
+        $this->owned = ($arena === null);
+
         if ($dtype === self::DTYPE_INT32) {
             $this->buffer = $ffi->cast("int32_t*", $this->ptr->data);
         } elseif ($dtype === self::DTYPE_INT64) {
@@ -92,8 +96,13 @@ class Tensor {
     private static function checkError(): void {
         $ffi = TensorEngine::get();
         if ($ffi->tensor_check_error()) {
-            $err = \FFI::string($ffi->tensor_get_last_error());
+            // Clear BEFORE reading the string so the error never leaks into
+            // subsequent tests even if FFI::string() itself throws.
             $ffi->tensor_clear_error();
+            $errPtr = $ffi->tensor_get_last_error();
+            // PHP FFI may return const char* as either FFI\CData or a plain PHP
+            // string depending on the runtime version.
+            $err = $errPtr instanceof \FFI\CData ? \FFI::string($errPtr) : (string)$errPtr;
             throw new \RuntimeException("C-Engine Error: {$err}");
         }
     }

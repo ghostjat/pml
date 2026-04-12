@@ -69,8 +69,16 @@ final class GaussianNB implements Learner, Probabilistic
 
     public function predict(Dataset $dataset): Tensor
     {
-        // argmax over the computed log probabilities returns the winning class
-        return $this->proba($dataset)->argmax();
+        // proba() returns [N, K] log-probabilities; pick the class with the highest score per row.
+        $logProbs = $this->proba($dataset)->toFlatArray();
+        $n = $dataset->numRows();
+        $k = \count($this->classes);
+        $preds = [];
+        for ($i = 0; $i < $n; $i++) {
+            $row   = \array_slice($logProbs, $i * $k, $k);
+            $preds[] = (float) \array_search(\max($row), $row);
+        }
+        return Tensor::fromArray($preds);
     }
 
     public function proba(Dataset $dataset): Tensor

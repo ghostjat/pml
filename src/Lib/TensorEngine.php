@@ -45,6 +45,7 @@ final class TensorEngine {
                 bool tensor_check_error(void);
                 const char* tensor_get_last_error(void);
                 void tensor_clear_error(void);
+                void tensor_set_error(const char* msg);
 
                 void free(void *ptr);
 
@@ -222,6 +223,32 @@ final class TensorEngine {
                 void tensor_save_to_file(TensorC* t, const char* filepath);
                 TensorC* tensor_load_from_file(const char* filepath);
                 int tensor_save_safetensors(const char* filepath, const char* json_header, uint64_t json_len, TensorC** tensors, int num_tensors);
+
+                // ---------------------------------------------------------------
+                // Columnar DataFrame + ETL  (src/Lib/dataset_io.c)
+                // Opaque struct — PHP only ever holds a DataFrame* pointer;
+                // all access goes through df_* functions.
+                // ---------------------------------------------------------------
+                typedef struct DataFrame DataFrame;
+
+                DataFrame*  df_read_csv(const char* filepath, bool has_header);
+                void        df_free(DataFrame* df);
+
+                DataFrame*  df_select_columns(const DataFrame* df,
+                                              const int* col_indices, int n);
+                DataFrame*  df_drop_nans(const DataFrame* df);
+                DataFrame*  df_one_hot_encode(const DataFrame* df, int col_idx);
+
+                TensorC*    df_to_tensor(const DataFrame* df,
+                                         const int* col_indices, int n);
+
+                size_t      df_num_rows(const DataFrame* df);
+                size_t      df_num_cols(const DataFrame* df);
+                const char* df_col_name(const DataFrame* df, int col_idx);
+                int         df_col_dtype(const DataFrame* df, int col_idx);
+                int         df_col_n_categories(const DataFrame* df, int col_idx);
+                const char* df_col_category_name(const DataFrame* df,
+                                                  int col_idx, int cat_idx);
             ", $libPath);
         }
         return self::$ffi;

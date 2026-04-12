@@ -34,6 +34,7 @@ typedef struct {
 bool tensor_check_error(void);
 const char* tensor_get_last_error(void);
 void tensor_clear_error(void);
+void tensor_set_error(const char *msg);   /* used by dataframe.c and other TUs */
 
 // ============================================================================
 // 2. SAFE MEMORY ALLOCATORS & LIFECYCLE

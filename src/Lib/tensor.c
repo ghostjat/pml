@@ -41,6 +41,12 @@ bool tensor_check_error(void) { return tensor_had_error; }
 const char* tensor_get_last_error(void) { return tensor_last_error; }
 void tensor_clear_error(void) { tensor_had_error = false; tensor_last_error[0] = 0; }
 
+/* Called by dataframe.c and other translation units that share the .so */
+void tensor_set_error(const char *msg) {
+    snprintf(tensor_last_error, sizeof(tensor_last_error), "%s", msg);
+    tensor_had_error = true;
+}
+
 #define TENSOR_ERROR(fmt, ...) do { \
     snprintf(tensor_last_error, sizeof(tensor_last_error), fmt, ##__VA_ARGS__); \
     tensor_had_error = true; \

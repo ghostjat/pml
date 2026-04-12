@@ -7,7 +7,7 @@ namespace Pml\Estimators\Classifiers;
 use Pml\Interfaces\Learner;
 use Pml\Tensor;
 use Pml\Dataset;
-use Pml\Estimators\Trees\DecisionTreeClassifier;
+use Pml\Estimators\Classifiers\DecisionTreeClassifier;
 use RuntimeException;
 
 /**
@@ -151,10 +151,10 @@ final class AdaBoostClassifier implements Learner
             $alpha = $this->alphas[$i];
 
             for ($row = 0; $row < $n; $row++) {
-                $predictedClass = (int) $preds[$row];
-                
+                $predictedClass = (float) $preds[$row];
+
                 // Map the original class value to its sequential index [0...K]
-                $classIdx = array_search($predictedClass, $this->classes, true);
+                $classIdx = array_search($predictedClass, $this->classes);
                 if ($classIdx !== false) {
                     $classScores[$classIdx][$row] += $alpha;
                 }

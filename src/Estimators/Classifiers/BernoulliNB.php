@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Pml\Classifiers;
+namespace Pml\Estimators\Classifiers;
 
 use Pml\Interfaces\Learner;
 use Pml\Interfaces\Probabilistic;
@@ -59,10 +59,11 @@ final class BernoulliNB implements Learner, Probabilistic
             $smoothedCounts = $featureCounts->addScalarInplace($this->alpha);
             $smoothedTotal = $classCount + ($this->alpha * 2.0);
             
-            $prob = $smoothedCounts->divInplace(Tensor::zeros(1)->addScalarInplace($smoothedTotal));
-            
+            $prob = $smoothedCounts->mulScalarInplace(1.0 / $smoothedTotal);
+
             $this->featureLogProbs[$classKey] = $prob->copy()->log();
-            $this->featureNegLogProbs[$classKey] = Tensor::zeros(1)->addScalarInplace(1.0)->subInplace($prob)->log();
+            // 1 - prob, computed in-place on a same-shape copy to avoid broadcast issues
+            $this->featureNegLogProbs[$classKey] = $prob->copy()->mulScalar(-1.0)->addScalarInplace(1.0)->log();
         }
     }
 
@@ -72,7 +73,8 @@ final class BernoulliNB implements Learner, Probabilistic
 
         $zeroT = Tensor::zeros(1);
         $xBin = $dataset->samples()->greater($zeroT);
-        $notXBin = Tensor::zeros(1)->addScalarInplace(1.0)->subInplace($xBin);
+        // 1 - xBin, computed in-place on a copy to avoid scalar-broadcast shape mismatch
+        $notXBin = $xBin->copy()->mulScalar(-1.0)->addScalarInplace(1.0);
         
         $logProbs = [];
 
