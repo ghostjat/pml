@@ -826,34 +826,47 @@ TENSOR_AXIS_AGG(tensor_mean_axis, 0.0f, _ADD_OP, for (size_t j=0; j<out->total_s
 TENSOR_AXIS_AGG(tensor_max_axis, -INFINITY, _MAX_OP, )
 TENSOR_AXIS_AGG(tensor_min_axis, INFINITY, _MIN_OP, )
 
+/*
+ * tensor_sum — two-tier strategy:
+ *   ≥ 500 K elements : OpenMP parallel reduction (auto-vectorized by -O3 -mavx2)
+ *   < 500 K elements : 4-accumulator AVX2 loop (hides latency without thread overhead)
+ */
 float tensor_sum(Tensor* A) {
     if (A->dtype != DTYPE_FLOAT32) return 0.0f;
     float sum = 0.0f;
     if (tensor_is_contiguous(A)) {
+        const float* data = F32(A);
         size_t n = A->total_size;
+
+        if (n >= 500000) {
+            /* Large tensors: let OpenMP+compiler vectorise for us */
+            #pragma omp parallel for simd reduction(+:sum) schedule(static)
+            for (size_t i = 0; i < n; i++) sum += data[i];
+        } else {
 #ifdef __AVX2__
-        __m256 acc0 = _mm256_setzero_ps();
-        __m256 acc1 = _mm256_setzero_ps();
-        __m256 acc2 = _mm256_setzero_ps();
-        __m256 acc3 = _mm256_setzero_ps();
-        size_t i = 0;
-        for (; i + 31 < n; i += 32) {
-            acc0 = _mm256_add_ps(acc0, _mm256_loadu_ps(F32(A) + i));
-            acc1 = _mm256_add_ps(acc1, _mm256_loadu_ps(F32(A) + i + 8));
-            acc2 = _mm256_add_ps(acc2, _mm256_loadu_ps(F32(A) + i + 16));
-            acc3 = _mm256_add_ps(acc3, _mm256_loadu_ps(F32(A) + i + 24));
-        }
-        acc0 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
-        __m128 lo = _mm256_castps256_ps128(acc0);
-        __m128 hi = _mm256_extractf128_ps(acc0, 1);
-        __m128 s = _mm_add_ps(lo, hi);
-        s = _mm_add_ps(s, _mm_movehl_ps(s, s));
-        s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
-        sum = _mm_cvtss_f32(s);
-        for (; i < n; i++) sum += F32(A)[i];
+            /* Medium tensors: 4-accumulator unrolled AVX2 */
+            __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+            __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+            size_t i = 0;
+            for (; i + 31 < n; i += 32) {
+                __builtin_prefetch(data + i + 128, 0, 1);
+                a0 = _mm256_add_ps(a0, _mm256_loadu_ps(data + i));
+                a1 = _mm256_add_ps(a1, _mm256_loadu_ps(data + i +  8));
+                a2 = _mm256_add_ps(a2, _mm256_loadu_ps(data + i + 16));
+                a3 = _mm256_add_ps(a3, _mm256_loadu_ps(data + i + 24));
+            }
+            a0 = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+            __m128 lo = _mm256_castps256_ps128(a0);
+            __m128 hi = _mm256_extractf128_ps(a0, 1);
+            __m128 s  = _mm_add_ps(lo, hi);
+            s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+            s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+            sum = _mm_cvtss_f32(s);
+            for (; i < n; i++) sum += data[i];
 #else
-        for(size_t i=0; i<n; i++) sum += F32(A)[i];
+            for (size_t i = 0; i < n; i++) sum += data[i];
 #endif
+        }
     } else {
         int idx[8] = {0};
         for (size_t i = 0; i < A->total_size; i++) {
@@ -1037,42 +1050,94 @@ Tensor* tensor_argsort(Tensor* A, int axis) {
     return out;
 }
 
+/* AVX2 horizontal min/max helper: reduce __m256 to scalar */
+#ifdef __AVX2__
+static inline float _hmin256(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 m4 = _mm_min_ps(lo, hi);
+    m4 = _mm_min_ps(m4, _mm_movehl_ps(m4, m4));
+    m4 = _mm_min_ss(m4, _mm_shuffle_ps(m4, m4, 1));
+    return _mm_cvtss_f32(m4);
+}
+static inline float _hmax256(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 m4 = _mm_max_ps(lo, hi);
+    m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+    m4 = _mm_max_ss(m4, _mm_shuffle_ps(m4, m4, 1));
+    return _mm_cvtss_f32(m4);
+}
+#endif
+
 float tensor_min(Tensor* A) {
     if (A->dtype != DTYPE_FLOAT32) return 0.0f;
-    float min_val = INFINITY;
     if (tensor_is_contiguous(A)) {
-        for(size_t i=0; i<A->total_size; i++) if(F32(A)[i] < min_val) min_val = F32(A)[i];
+        const float* data = F32(A);
+        size_t n = A->total_size;
+        float min_val = INFINITY;
+        size_t i = 0;
+#ifdef __AVX2__
+        if (n >= 8) {
+            __m256 vmin = _mm256_set1_ps(INFINITY);
+            size_t limit = n & ~7UL;
+            for (; i < limit; i += 8) {
+                __builtin_prefetch(data + i + 64, 0, 1);
+                vmin = _mm256_min_ps(vmin, _mm256_loadu_ps(data + i));
+            }
+            min_val = _hmin256(vmin);
+        }
+#endif
+        for (; i < n; i++) if (data[i] < min_val) min_val = data[i];
+        return min_val;
     } else {
+        float min_val = INFINITY;
         int idx[8] = {0};
         for (size_t i = 0; i < A->total_size; i++) {
             size_t offset = 0;
             for (int d = 0; d < A->ndim; d++) offset += idx[d] * A->stride[d];
-            if(F32(A)[offset] < min_val) min_val = F32(A)[offset];
+            if (F32(A)[offset] < min_val) min_val = F32(A)[offset];
             for (int d = A->ndim - 1; d >= 0; d--) {
                 idx[d]++; if (idx[d] < A->shape[d]) break; idx[d] = 0;
             }
         }
+        return min_val;
     }
-    return min_val;
 }
 
 float tensor_max(Tensor* A) {
     if (A->dtype != DTYPE_FLOAT32) return 0.0f;
-    float max_val = -INFINITY;
     if (tensor_is_contiguous(A)) {
-        for(size_t i=0; i<A->total_size; i++) if(F32(A)[i] > max_val) max_val = F32(A)[i];
+        const float* data = F32(A);
+        size_t n = A->total_size;
+        float max_val = -INFINITY;
+        size_t i = 0;
+#ifdef __AVX2__
+        if (n >= 8) {
+            __m256 vmax = _mm256_set1_ps(-INFINITY);
+            size_t limit = n & ~7UL;
+            for (; i < limit; i += 8) {
+                __builtin_prefetch(data + i + 64, 0, 1);
+                vmax = _mm256_max_ps(vmax, _mm256_loadu_ps(data + i));
+            }
+            max_val = _hmax256(vmax);
+        }
+#endif
+        for (; i < n; i++) if (data[i] > max_val) max_val = data[i];
+        return max_val;
     } else {
+        float max_val = -INFINITY;
         int idx[8] = {0};
         for (size_t i = 0; i < A->total_size; i++) {
             size_t offset = 0;
             for (int d = 0; d < A->ndim; d++) offset += idx[d] * A->stride[d];
-            if(F32(A)[offset] > max_val) max_val = F32(A)[offset];
+            if (F32(A)[offset] > max_val) max_val = F32(A)[offset];
             for (int d = A->ndim - 1; d >= 0; d--) {
                 idx[d]++; if (idx[d] < A->shape[d]) break; idx[d] = 0;
             }
         }
+        return max_val;
     }
-    return max_val;
 }
 
 int tensor_argmin(Tensor* A) {
@@ -1439,6 +1504,44 @@ Tensor* tensor_matmul(Tensor* A, Tensor* B) {
     int k = A->shape[1];
     int n = B->shape[1];
 
+    // ----------------------------------------------------------------
+    // GEMV fast-path #1: B is a column vector [k, 1]  →  sgemv beats sgemm
+    // ----------------------------------------------------------------
+    if (n == 1) {
+        Tensor* a_c = tensor_is_contiguous(A) ? A : tensor_copy(A);
+        Tensor* b_c = tensor_is_contiguous(B) ? B : tensor_copy(B);
+        Tensor* out = tensor_create_uninitialized(2, (int[]){m, 1}, DTYPE_FLOAT32);
+        cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                    m, k, 1.0f,
+                    F32(a_c), k,    /* lda = k for row-major [m,k] */
+                    F32(b_c), 1,    /* incx = 1 for contiguous [k,1] */
+                    0.0f, F32(out), 1);
+        if (a_c != A) tensor_free(a_c);
+        if (b_c != B) tensor_free(b_c);
+        return out;
+    }
+
+    // ----------------------------------------------------------------
+    // GEMV fast-path #2: A is a row vector [1, k]  →  y = B^T * x
+    // ----------------------------------------------------------------
+    if (m == 1) {
+        Tensor* a_c = tensor_is_contiguous(A) ? A : tensor_copy(A);
+        Tensor* b_c = tensor_is_contiguous(B) ? B : tensor_copy(B);
+        Tensor* out = tensor_create_uninitialized(2, (int[]){1, n}, DTYPE_FLOAT32);
+        /* sgemv(Trans, rows=k, cols=n): out[j] = sum_i B[i,j]*x[i]  ==  x*B */
+        cblas_sgemv(CblasRowMajor, CblasTrans,
+                    k, n, 1.0f,
+                    F32(b_c), n,
+                    F32(a_c), 1,
+                    0.0f, F32(out), 1);
+        if (a_c != A) tensor_free(a_c);
+        if (b_c != B) tensor_free(b_c);
+        return out;
+    }
+
+    // ----------------------------------------------------------------
+    // General SGEMM path with transpose / non-contiguous detection
+    // ----------------------------------------------------------------
     CBLAS_TRANSPOSE transA = CblasNoTrans;
     CBLAS_TRANSPOSE transB = CblasNoTrans;
     int lda = k;
@@ -1452,7 +1555,7 @@ Tensor* tensor_matmul(Tensor* A, Tensor* B) {
         lda = A->shape[0];
     } else if (!tensor_is_contiguous(A)) {
         if (A->stride[0] == (size_t)A->shape[1] && A->stride[1] == 1) {
-            lda = A->shape[1]; // Sub-matrix that happens to be contiguous
+            lda = A->shape[1];
         } else {
             a_work = tensor_copy(A);
             lda = a_work->shape[1];
@@ -1471,7 +1574,7 @@ Tensor* tensor_matmul(Tensor* A, Tensor* B) {
         }
     } else { ldb = B->shape[1]; }
 
-    // beta=0.0 makes BLAS overwrite every output element — no zero-fill needed.
+    /* beta=0.0 → BLAS overwrites every output element; no zero-fill needed. */
     Tensor* out = tensor_create_uninitialized(2, (int[]){m, n}, DTYPE_FLOAT32);
 
     cblas_sgemm(CblasRowMajor, transA, transB,
@@ -1482,38 +1585,60 @@ Tensor* tensor_matmul(Tensor* A, Tensor* B) {
 
     if (a_work != A) tensor_free(a_work);
     if (b_work != B) tensor_free(b_work);
-    
     return out;
 }
 
+/*
+ * tensor_bmm — batched matrix multiply: A[batch,m,k] × B[batch,k,n] → [batch,m,n]
+ *
+ * Optimization: for contiguous inputs we bypass all per-batch view/reshape/slice
+ * allocations and call cblas_sgemm directly with pointer arithmetic.  5 heap
+ * objects per batch iteration → 0.  For batch > 1 and large slices the batch
+ * loop is parallelised with OpenMP; BLAS is kept single-threaded in that case
+ * to avoid oversubscription.
+ */
+extern void openblas_set_num_threads(int) __attribute__((weak));
+
 Tensor* tensor_bmm(Tensor* A, Tensor* B) {
-    if(A->ndim != 3 || B->ndim != 3 || A->shape[0] != B->shape[0] || A->shape[2] != B->shape[1] || A->dtype != DTYPE_FLOAT32) {
+    if (A->ndim != 3 || B->ndim != 3 ||
+        A->shape[0] != B->shape[0] ||
+        A->shape[2] != B->shape[1] ||
+        A->dtype != DTYPE_FLOAT32 || B->dtype != DTYPE_FLOAT32) {
         TENSOR_ERROR("FATAL [BMM]: Invalid dimensions or type.");
     }
-    int batch = A->shape[0]; int m = A->shape[1]; int k = A->shape[2]; int n = B->shape[2];
-    // Each batch slice is fully overwritten by cblas_sgemm with beta=0 — skip zero-fill.
+
+    int batch = A->shape[0];
+    int m     = A->shape[1];
+    int k     = A->shape[2];
+    int n     = B->shape[2];
+
+    /* Each slice is fully overwritten by sgemm with beta=0 — skip zero-fill. */
     Tensor* out = tensor_create_uninitialized(3, (int[]){batch, m, n}, DTYPE_FLOAT32);
-    
-    for(int b = 0; b < batch; b++) {
-        Tensor* a_slice = tensor_slice(A, 0, b, 1);
-        Tensor* b_slice = tensor_slice(B, 0, b, 1);
-        Tensor* a_2d = tensor_reshape(a_slice, 2, (int[]){m, k});
-        Tensor* b_2d = tensor_reshape(b_slice, 2, (int[]){k, n});
-        
-        Tensor* res_2d = tensor_matmul(a_2d, b_2d);
-        if (!res_2d) {
-            tensor_free(a_slice); tensor_free(b_slice);
-            tensor_free(a_2d); tensor_free(b_2d);
-            tensor_free(out);
-            return NULL;
-        }
-        
-        memcpy(F32(out) + b * out->stride[0], F32(res_2d), res_2d->byte_size);
-        
-        tensor_free(a_slice); tensor_free(b_slice);
-        tensor_free(a_2d); tensor_free(b_2d);
-        tensor_free(res_2d);
+
+    /* Compact non-contiguous inputs once (O(N) copy), then use direct offsets. */
+    Tensor* a_work = tensor_is_contiguous(A) ? A : tensor_copy(A);
+    Tensor* b_work = tensor_is_contiguous(B) ? B : tensor_copy(B);
+
+    bool parallel = (batch > 1) && ((size_t)m * n * k > 10000);
+
+    if (parallel && openblas_set_num_threads)
+        openblas_set_num_threads(1); /* prevent BLAS×OMP oversubscription */
+
+    #pragma omp parallel for schedule(dynamic) if(parallel)
+    for (int b = 0; b < batch; b++) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    m, n, k, 1.0f,
+                    F32(a_work) + b * m * k, k,
+                    F32(b_work) + b * k * n, n,
+                    0.0f,
+                    F32(out)    + b * m * n, n);
     }
+
+    if (parallel && openblas_set_num_threads)
+        openblas_set_num_threads(omp_get_max_threads());
+
+    if (a_work != A) tensor_free(a_work);
+    if (b_work != B) tensor_free(b_work);
     return out;
 }
 
@@ -2079,34 +2204,66 @@ Tensor* tensor_topk(Tensor* A, int k, int axis) {
 // DEEP LEARNING (CNN Primitives)
 // ============================================================================
 
-Tensor* tensor_im2col(Tensor* A, int kernel_h, int kernel_w, int stride_h, int stride_w, int pad_h, int pad_w) {
+/*
+ * tensor_im2col — optimised implementation.
+ *
+ * Loop-order change (b,oh,ow outer; c,kh,kw inner):
+ *   • Writes to out_row[col_idx] are now sequential → cache-friendly stores.
+ *   • Padding zeros are never written; the tensor is initialised with zeros
+ *     and only valid positions are overwritten (branch-free in the common case
+ *     after the pad guard is hoisted out of the hot loop).
+ *
+ * OpenMP: parallelise over batch dimension — each b writes to disjoint rows of
+ * the output matrix, so there are no race conditions.
+ */
+Tensor* tensor_im2col(Tensor* A, int kernel_h, int kernel_w,
+                      int stride_h, int stride_w, int pad_h, int pad_w) {
     if (A->ndim != 4 || A->dtype != DTYPE_FLOAT32) TENSOR_ERROR("Requires 4D FLOAT32.");
-    
-    int batch = A->shape[0]; int channels = A->shape[1]; int height = A->shape[2]; int width = A->shape[3];
-    int out_h = (height + 2 * pad_h - kernel_h) / stride_h + 1;
-    int out_w = (width + 2 * pad_w - kernel_w) / stride_w + 1;
-    
-    int cols = channels * kernel_h * kernel_w;
-    int rows = batch * out_h * out_w;
-    Tensor* out = tensor_zeros(2, (int[]){rows, cols});
-    
-    // Cache-friendly sequential writes
-    for (int c = 0; c < channels; c++) {
-        for (int kh = 0; kh < kernel_h; kh++) {
-            for (int kw = 0; kw < kernel_w; kw++) {
-                int col_idx = c * (kernel_h * kernel_w) + kh * kernel_w + kw;
-                float* out_col = F32(out) + col_idx; 
-                for (int b = 0; b < batch; b++) {
-                    for (int oh = 0; oh < out_h; oh++) {
-                        for (int ow = 0; ow < out_w; ow++) {
-                            int row_idx = b * (out_h * out_w) + oh * out_w + ow;
-                            int im_h = oh * stride_h - pad_h + kh;
-                            int im_w = ow * stride_w - pad_w + kw;
-                            
-                            if (im_h >= 0 && im_h < height && im_w >= 0 && im_w < width) {
-                                size_t a_idx = b * A->stride[0] + c * A->stride[1] + im_h * A->stride[2] + im_w * A->stride[3];
-                                out_col[row_idx * cols] = F32(A)[a_idx];
+
+    int batch    = A->shape[0];
+    int channels = A->shape[1];
+    int height   = A->shape[2];
+    int width    = A->shape[3];
+    int out_h    = (height + 2 * pad_h - kernel_h) / stride_h + 1;
+    int out_w    = (width  + 2 * pad_w - kernel_w) / stride_w + 1;
+    int cols     = channels * kernel_h * kernel_w;
+    int rows     = batch * out_h * out_w;
+
+    /* Padding regions stay 0 from calloc inside tensor_create */
+    Tensor* out = tensor_create(2, (int[]){rows, cols});
+
+    /* Pre-compute per-channel base strides to avoid repeated multiplication */
+    size_t as0 = A->stride[0];
+    size_t as1 = A->stride[1];
+    size_t as2 = A->stride[2];
+    /* stride[3] == 1 for contiguous 4D (verified by callers), so we skip it */
+
+    #pragma omp parallel for schedule(static) if(rows > 4096)
+    for (int b = 0; b < batch; b++) {
+        int base_row = b * (out_h * out_w);
+
+        for (int oh = 0; oh < out_h; oh++) {
+            for (int ow = 0; ow < out_w; ow++) {
+                int   row_idx = base_row + oh * out_w + ow;
+                float* out_row = F32(out) + (size_t)row_idx * cols;
+
+                /* Prefetch the next output row while filling this one */
+                if (ow + 1 < out_w)
+                    __builtin_prefetch(out_row + cols, 1, 1);
+
+                int col_idx = 0;
+                for (int c = 0; c < channels; c++) {
+                    size_t base_a = b * as0 + c * as1;
+                    for (int kh_i = 0; kh_i < kernel_h; kh_i++) {
+                        int im_h = oh * stride_h - pad_h + kh_i;
+                        bool h_valid = (im_h >= 0 && im_h < height);
+                        for (int kw_i = 0; kw_i < kernel_w; kw_i++, col_idx++) {
+                            int im_w = ow * stride_w - pad_w + kw_i;
+                            if (h_valid && im_w >= 0 && im_w < width) {
+                                out_row[col_idx] =
+                                    F32(A)[base_a + (size_t)im_h * as2 + im_w];
                             }
+                            /* else: already 0 from tensor_create */
                         }
                     }
                 }
@@ -2446,4 +2603,192 @@ int tensor_save_safetensors(const char* filepath, const char* json_header, uint6
     
     fclose(f);
     return 1;
+}
+// ============================================================================
+// 16. FUSED NEURAL NETWORK KERNELS (New — Zero-copy, FMA-accelerated)
+// ============================================================================
+
+/*
+ * tensor_linear — fused fully-connected layer: out = X @ W^T + bias
+ *
+ *   X    : [m, k]   (or any shape with last-dim k; treated as [m, k])
+ *   W    : [n, k]   (weight matrix, transposed convention: rows = output neurons)
+ *   bias : [n]      (optional; NULL skips the add)
+ *   out  : [m, n]
+ *
+ * Fusion benefit: single SGEMM call + one AVX2 pass for bias — no temporary
+ * tensor allocation between GEMM and add.  Compared to matmul()+add() this
+ * saves one full output-buffer allocation and one extra memory pass.
+ */
+Tensor* tensor_linear(Tensor* X, Tensor* W, Tensor* bias) {
+    if (X->dtype != DTYPE_FLOAT32 || W->dtype != DTYPE_FLOAT32)
+        TENSOR_ERROR("FATAL [Linear]: Requires FLOAT32.");
+    if (W->ndim != 2 || X->shape[X->ndim - 1] != W->shape[1])
+        TENSOR_ERROR("FATAL [Linear]: W must be 2D [n,k] with k == X last dim.");
+
+    int k = X->shape[X->ndim - 1];
+    int m = (int)(X->total_size / k);
+    int n = W->shape[0];
+
+    /* Compact if needed — single O(N) copy, then pure pointer arithmetic */
+    Tensor* x_work = tensor_is_contiguous(X) ? X : tensor_copy(X);
+    Tensor* w_work = tensor_is_contiguous(W) ? W : tensor_copy(W);
+
+    /* Build output shape: same as X but with last dim replaced by n */
+    int out_shape[8];
+    for (int i = 0; i < X->ndim - 1; i++) out_shape[i] = X->shape[i];
+    out_shape[X->ndim - 1] = n;
+    Tensor* out = tensor_create_uninitialized(X->ndim, out_shape, DTYPE_FLOAT32);
+
+    /* SGEMM: out = X * W^T  (W stored as [n,k], so Trans gives [k,n]) */
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                m, n, k, 1.0f,
+                F32(x_work), k,
+                F32(w_work), k,
+                0.0f, F32(out), n);
+
+    /* Fused bias addition: single AVX2 pass over the output matrix */
+    if (bias != NULL) {
+        if (bias->dtype != DTYPE_FLOAT32)
+            TENSOR_ERROR("FATAL [Linear]: bias must be FLOAT32.");
+        Tensor* b_work = tensor_is_contiguous(bias) ? bias : tensor_copy(bias);
+        float*  b_data = F32(b_work);
+        float*  o_data = F32(out);
+
+        #pragma omp parallel for schedule(static) if((size_t)m * n > 100000)
+        for (int i = 0; i < m; i++) {
+            float* row = o_data + (size_t)i * n;
+            size_t j = 0;
+#ifdef __AVX2__
+            for (; j + 7 < (size_t)n; j += 8) {
+                _mm256_storeu_ps(row + j,
+                    _mm256_add_ps(_mm256_loadu_ps(row + j),
+                                  _mm256_loadu_ps(b_data + j)));
+            }
+#endif
+            for (; j < (size_t)n; j++) row[j] += b_data[j];
+        }
+
+        if (b_work != bias) tensor_free(b_work);
+    }
+
+    if (x_work != X) tensor_free(x_work);
+    if (w_work != W) tensor_free(w_work);
+    return out;
+}
+
+/*
+ * tensor_add_relu — fused elementwise: out = relu(A + B)
+ *
+ * Saves one full output-buffer allocation + one extra memory pass vs add()+relu().
+ * Uses AVX2 _mm256_max_ps for the relu in the same loop as the add.
+ */
+Tensor* tensor_add_relu(Tensor* A, Tensor* B) {
+    if (A->dtype != DTYPE_FLOAT32 || B->dtype != DTYPE_FLOAT32)
+        TENSOR_ERROR("FATAL [AddReLU]: Requires FLOAT32.");
+    if (A->total_size != B->total_size)
+        TENSOR_ERROR("FATAL [AddReLU]: Shape mismatch.");
+
+    Tensor* a_work = tensor_is_contiguous(A) ? A : tensor_copy(A);
+    Tensor* b_work = tensor_is_contiguous(B) ? B : tensor_copy(B);
+
+    Tensor* out = tensor_create_uninitialized(A->ndim, A->shape, DTYPE_FLOAT32);
+    size_t  n   = A->total_size;
+    float*  a   = F32(a_work);
+    float*  b   = F32(b_work);
+    float*  o   = F32(out);
+
+    size_t i = 0;
+#ifdef __AVX2__
+    __m256 zero  = _mm256_setzero_ps();
+    size_t limit = n & ~7UL;
+    _Pragma("omp parallel for schedule(static) if(limit > 100000)")
+    for (size_t j = 0; j < limit; j += 8) {
+        __builtin_prefetch(a + j + 64, 0, 1);
+        __builtin_prefetch(b + j + 64, 0, 1);
+        _mm256_storeu_ps(o + j,
+            _mm256_max_ps(
+                _mm256_add_ps(_mm256_loadu_ps(a + j), _mm256_loadu_ps(b + j)),
+                zero));
+    }
+    i = limit;
+#endif
+    for (; i < n; i++) { float v = a[i] + b[i]; o[i] = v > 0.0f ? v : 0.0f; }
+
+    if (a_work != A) tensor_free(a_work);
+    if (b_work != B) tensor_free(b_work);
+    return out;
+}
+
+/*
+ * tensor_mul_add — fused FMA: out = A * B + C
+ *
+ * Uses _mm256_fmadd_ps (single FMA instruction, -mfma flag already set).
+ * Saves one full pass over memory vs mul()+add().
+ */
+Tensor* tensor_mul_add(Tensor* A, Tensor* B, Tensor* C) {
+    if (A->dtype != DTYPE_FLOAT32 || B->dtype != DTYPE_FLOAT32 || C->dtype != DTYPE_FLOAT32)
+        TENSOR_ERROR("FATAL [MulAdd]: Requires FLOAT32.");
+    if (A->total_size != B->total_size || A->total_size != C->total_size)
+        TENSOR_ERROR("FATAL [MulAdd]: Shape mismatch.");
+
+    Tensor* a_work = tensor_is_contiguous(A) ? A : tensor_copy(A);
+    Tensor* b_work = tensor_is_contiguous(B) ? B : tensor_copy(B);
+    Tensor* c_work = tensor_is_contiguous(C) ? C : tensor_copy(C);
+
+    Tensor* out = tensor_create_uninitialized(A->ndim, A->shape, DTYPE_FLOAT32);
+    size_t  n   = A->total_size;
+    float*  a   = F32(a_work);
+    float*  b   = F32(b_work);
+    float*  c   = F32(c_work);
+    float*  o   = F32(out);
+
+    size_t i = 0;
+#ifdef __AVX2__
+    size_t limit = n & ~7UL;
+    _Pragma("omp parallel for schedule(static) if(limit > 100000)")
+    for (size_t j = 0; j < limit; j += 8) {
+        __builtin_prefetch(a + j + 64, 0, 1);
+        __builtin_prefetch(b + j + 64, 0, 1);
+        /* fmadd: a*b + c in one FP instruction */
+        _mm256_storeu_ps(o + j,
+            _mm256_fmadd_ps(_mm256_loadu_ps(a + j),
+                            _mm256_loadu_ps(b + j),
+                            _mm256_loadu_ps(c + j)));
+    }
+    i = limit;
+#endif
+    for (; i < n; i++) o[i] = a[i] * b[i] + c[i];
+
+    if (a_work != A) tensor_free(a_work);
+    if (b_work != B) tensor_free(b_work);
+    if (c_work != C) tensor_free(c_work);
+    return out;
+}
+
+// ============================================================================
+// 17. THREADING CONTROL
+// ============================================================================
+
+/* Weak-symbol declarations so the code links against any BLAS flavour
+   (OpenBLAS, ATLAS, MKL via openblas compat shim) without hard-dep failures. */
+extern void openblas_set_num_threads(int) __attribute__((weak));
+extern void goto_set_num_threads(int)     __attribute__((weak));   /* older name */
+
+/*
+ * tensor_configure_threading — set OpenMP thread count and BLAS thread count
+ * independently.  Call once at startup to prevent OpenBLAS × OpenMP
+ * oversubscription (common cause of 2× slowdown on multi-core systems).
+ *
+ * Recommended:
+ *   omp_threads  = physical core count
+ *   blas_threads = 1  (when outer OpenMP loops are used)
+ *   blas_threads = physical core count  (when only BLAS, no outer OpenMP)
+ */
+void tensor_configure_threading(int omp_threads, int blas_threads) {
+    if (omp_threads  > 0) omp_set_num_threads(omp_threads);
+    if (blas_threads > 0) {
+        if (openblas_set_num_threads) openblas_set_num_threads(blas_threads);
+        else if (goto_set_num_threads) goto_set_num_threads(blas_threads);
+    }
 }

@@ -17,7 +17,8 @@ final class TensorEngine {
                 // Glob relative to __DIR__ — process CWD is unreliable under php-fpm.
                 $cFiles = implode(' ', array_map('escapeshellarg', glob(__DIR__ . '/*.c')));
                 $result = shell_exec(
-                    "gcc -O3 -mavx2 -mfma -ffast-math -fopenmp -shared -fPIC -o "
+                    "gcc -O3 -march=native -mfma -ffast-math -fopenmp -funroll-loops"
+                    . " -fomit-frame-pointer -shared -fPIC -o "
                     . escapeshellarg($libPath) . " " . $cFiles
                     . " -lopenblas -llapacke -lm 2>&1"
                 );
@@ -210,6 +211,17 @@ final class TensorEngine {
 
                 void tensor_fused_bce_loss_and_grad(TensorC* preds, TensorC* targets, TensorC* grads, float* out_loss);
                 void tensor_fused_adam_step(TensorC* param, TensorC* grad, TensorC* m, TensorC* v, float lr, float b1, float b2, float eps, int t);
+
+                // --- FUSED NEURAL NETWORK KERNELS ---
+                // out = X @ W^T + bias  (bias may be NULL)
+                TensorC* tensor_linear(TensorC* X, TensorC* W, TensorC* bias);
+                // out = relu(A + B)
+                TensorC* tensor_add_relu(TensorC* A, TensorC* B);
+                // out = A * B + C
+                TensorC* tensor_mul_add(TensorC* A, TensorC* B, TensorC* C);
+
+                // --- THREADING CONTROL ---
+                void tensor_configure_threading(int omp_threads, int blas_threads);
 
                 typedef struct {
                     int feature_idx;

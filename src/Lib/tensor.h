@@ -255,6 +255,29 @@ typedef struct __attribute__((packed)) {
 void tensor_hardware_tree_predict(Tensor* X, HardwareNode* nodes, Tensor* out);
 
 // ============================================================================
+// 16. FUSED NEURAL NETWORK KERNELS
+// ============================================================================
+
+// Fused fully-connected: out = X @ W^T + bias  (bias optional, pass NULL to skip)
+// X: [m, k]  W: [n, k]  bias: [n]  → out: [m, n]
+Tensor* tensor_linear(Tensor* X, Tensor* W, Tensor* bias);
+
+// Fused add + ReLU: out = relu(A + B)
+Tensor* tensor_add_relu(Tensor* A, Tensor* B);
+
+// Fused multiply-add (FMA): out = A * B + C
+Tensor* tensor_mul_add(Tensor* A, Tensor* B, Tensor* C);
+
+// ============================================================================
+// 17. THREADING CONTROL
+// ============================================================================
+
+// Set OpenMP and BLAS thread counts independently to prevent oversubscription.
+// Call once at startup: omp_threads = cores, blas_threads = 1 when outer
+// OpenMP loops are used; blas_threads = cores for pure-BLAS workloads.
+void tensor_configure_threading(int omp_threads, int blas_threads);
+
+// ============================================================================
 // 14. I/O SERIALIZATION
 // ============================================================================
 void tensor_save_to_file(Tensor* t, const char* filepath);

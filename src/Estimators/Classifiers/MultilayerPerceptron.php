@@ -13,6 +13,7 @@ use Pml\NeuralNetwork\Layers\ReLU;
 use Pml\NeuralNetwork\Layers\Softmax;
 use Pml\NeuralNetwork\Layers\Dropout;
 use Pml\NeuralNetwork\Optimizers\Adam;
+use Pml\Losses\CategoricalCrossEntropy;
 use RuntimeException;
 
 /**
@@ -51,7 +52,8 @@ final class MultilayerPerceptron implements Learner, Probabilistic
         $flat   = $labels->toFlatArray();
         $unique = array_values(array_unique($flat));
         sort($unique);
-        $this->classMap = array_flip($unique);
+        // array_flip() cannot handle float keys; use string representation
+        $this->classMap = array_flip(array_map('strval', $unique));
         $this->indexMap = $unique;
         $k = count($unique);
         $d = $dataset->numColumns();
@@ -70,8 +72,23 @@ final class MultilayerPerceptron implements Learner, Probabilistic
         $layers[] = new Dense($inSize, $k);
         $layers[] = new Softmax();
 
-        $this->network = new Sequential($layers, new Adam($this->learningRate));
-        $this->network->train($dataset, $this->epochs, $this->batchSize);
+        $this->network = new Sequential(
+            $layers,
+            new CategoricalCrossEntropy(),
+            new Adam($this->learningRate)
+        );
+
+        // CategoricalCrossEntropy expects one-hot labels [N × K].
+        // Build the one-hot matrix in PHP, then wrap in a new Dataset.
+        $nSamples   = count($flat);
+        $oneHotData = array_fill(0, $nSamples, array_fill(0, $k, 0.0));
+        foreach ($flat as $i => $label) {
+            $classIdx = $this->classMap[(string) $label];
+            $oneHotData[$i][$classIdx] = 1.0;
+        }
+        $trainDataset = new Dataset($dataset->samples(), Tensor::fromArray($oneHotData));
+
+        $this->network->train($trainDataset, $this->epochs, $this->batchSize);
     }
 
     public function proba(Dataset $dataset): Tensor

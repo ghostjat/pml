@@ -262,7 +262,11 @@ final class Sequential implements Learner, Persistable, Verbose
                 $type = $prop->getType();
                 if ($type instanceof \ReflectionNamedType && $type->getName() === Tensor::class) {
                     $prop->setAccessible(true);
-                    $prop->setValue($layerClone, null); 
+                    if ($type->allowsNull()) {
+                        $prop->setValue($layerClone, null);
+                    } else {
+                        $prop->setValue($layerClone, Tensor::zeros(1));
+                    }
                 }
             }
 

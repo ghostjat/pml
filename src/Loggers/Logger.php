@@ -2,14 +2,12 @@
 declare(strict_types=1);
 
 namespace Pml\Loggers;
+use Psr\Log\LoggerInterface; 
 
 /**
  * PSR-3 compatible logger interface.
  */
-interface Logger
+interface Logger extends LoggerInterface
 {
-    public function info(string $message): void;
-    public function warning(string $message): void;
-    public function error(string $message): void;
-    public function debug(string $message): void;
+   
 }

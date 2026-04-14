@@ -6,11 +6,6 @@ namespace Pml\Losses;
 
 use Pml\Tensor;
 
-/**
- * Categorical Cross Entropy Loss.
- * Standard loss function for Multi-Class classification paired with Softmax.
- * Expects $labels to be One-Hot Encoded (e.g., [0, 1, 0, 0]).
- */
 final class CategoricalCrossEntropy implements Loss
 {
     public function compute(Tensor $predictions, Tensor $labels): float
@@ -30,9 +25,9 @@ final class CategoricalCrossEntropy implements Loss
         $clipped = $predictions->clip(1e-7, 1.0 - 1e-7);
         $batchSize = (float) $predictions->shape()[0];
         
-        // Formula: dY = -(y_true / y_pred) / BatchSize
-        // Uses inplace mutation on the division output
-        $diff = $labels->div($clipped);
+        // FIXED: Added epsilon scalar to the denominator to prevent gradient explosion
+        $denominator = $clipped->addScalar(1e-8);
+        $diff = $labels->div($denominator);
         
         return $diff->mulScalarInplace(-1.0 / $batchSize);
     }

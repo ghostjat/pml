@@ -6,10 +6,6 @@ namespace Pml\NeuralNetwork\Optimizers;
 
 use Pml\Tensor;
 
-/**
- * AdaMax Optimizer.
- * A variant of Adam based on the infinity norm. Can be more stable than Adam for models with embeddings.
- */
 final class AdaMax implements Optimizer
 {
     private float $learningRate;
@@ -57,14 +53,15 @@ final class AdaMax implements Optimizer
                     $uScaled = $u->mulScalar($this->beta2);
                     $absG = $g->abs();
                     
-                    // Hardware Boolean Masking to resolve max()
                     $mask = $uScaled->greater($absG);
                     $uUpdated = $mask->where($uScaled, $absG);
                     $this->uCache[$oid] = $uUpdated;
 
-                    // Update = (lr / biasCorrection1) * (m / (u + eps))
                     $stepSize = $this->learningRate / $biasCorrection1;
-                    $update = $m->div($uUpdated->addScalarInplace($this->epsilon))->mulScalarInplace($stepSize);
+                    
+                    // FIXED: Removed Inplace mutation on the cached uUpdated tensor!
+                    $denominator = $uUpdated->addScalar($this->epsilon);
+                    $update = $m->div($denominator)->mulScalarInplace($stepSize);
 
                     $paramTensor->subInplace($update);
                 }
