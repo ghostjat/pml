@@ -6,8 +6,12 @@
 #include <float.h>
 #include <time.h>
 #include <sys/time.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <immintrin.h>
-#include <cblas.h>     
+#include <cblas.h>
 #include <lapacke.h>
 #include <omp.h>
 
@@ -66,8 +70,26 @@ void tensor_set_error(const char *msg) {
 } while(0)
 
 // ============================================================================
-// 1. SAFE MEMORY & LIFECYCLE
+// 1. SAFE MEMORY & LIFECYCLE (Size-Class Pools)
 // ============================================================================
+#define POOL_MAX_BINS 64
+#define POOL_BIN_SHIFT 10 // 1KB bins up to 64KB
+
+typedef struct PoolNode {
+    struct PoolNode* next;
+} PoolNode;
+
+static PoolNode* size_pools[POOL_MAX_BINS] = {NULL};
+static omp_lock_t pool_locks[POOL_MAX_BINS];
+static bool pools_initialized = false;
+
+static void init_pools() {
+    if (!pools_initialized) {
+        for (int i = 0; i < POOL_MAX_BINS; i++) omp_init_lock(&pool_locks[i]);
+        pools_initialized = true;
+    }
+}
+
 void* safe_malloc(size_t size) {
     if (size == 0) return NULL;
     void* ptr = malloc(size);
@@ -78,12 +100,46 @@ void* safe_malloc(size_t size) {
 
 void* safe_memalign(size_t alignment, size_t size) {
     if (size == 0) return NULL;
+    init_pools();
+    
+    // Calculate bin index based on a size rounded up to the nearest bin
+    int bin = (size + (1 << POOL_BIN_SHIFT) - 1) >> POOL_BIN_SHIFT;
+    size_t alloc_size = bin << POOL_BIN_SHIFT;
+    if (alloc_size == 0) alloc_size = 1 << POOL_BIN_SHIFT;
+    
+    if (bin < POOL_MAX_BINS && alignment <= 64) {
+        omp_set_lock(&pool_locks[bin]);
+        PoolNode* node = size_pools[bin];
+        if (node) size_pools[bin] = node->next;
+        omp_unset_lock(&pool_locks[bin]);
+        if (node) {
+            memset(node, 0, size);
+            return (void*)node;
+        }
+        size = alloc_size; // Allocate the full bin size
+    }
+    
     void* ptr = NULL;
-    if (posix_memalign(&ptr, alignment, size) != 0 || !ptr) {
+    if (posix_memalign(&ptr, alignment > 64 ? alignment : 64, size) != 0 || !ptr) {
         TENSOR_ERROR_VAL(NULL, "FATAL: Memalign failed.");
     }
     memset(ptr, 0, size);
     return ptr;
+}
+
+void safe_free_size(void* ptr, size_t size) {
+    if (!ptr) return;
+    init_pools();
+    int bin = (size + (1 << POOL_BIN_SHIFT) - 1) >> POOL_BIN_SHIFT;
+    if (bin < POOL_MAX_BINS) {
+        omp_set_lock(&pool_locks[bin]);
+        PoolNode* node = (PoolNode*)ptr;
+        node->next = size_pools[bin];
+        size_pools[bin] = node;
+        omp_unset_lock(&pool_locks[bin]);
+        return;
+    }
+    free(ptr);
 }
 
 void safe_free(void** ptr) {
@@ -144,10 +200,10 @@ Tensor* tensor_create_uninitialized(int ndim, int* shape, TensorDType dtype) {
     }
     _compute_strides(t);
     t->byte_size = t->total_size * dtype_size(dtype);
-    void* data = NULL;
-    // posix_memalign requires size > 0; fall back to a 32-byte sentinel for empty tensors
-    size_t alloc_size = t->byte_size > 0 ? t->byte_size : 32;
-    if (posix_memalign(&data, 32, alloc_size) != 0) {
+    // fall back to a 64-byte sentinel for empty tensors
+    size_t alloc_size = t->byte_size > 0 ? t->byte_size : 64;
+    void* data = safe_memalign(64, alloc_size);
+    if (!data) {
         free(t);
         TENSOR_ERROR("FATAL: Memalign failed.");
     }
@@ -215,7 +271,10 @@ Tensor* tensor_from_external(void* data, int ndim, int* shape, TensorDType dtype
 void tensor_free(Tensor* t) {
     if (t) {
         if (t->is_arena) return; 
-        if (t->owns_data) safe_free(&t->data);
+        if (t->owns_data) {
+            size_t alloc_size = t->byte_size > 0 ? t->byte_size : 64;
+            safe_free_size(t->data, alloc_size);
+        }
         safe_free((void**)&t);
     }
 }
@@ -507,18 +566,19 @@ Tensor* tensor_transpose_nd(Tensor* t, int* axes) {
             ON_ERR("FATAL: Shapes not broadcastable."); \
         } \
         if (!IN_PLACE) OUT_TENSOR = tensor_create_uninitialized(out_ndim, out_shape, DTYPE_FLOAT32); \
-        int idx[8] = {0}; \
-        for (size_t i = 0; i < OUT_TENSOR->total_size; i++) { \
+        size_t limit = OUT_TENSOR->total_size; \
+        _Pragma("omp parallel for schedule(static) if(limit > 100000)") \
+        for (size_t i = 0; i < limit; i++) { \
+            size_t temp = i; \
             size_t offset_a = 0, offset_b = 0; \
-            for (int d = 0; d < out_ndim; d++) { \
-                offset_a += idx[d] * stride_A[d]; \
-                offset_b += idx[d] * stride_B[d]; \
+            for (int d = out_ndim - 1; d >= 0; d--) { \
+                size_t c = temp % out_shape[d]; \
+                temp /= out_shape[d]; \
+                offset_a += c * stride_A[d]; \
+                offset_b += c * stride_B[d]; \
             } \
             if (IN_PLACE) F32(OUT_TENSOR)[offset_a] = F32(A)[offset_a] SCALAR_OP F32(B)[offset_b]; \
             else F32(OUT_TENSOR)[i] = F32(A)[offset_a] SCALAR_OP F32(B)[offset_b]; \
-            for (int d = out_ndim - 1; d >= 0; d--) { \
-                idx[d]++; if (idx[d] < out_shape[d]) break; idx[d] = 0; \
-            } \
         } \
     }
 
@@ -558,15 +618,18 @@ void tensor_div_inplace(Tensor* A, Tensor* B) {
             F32(OUT_TENSOR)[i] = F32(A)[i] SCALAR_OP val; \
         } \
     }else { \
-        int idx[8] = {0}; \
-        for (size_t i = 0; i < OUT_TENSOR->total_size; i++) { \
+        size_t limit = OUT_TENSOR->total_size; \
+        _Pragma("omp parallel for schedule(static) if(limit > 100000)") \
+        for (size_t i = 0; i < limit; i++) { \
+            size_t temp = i; \
             size_t offset_a = 0; \
-            for (int d = 0; d < A->ndim; d++) offset_a += idx[d] * A->stride[d]; \
+            for (int d = A->ndim - 1; d >= 0; d--) { \
+                size_t c = temp % A->shape[d]; \
+                temp /= A->shape[d]; \
+                offset_a += c * A->stride[d]; \
+            } \
             if (IN_PLACE) F32(OUT_TENSOR)[offset_a] = F32(A)[offset_a] SCALAR_OP val; \
             else F32(OUT_TENSOR)[i] = F32(A)[offset_a] SCALAR_OP val; \
-            for (int d = A->ndim - 1; d >= 0; d--) { \
-                idx[d]++; if (idx[d] < A->shape[d]) break; idx[d] = 0; \
-            } \
         } \
     }
 
@@ -654,10 +717,24 @@ Tensor* tensor_clip(Tensor* A, float min_val, float max_val) {
     if (A->dtype != DTYPE_FLOAT32) TENSOR_ERROR("Requires FLOAT32.");
     Tensor* out = tensor_create_uninitialized(A->ndim, A->shape, DTYPE_FLOAT32);
     if (tensor_is_contiguous(A)) {
-        _Pragma("omp simd")
-        for (size_t i = 0; i < A->total_size; i++) {
-            float v = F32(A)[i];
-            F32(out)[i] = (v < min_val) ? min_val : ((v > max_val) ? max_val : v);
+        size_t n = A->total_size;
+        float* a = F32(A);
+        float* o = F32(out);
+        size_t i = 0;
+#ifdef __AVX2__
+        __m256 vmin = _mm256_set1_ps(min_val);
+        __m256 vmax = _mm256_set1_ps(max_val);
+        size_t limit = n & ~7UL;
+        for (; i < limit; i += 8) {
+            __m256 val = _mm256_loadu_ps(a + i);
+            val = _mm256_max_ps(vmin, val);
+            val = _mm256_min_ps(vmax, val);
+            _mm256_storeu_ps(o + i, val);
+        }
+#endif
+        for (; i < n; i++) {
+            float v = a[i];
+            o[i] = (v < min_val) ? min_val : ((v > max_val) ? max_val : v);
         }
     } else {
         int idx[8] = {0};
@@ -674,9 +751,42 @@ Tensor* tensor_clip(Tensor* A, float min_val, float max_val) {
     return out;
 }
 
-Tensor* tensor_relu(Tensor* A) { return tensor_clip(A, 0.0f, INFINITY); }
+Tensor* tensor_relu(Tensor* A) {
+    if (A->dtype != DTYPE_FLOAT32) TENSOR_ERROR("Requires FLOAT32.");
+    Tensor* out = tensor_create_uninitialized(A->ndim, A->shape, DTYPE_FLOAT32);
+    if (tensor_is_contiguous(A)) {
+        size_t n = A->total_size;
+        float* a = F32(A);
+        float* o = F32(out);
+        size_t i = 0;
+#ifdef __AVX2__
+        __m256 vzero = _mm256_setzero_ps();
+        size_t limit = n & ~7UL;
+        for (; i < limit; i += 8) {
+            __m256 val = _mm256_loadu_ps(a + i);
+            _mm256_storeu_ps(o + i, _mm256_max_ps(vzero, val));
+        }
+#endif
+        for (; i < n; i++) {
+            float v = a[i];
+            o[i] = v > 0.0f ? v : 0.0f;
+        }
+    } else {
+        int idx[8] = {0};
+        for (size_t i = 0; i < out->total_size; i++) {
+            size_t offset = 0;
+            for (int d = 0; d < A->ndim; d++) offset += idx[d] * A->stride[d];
+            float v = F32(A)[offset];
+            F32(out)[i] = v > 0.0f ? v : 0.0f;
+            for (int d = A->ndim - 1; d >= 0; d--) {
+                idx[d]++; if (idx[d] < A->shape[d]) break; idx[d] = 0;
+            }
+        }
+    }
+    return out;
+}
 
-#define TENSOR_LOGICAL_OP(OP_NAME, OP) \
+#define TENSOR_LOGICAL_OP(OP_NAME, OP, CMP_PRED) \
 Tensor* OP_NAME(Tensor* A, Tensor* B) { \
     if (A->dtype != DTYPE_FLOAT32 || B->dtype != DTYPE_FLOAT32) TENSOR_ERROR("Requires FLOAT32."); \
     int out_ndim, out_shape[8]; \
@@ -685,32 +795,53 @@ Tensor* OP_NAME(Tensor* A, Tensor* B) { \
         TENSOR_ERROR("FATAL: Shapes not broadcastable."); \
     } \
     Tensor* out = tensor_create_uninitialized(out_ndim, out_shape, DTYPE_FLOAT32); \
-    int idx[8] = {0}; \
-    for (size_t i = 0; i < out->total_size; i++) { \
-        size_t off_a = 0, off_b = 0; \
-        for (int d = 0; d < out_ndim; d++) { \
-            off_a += idx[d] * stride_A[d]; off_b += idx[d] * stride_B[d]; \
-        } \
-        F32(out)[i] = (F32(A)[off_a] OP F32(B)[off_b]) ? 1.0f : 0.0f; \
-        for (int d = out_ndim - 1; d >= 0; d--) { \
-            idx[d]++; if (idx[d] < out_shape[d]) break; idx[d] = 0; \
+    if (tensor_is_contiguous(A) && tensor_is_contiguous(B) && A->total_size == B->total_size) { \
+        size_t n = out->total_size; \
+        float* a = F32(A); float* b = F32(B); float* o = F32(out); \
+        size_t i = 0; \
+        _Pragma("omp parallel for simd if(n > 100000)") \
+        for (size_t j = 0; j < n; j++) o[j] = (a[j] OP b[j]) ? 1.0f : 0.0f; \
+    } else { \
+        int idx[8] = {0}; \
+        for (size_t i = 0; i < out->total_size; i++) { \
+            size_t off_a = 0, off_b = 0; \
+            for (int d = 0; d < out_ndim; d++) { \
+                off_a += idx[d] * stride_A[d]; off_b += idx[d] * stride_B[d]; \
+            } \
+            F32(out)[i] = (F32(A)[off_a] OP F32(B)[off_b]) ? 1.0f : 0.0f; \
+            for (int d = out_ndim - 1; d >= 0; d--) { \
+                idx[d]++; if (idx[d] < out_shape[d]) break; idx[d] = 0; \
+            } \
         } \
     } \
     return out; \
 }
 
-TENSOR_LOGICAL_OP(tensor_equal, ==)
-TENSOR_LOGICAL_OP(tensor_not_equal, !=)
-TENSOR_LOGICAL_OP(tensor_greater, >)
-TENSOR_LOGICAL_OP(tensor_greater_equal, >=)
-TENSOR_LOGICAL_OP(tensor_less, <)
-TENSOR_LOGICAL_OP(tensor_less_equal, <=)
+TENSOR_LOGICAL_OP(tensor_equal,         ==, _CMP_EQ_OQ)
+TENSOR_LOGICAL_OP(tensor_not_equal,     !=, _CMP_NEQ_OQ)
+TENSOR_LOGICAL_OP(tensor_greater,        >, _CMP_GT_OQ)
+TENSOR_LOGICAL_OP(tensor_greater_equal, >=, _CMP_GE_OQ)
+TENSOR_LOGICAL_OP(tensor_less,           <, _CMP_LT_OQ)
+TENSOR_LOGICAL_OP(tensor_less_equal,    <=, _CMP_LE_OQ)
 
 Tensor* tensor_logical_not(Tensor* A) {
     if (A->dtype != DTYPE_FLOAT32) TENSOR_ERROR("Requires FLOAT32.");
     Tensor* out = tensor_create_uninitialized(A->ndim, A->shape, DTYPE_FLOAT32);
     if (tensor_is_contiguous(A)) {
-        for(size_t i = 0; i < A->total_size; i++) F32(out)[i] = (F32(A)[i] == 0.0f) ? 1.0f : 0.0f;
+        size_t n = A->total_size;
+        float* a = F32(A); float* o = F32(out);
+        size_t i = 0;
+#ifdef __AVX2__
+        __m256 vzero = _mm256_setzero_ps();
+        __m256 vone  = _mm256_set1_ps(1.0f);
+        size_t limit = n & ~7UL;
+        for (; i < limit; i += 8) {
+            /* cmp_eq returns all-ones mask where a==0; and with 1.0f gives 0/1 */
+            __m256 cmp = _mm256_cmp_ps(_mm256_loadu_ps(a + i), vzero, _CMP_EQ_OQ);
+            _mm256_storeu_ps(o + i, _mm256_and_ps(cmp, vone));
+        }
+#endif
+        for (; i < n; i++) o[i] = (a[i] == 0.0f) ? 1.0f : 0.0f;
     } else {
         int idx[8] = {0};
         for (size_t i = 0; i < out->total_size; i++) {
@@ -887,7 +1018,32 @@ float tensor_product(Tensor* A) {
     if (A->dtype != DTYPE_FLOAT32) return 0.0f;
     float prod = 1.0f;
     if (tensor_is_contiguous(A)) {
-        for(size_t i=0; i<A->total_size; i++) prod *= F32(A)[i];
+        const float* data = F32(A);
+        size_t n = A->total_size;
+#ifdef __AVX2__
+        size_t i = 0;
+        if (n >= 32) {
+            __m256 p0 = _mm256_set1_ps(1.0f), p1 = _mm256_set1_ps(1.0f);
+            __m256 p2 = _mm256_set1_ps(1.0f), p3 = _mm256_set1_ps(1.0f);
+            size_t limit = n & ~31UL;
+            for (; i < limit; i += 32) {
+                __builtin_prefetch(data + i + 128, 0, 1);
+                p0 = _mm256_mul_ps(p0, _mm256_loadu_ps(data + i));
+                p1 = _mm256_mul_ps(p1, _mm256_loadu_ps(data + i +  8));
+                p2 = _mm256_mul_ps(p2, _mm256_loadu_ps(data + i + 16));
+                p3 = _mm256_mul_ps(p3, _mm256_loadu_ps(data + i + 24));
+            }
+            p0 = _mm256_mul_ps(_mm256_mul_ps(p0, p1), _mm256_mul_ps(p2, p3));
+            /* Horizontal product: extract 8 lanes and multiply */
+            float tmp[8]; _mm256_storeu_ps(tmp, p0);
+            prod = tmp[0]*tmp[1]*tmp[2]*tmp[3]*tmp[4]*tmp[5]*tmp[6]*tmp[7];
+            for (; i < n; i++) prod *= data[i];
+        } else {
+            for (; i < n; i++) prod *= data[i];
+        }
+#else
+        for (size_t i = 0; i < n; i++) prod *= data[i];
+#endif
     } else {
         int idx[8] = {0};
         for (size_t i = 0; i < A->total_size; i++) {
@@ -1142,6 +1298,17 @@ float tensor_max(Tensor* A) {
 
 int tensor_argmin(Tensor* A) {
     if (A->dtype != DTYPE_FLOAT32) return 0;
+    if (tensor_is_contiguous(A)) {
+        /* Pass 1: find minimum value using AVX2 (already vectorised in tensor_min) */
+        float min_val = tensor_min(A);
+        /* Pass 2: find first index — scalar scan, early-exit on first match */
+        const float* data = F32(A);
+        size_t n = A->total_size;
+        for (size_t i = 0; i < n; i++) {
+            if (data[i] == min_val) return (int)i;
+        }
+        return 0;
+    }
     float min_val = INFINITY; int global_idx = 0, best_idx = 0;
     int idx[8] = {0};
     for (size_t i = 0; i < A->total_size; i++) {
@@ -1158,6 +1325,17 @@ int tensor_argmin(Tensor* A) {
 
 int tensor_argmax(Tensor* A) {
     if (A->dtype != DTYPE_FLOAT32) return 0;
+    if (tensor_is_contiguous(A)) {
+        /* Pass 1: find maximum value using AVX2 (already vectorised in tensor_max) */
+        float max_val = tensor_max(A);
+        /* Pass 2: find first index — scalar scan, early-exit on first match */
+        const float* data = F32(A);
+        size_t n = A->total_size;
+        for (size_t i = 0; i < n; i++) {
+            if (data[i] == max_val) return (int)i;
+        }
+        return 0;
+    }
     float max_val = -INFINITY; int global_idx = 0, best_idx = 0;
     int idx[8] = {0};
     for (size_t i = 0; i < A->total_size; i++) {
@@ -1412,9 +1590,181 @@ Tensor* tensor_boolean_index(Tensor* A, Tensor* mask) {
 // ============================================================================
 // 9. LINEAR ALGEBRA & ADVANCED DECOMPOSITIONS
 // ============================================================================
+
+#ifdef __AVX2__
+static inline float _hsum256(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+    return _mm_cvtss_f32(s);
+}
+#endif
+
+static inline float micro_sdot(int n, const float* x, int incx, const float* y, int incy) {
+    if (n <= 0) return 0.0f;
+#ifdef __AVX2__
+    if (incx == 1 && incy == 1) {
+        float sum = 0.0f;
+        __m256 vsum0 = _mm256_setzero_ps();
+        __m256 vsum1 = _mm256_setzero_ps();
+        int i = 0;
+        for (; i + 15 < n; i += 16) {
+            __m256 vx0 = _mm256_loadu_ps(x + i);
+            __m256 vy0 = _mm256_loadu_ps(y + i);
+            __m256 vx1 = _mm256_loadu_ps(x + i + 8);
+            __m256 vy1 = _mm256_loadu_ps(y + i + 8);
+            vsum0 = _mm256_fmadd_ps(vx0, vy0, vsum0);
+            vsum1 = _mm256_fmadd_ps(vx1, vy1, vsum1);
+        }
+        vsum0 = _mm256_add_ps(vsum0, vsum1);
+        for (; i + 7 < n; i += 8) {
+            __m256 vx = _mm256_loadu_ps(x + i);
+            __m256 vy = _mm256_loadu_ps(y + i);
+            vsum0 = _mm256_fmadd_ps(vx, vy, vsum0);
+        }
+        sum = _hsum256(vsum0);
+        for (; i < n; i++) sum += x[i] * y[i];
+        return sum;
+    }
+#endif
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) sum += x[i * incx] * y[i * incy];
+    return sum;
+}
+
+static inline void micro_sgemv(int m, int n, const float* A, int lda, const float* x, float* y) {
+    for (int i = 0; i < m; i++) y[i] = 0.0f;
+    for (int i = 0; i < m; i++) {
+        float sum = 0.0f;
+        const float* row = A + i * lda;
+#ifdef __AVX2__
+        __m256 vsum0 = _mm256_setzero_ps();
+        __m256 vsum1 = _mm256_setzero_ps();
+        int j = 0;
+        for (; j + 15 < n; j += 16) {
+            __m256 vx0 = _mm256_loadu_ps(x + j);
+            __m256 vA0 = _mm256_loadu_ps(row + j);
+            __m256 vx1 = _mm256_loadu_ps(x + j + 8);
+            __m256 vA1 = _mm256_loadu_ps(row + j + 8);
+            vsum0 = _mm256_fmadd_ps(vx0, vA0, vsum0);
+            vsum1 = _mm256_fmadd_ps(vx1, vA1, vsum1);
+        }
+        vsum0 = _mm256_add_ps(vsum0, vsum1);
+        for (; j + 7 < n; j += 8) {
+            __m256 vx = _mm256_loadu_ps(x + j);
+            __m256 vA = _mm256_loadu_ps(row + j);
+            vsum0 = _mm256_fmadd_ps(vx, vA, vsum0);
+        }
+        sum = _hsum256(vsum0);
+        for (; j < n; j++) sum += row[j] * x[j];
+#else
+        for (int j = 0; j < n; j++) sum += row[j] * x[j];
+#endif
+        y[i] = sum;
+    }
+}
+
+static inline void micro_sgemv_trans(int m, int n, const float* A, int lda, const float* x, float* y) {
+    for (int j = 0; j < n; j++) y[j] = 0.0f;
+    for (int i = 0; i < m; i++) {
+        float xi = x[i];
+        const float* row = A + i * lda;
+#ifdef __AVX2__
+        __m256 vxi = _mm256_set1_ps(xi);
+        int j = 0;
+        for (; j + 15 < n; j += 16) {
+            __m256 vA0 = _mm256_loadu_ps(row + j);
+            __m256 vA1 = _mm256_loadu_ps(row + j + 8);
+            __m256 vy0 = _mm256_loadu_ps(y + j);
+            __m256 vy1 = _mm256_loadu_ps(y + j + 8);
+            _mm256_storeu_ps(y + j, _mm256_fmadd_ps(vA0, vxi, vy0));
+            _mm256_storeu_ps(y + j + 8, _mm256_fmadd_ps(vA1, vxi, vy1));
+        }
+        for (; j + 7 < n; j += 8) {
+            __m256 vA = _mm256_loadu_ps(row + j);
+            __m256 vy = _mm256_loadu_ps(y + j);
+            _mm256_storeu_ps(y + j, _mm256_fmadd_ps(vA, vxi, vy));
+        }
+        for (; j < n; j++) y[j] += row[j] * xi;
+#else
+        for (int j = 0; j < n; j++) y[j] += row[j] * xi;
+#endif
+    }
+}
+
+static inline void micro_sgemm(int m, int n, int k, const float* A, int lda, const float* B, int ldb, float* C, int ldc) {
+    for (int i = 0; i < m; i++) {
+        for (int j = 0; j < n; j++) C[i * ldc + j] = 0.0f;
+        for (int p = 0; p < k; p++) {
+            float a_ip = A[i * lda + p];
+            const float* B_row = B + p * ldb;
+            float* C_row = C + i * ldc;
+#ifdef __AVX2__
+            __m256 va = _mm256_set1_ps(a_ip);
+            int j = 0;
+            for (; j + 15 < n; j += 16) {
+                __m256 vb0 = _mm256_loadu_ps(B_row + j);
+                __m256 vb1 = _mm256_loadu_ps(B_row + j + 8);
+                __m256 vc0 = _mm256_loadu_ps(C_row + j);
+                __m256 vc1 = _mm256_loadu_ps(C_row + j + 8);
+                _mm256_storeu_ps(C_row + j, _mm256_fmadd_ps(va, vb0, vc0));
+                _mm256_storeu_ps(C_row + j + 8, _mm256_fmadd_ps(va, vb1, vc1));
+            }
+            for (; j + 7 < n; j += 8) {
+                __m256 vb = _mm256_loadu_ps(B_row + j);
+                __m256 vc = _mm256_loadu_ps(C_row + j);
+                _mm256_storeu_ps(C_row + j, _mm256_fmadd_ps(va, vb, vc));
+            }
+            for (; j < n; j++) C_row[j] += a_ip * B_row[j];
+#else
+            for (int j = 0; j < n; j++) C_row[j] += a_ip * B_row[j];
+#endif
+        }
+    }
+}
+
+static inline void micro_sgemm_transB(int m, int n, int k, const float* A, int lda, const float* B, int ldb, float* C, int ldc) {
+    for (int i = 0; i < m; i++) {
+        for (int j = 0; j < n; j++) {
+            float sum = 0.0f;
+            const float* a_row = A + i * lda;
+            const float* b_row = B + j * ldb;
+#ifdef __AVX2__
+            __m256 vsum0 = _mm256_setzero_ps();
+            __m256 vsum1 = _mm256_setzero_ps();
+            int p = 0;
+            for (; p + 15 < k; p += 16) {
+                __m256 va0 = _mm256_loadu_ps(a_row + p);
+                __m256 vb0 = _mm256_loadu_ps(b_row + p);
+                __m256 va1 = _mm256_loadu_ps(a_row + p + 8);
+                __m256 vb1 = _mm256_loadu_ps(b_row + p + 8);
+                vsum0 = _mm256_fmadd_ps(va0, vb0, vsum0);
+                vsum1 = _mm256_fmadd_ps(va1, vb1, vsum1);
+            }
+            vsum0 = _mm256_add_ps(vsum0, vsum1);
+            for (; p + 7 < k; p += 8) {
+                __m256 va = _mm256_loadu_ps(a_row + p);
+                __m256 vb = _mm256_loadu_ps(b_row + p);
+                vsum0 = _mm256_fmadd_ps(va, vb, vsum0);
+            }
+            sum = _hsum256(vsum0);
+            for (; p < k; p++) sum += a_row[p] * b_row[p];
+#else
+            for (int p = 0; p < k; p++) sum += a_row[p] * b_row[p];
+#endif
+            C[i * ldc + j] = sum;
+        }
+    }
+}
+
 float tensor_dot(Tensor* A, Tensor* B) {
     if(A->ndim != 1 || B->ndim != 1 || A->total_size != B->total_size || A->dtype != DTYPE_FLOAT32 || B->dtype != DTYPE_FLOAT32) {
         TENSOR_ERROR_VAL(0.0f, "FATAL [Dot]: Must be 1D FLOAT32 tensors of identical length.");
+    }
+    if (A->total_size < 2048) {
+        return micro_sdot(A->total_size, F32(A), A->stride[0], F32(B), B->stride[0]);
     }
     return cblas_sdot(A->total_size, F32(A), A->stride[0], F32(B), B->stride[0]);
 }
@@ -1511,11 +1861,15 @@ Tensor* tensor_matmul(Tensor* A, Tensor* B) {
         Tensor* a_c = tensor_is_contiguous(A) ? A : tensor_copy(A);
         Tensor* b_c = tensor_is_contiguous(B) ? B : tensor_copy(B);
         Tensor* out = tensor_create_uninitialized(2, (int[]){m, 1}, DTYPE_FLOAT32);
-        cblas_sgemv(CblasRowMajor, CblasNoTrans,
-                    m, k, 1.0f,
-                    F32(a_c), k,    /* lda = k for row-major [m,k] */
-                    F32(b_c), 1,    /* incx = 1 for contiguous [k,1] */
-                    0.0f, F32(out), 1);
+        if (m <= 128 && k <= 128) {
+            micro_sgemv(m, k, F32(a_c), k, F32(b_c), F32(out));
+        } else {
+            cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                        m, k, 1.0f,
+                        F32(a_c), k,    /* lda = k for row-major [m,k] */
+                        F32(b_c), 1,    /* incx = 1 for contiguous [k,1] */
+                        0.0f, F32(out), 1);
+        }
         if (a_c != A) tensor_free(a_c);
         if (b_c != B) tensor_free(b_c);
         return out;
@@ -1528,12 +1882,16 @@ Tensor* tensor_matmul(Tensor* A, Tensor* B) {
         Tensor* a_c = tensor_is_contiguous(A) ? A : tensor_copy(A);
         Tensor* b_c = tensor_is_contiguous(B) ? B : tensor_copy(B);
         Tensor* out = tensor_create_uninitialized(2, (int[]){1, n}, DTYPE_FLOAT32);
-        /* sgemv(Trans, rows=k, cols=n): out[j] = sum_i B[i,j]*x[i]  ==  x*B */
-        cblas_sgemv(CblasRowMajor, CblasTrans,
-                    k, n, 1.0f,
-                    F32(b_c), n,
-                    F32(a_c), 1,
-                    0.0f, F32(out), 1);
+        if (n <= 128 && k <= 128) {
+            micro_sgemv_trans(n, k, F32(b_c), n, F32(a_c), F32(out));
+        } else {
+            /* sgemv(Trans, rows=k, cols=n): out[j] = sum_i B[i,j]*x[i]  ==  x*B */
+            cblas_sgemv(CblasRowMajor, CblasTrans,
+                        k, n, 1.0f,
+                        F32(b_c), n,
+                        F32(a_c), 1,
+                        0.0f, F32(out), 1);
+        }
         if (a_c != A) tensor_free(a_c);
         if (b_c != B) tensor_free(b_c);
         return out;
@@ -1577,11 +1935,21 @@ Tensor* tensor_matmul(Tensor* A, Tensor* B) {
     /* beta=0.0 → BLAS overwrites every output element; no zero-fill needed. */
     Tensor* out = tensor_create_uninitialized(2, (int[]){m, n}, DTYPE_FLOAT32);
 
-    cblas_sgemm(CblasRowMajor, transA, transB,
-                m, n, k, 1.0f,
-                F32(a_work), lda,
-                F32(b_work), ldb,
-                0.0f, F32(out), n);
+    if (m <= 128 && n <= 128 && k <= 128 && transA == CblasNoTrans) {
+        if (transB == CblasNoTrans) {
+            micro_sgemm(m, n, k, F32(a_work), lda, F32(b_work), ldb, F32(out), n);
+        } else if (transB == CblasTrans) {
+            micro_sgemm_transB(m, n, k, F32(a_work), lda, F32(b_work), ldb, F32(out), n);
+        } else {
+            cblas_sgemm(CblasRowMajor, transA, transB, m, n, k, 1.0f, F32(a_work), lda, F32(b_work), ldb, 0.0f, F32(out), n);
+        }
+    } else {
+        cblas_sgemm(CblasRowMajor, transA, transB,
+                    m, n, k, 1.0f,
+                    F32(a_work), lda,
+                    F32(b_work), ldb,
+                    0.0f, F32(out), n);
+    }
 
     if (a_work != A) tensor_free(a_work);
     if (b_work != B) tensor_free(b_work);
@@ -1626,12 +1994,19 @@ Tensor* tensor_bmm(Tensor* A, Tensor* B) {
 
     #pragma omp parallel for schedule(dynamic) if(parallel)
     for (int b = 0; b < batch; b++) {
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    m, n, k, 1.0f,
-                    F32(a_work) + b * m * k, k,
-                    F32(b_work) + b * k * n, n,
-                    0.0f,
-                    F32(out)    + b * m * n, n);
+        if (m <= 128 && n <= 128 && k <= 128) {
+            micro_sgemm(m, n, k,
+                        F32(a_work) + b * m * k, k,
+                        F32(b_work) + b * k * n, n,
+                        F32(out)    + b * m * n, n);
+        } else {
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        m, n, k, 1.0f,
+                        F32(a_work) + b * m * k, k,
+                        F32(b_work) + b * k * n, n,
+                        0.0f,
+                        F32(out)    + b * m * n, n);
+        }
     }
 
     if (parallel && openblas_set_num_threads)
@@ -1640,6 +2015,162 @@ Tensor* tensor_bmm(Tensor* A, Tensor* B) {
     if (a_work != A) tensor_free(a_work);
     if (b_work != B) tensor_free(b_work);
     return out;
+}
+
+/*
+ * tensor_matmul_ex — 2-D GEMM with explicit transA / transB flags.
+ *
+ * Semantics: out = op(A) @ op(B)
+ *   op(X) = X^T when trans=true, X otherwise.
+ *
+ * lda / ldb are always the STORED column counts of A and B respectively
+ * (row-major BLAS convention: leading dimension = stored columns, regardless
+ * of the transpose flag).
+ *
+ * Returns a freshly-allocated [m, n] FLOAT32 tensor.
+ */
+Tensor* tensor_matmul_ex(Tensor* A, Tensor* B, bool transA, bool transB) {
+    if (A->dtype != DTYPE_FLOAT32 || B->dtype != DTYPE_FLOAT32)
+        TENSOR_ERROR("FATAL [MatmulEx]: Requires FLOAT32.");
+    if (A->ndim != 2 || B->ndim != 2)
+        TENSOR_ERROR("FATAL [MatmulEx]: Both inputs must be 2D.");
+
+    int m  = transA ? A->shape[1] : A->shape[0];
+    int k  = transA ? A->shape[0] : A->shape[1];
+    int k2 = transB ? B->shape[1] : B->shape[0];
+    int n  = transB ? B->shape[0] : B->shape[1];
+
+    if (k != k2)
+        TENSOR_ERROR("FATAL [MatmulEx]: Inner dims mismatch (%d vs %d).", k, k2);
+
+    /* lda/ldb = stored column count — constant regardless of transpose flag */
+    int lda = A->shape[1];
+    int ldb = B->shape[1];
+
+    Tensor* a_work = tensor_is_contiguous(A) ? A : tensor_copy(A);
+    Tensor* b_work = tensor_is_contiguous(B) ? B : tensor_copy(B);
+
+    Tensor* out = tensor_create_uninitialized(2, (int[]){m, n}, DTYPE_FLOAT32);
+    if (!out) {
+        if (a_work != A) tensor_free(a_work);
+        if (b_work != B) tensor_free(b_work);
+        return NULL;
+    }
+
+    cblas_sgemm(CblasRowMajor,
+                transA ? CblasTrans : CblasNoTrans,
+                transB ? CblasTrans : CblasNoTrans,
+                m, n, k, 1.0f,
+                F32(a_work), lda,
+                F32(b_work), ldb,
+                0.0f, F32(out), n);
+
+    if (a_work != A) tensor_free(a_work);
+    if (b_work != B) tensor_free(b_work);
+    return out;
+}
+
+/*
+ * tensor_matmul_into — zero-allocation GEMM: out = op(A) @ op(B)
+ *
+ * `out` must be a pre-allocated contiguous [m, n] FLOAT32 tensor.
+ * beta=0.0 — the output is fully overwritten; no prior zeroing needed.
+ * This is the core primitive for reusable gradient buffers in training loops.
+ */
+void tensor_matmul_into(Tensor* out, Tensor* A, Tensor* B, bool transA, bool transB) {
+    if (!out || !A || !B)
+        TENSOR_ERROR_VOID("FATAL [MatmulInto]: NULL pointer.");
+    if (A->dtype != DTYPE_FLOAT32 || B->dtype != DTYPE_FLOAT32 || out->dtype != DTYPE_FLOAT32)
+        TENSOR_ERROR_VOID("FATAL [MatmulInto]: Requires FLOAT32.");
+    if (A->ndim != 2 || B->ndim != 2 || out->ndim != 2)
+        TENSOR_ERROR_VOID("FATAL [MatmulInto]: All tensors must be 2D.");
+    if (!tensor_is_contiguous(out))
+        TENSOR_ERROR_VOID("FATAL [MatmulInto]: Output tensor must be contiguous.");
+
+    int m  = transA ? A->shape[1] : A->shape[0];
+    int k  = transA ? A->shape[0] : A->shape[1];
+    int k2 = transB ? B->shape[1] : B->shape[0];
+    int n  = transB ? B->shape[0] : B->shape[1];
+
+    if (k != k2)
+        TENSOR_ERROR_VOID("FATAL [MatmulInto]: Inner dims mismatch (%d vs %d).", k, k2);
+    if (out->shape[0] != m || out->shape[1] != n)
+        TENSOR_ERROR_VOID("FATAL [MatmulInto]: Output shape [%d,%d] ≠ expected [%d,%d].",
+                          out->shape[0], out->shape[1], m, n);
+
+    int lda = A->shape[1];
+    int ldb = B->shape[1];
+
+    Tensor* a_work = tensor_is_contiguous(A) ? A : tensor_copy(A);
+    Tensor* b_work = tensor_is_contiguous(B) ? B : tensor_copy(B);
+
+    cblas_sgemm(CblasRowMajor,
+                transA ? CblasTrans : CblasNoTrans,
+                transB ? CblasTrans : CblasNoTrans,
+                m, n, k, 1.0f,
+                F32(a_work), lda,
+                F32(b_work), ldb,
+                0.0f, F32(out), n);
+
+    if (a_work != A) tensor_free(a_work);
+    if (b_work != B) tensor_free(b_work);
+}
+
+/*
+ * tensor_sum_axis_into — zero-allocation axis-reduction: out[...] = sum(A, axis)
+ *
+ * `out` must be a pre-allocated tensor with the correct reduced shape.
+ * The buffer is zeroed and then accumulated into — no separate zero-fill step.
+ *
+ * Fast path: 2-D contiguous matrix, axis=0 → column sums via cblas_sgemv.
+ *   out[j] = Σ_i A[i,j]  implemented as  out = A^T * ones_batch
+ *   One BLAS call replaces an O(batch × n) scalar loop.
+ */
+void tensor_sum_axis_into(Tensor* out, Tensor* A, int axis) {
+    if (!out || !A)
+        TENSOR_ERROR_VOID("FATAL [SumAxisInto]: NULL pointer.");
+    if (A->dtype != DTYPE_FLOAT32 || out->dtype != DTYPE_FLOAT32)
+        TENSOR_ERROR_VOID("FATAL [SumAxisInto]: Requires FLOAT32.");
+    if (axis < 0 || axis >= A->ndim)
+        TENSOR_ERROR_VOID("FATAL [SumAxisInto]: Invalid axis %d for ndim=%d.", axis, A->ndim);
+
+    memset(F32(out), 0, out->byte_size);
+
+    /* Fast path: 2-D contiguous, axis=0 */
+    if (A->ndim == 2 && axis == 0 && tensor_is_contiguous(A) && tensor_is_contiguous(out)) {
+        int rows = A->shape[0];
+        int cols = A->shape[1];
+        if (out->total_size != (size_t)cols)
+            TENSOR_ERROR_VOID("FATAL [SumAxisInto]: Output size %zu ≠ %d (cols).",
+                              out->total_size, cols);
+
+        float* ones = (float*)malloc(rows * sizeof(float));
+        if (!ones) TENSOR_ERROR_VOID("FATAL [SumAxisInto]: malloc failed.");
+        for (int i = 0; i < rows; i++) ones[i] = 1.0f;
+
+        /* out[j] = A^T * ones  →  column sums */
+        cblas_sgemv(CblasRowMajor, CblasTrans,
+                    rows, cols, 1.0f,
+                    F32(A), cols, ones, 1,
+                    0.0f, F32(out), 1);
+        free(ones);
+        return;
+    }
+
+    /* Generic path */
+    int idx[8] = {0};
+    for (size_t i = 0; i < A->total_size; i++) {
+        size_t offset_a = 0, offset_out = 0;
+        int out_d = 0;
+        for (int d = 0; d < A->ndim; d++) {
+            offset_a += idx[d] * A->stride[d];
+            if (d != axis) offset_out += idx[d] * out->stride[out_d++];
+        }
+        F32(out)[offset_out] += F32(A)[offset_a];
+        for (int d = A->ndim - 1; d >= 0; d--) {
+            idx[d]++; if (idx[d] < A->shape[d]) break; idx[d] = 0;
+        }
+    }
 }
 
 Tensor* tensor_inverse(Tensor* A) {
@@ -2029,9 +2560,22 @@ Tensor* tensor_pinv(Tensor* A) {
 bool tensor_any(Tensor* A) {
     if (A->dtype != DTYPE_FLOAT32) return false;
     if (tensor_is_contiguous(A)) {
-        for (size_t i = 0; i < A->total_size; i++) {
-            if (fabsf(F32(A)[i]) > 1e-8f) return true;
+        const float* data = F32(A);
+        size_t n = A->total_size;
+        size_t i = 0;
+#ifdef __AVX2__
+        /* Check 8 lanes at once; movemask != 0 means at least one non-zero */
+        __m256 veps  = _mm256_set1_ps(1e-8f);
+        __m256 vsign = _mm256_set1_ps(-0.0f);
+        size_t limit = n & ~7UL;
+        for (; i < limit; i += 8) {
+            __m256 v    = _mm256_loadu_ps(data + i);
+            __m256 vabs = _mm256_andnot_ps(vsign, v);
+            __m256 cmp  = _mm256_cmp_ps(vabs, veps, _CMP_GT_OQ);
+            if (_mm256_movemask_ps(cmp)) return true;
         }
+#endif
+        for (; i < n; i++) if (fabsf(data[i]) > 1e-8f) return true;
     } else {
         int idx[8] = {0};
         for (size_t i = 0; i < A->total_size; i++) {
@@ -2049,9 +2593,22 @@ bool tensor_any(Tensor* A) {
 bool tensor_all(Tensor* A) {
     if (A->dtype != DTYPE_FLOAT32) return false;
     if (tensor_is_contiguous(A)) {
-        for (size_t i = 0; i < A->total_size; i++) {
-            if (fabsf(F32(A)[i]) <= 1e-8f) return false;
+        const float* data = F32(A);
+        size_t n = A->total_size;
+        size_t i = 0;
+#ifdef __AVX2__
+        /* If any lane is ≤ eps (abs), movemask will be non-zero → return false */
+        __m256 veps  = _mm256_set1_ps(1e-8f);
+        __m256 vsign = _mm256_set1_ps(-0.0f);
+        size_t limit = n & ~7UL;
+        for (; i < limit; i += 8) {
+            __m256 v    = _mm256_loadu_ps(data + i);
+            __m256 vabs = _mm256_andnot_ps(vsign, v);
+            __m256 cmp  = _mm256_cmp_ps(vabs, veps, _CMP_LE_OQ);
+            if (_mm256_movemask_ps(cmp)) return false;
         }
+#endif
+        for (; i < n; i++) if (fabsf(data[i]) <= 1e-8f) return false;
     } else {
         int idx[8] = {0};
         for (size_t i = 0; i < A->total_size; i++) {
@@ -2100,35 +2657,106 @@ Tensor* tensor_max_multi(Tensor* A, int* axes, int num_axes) { return tensor_red
 // MESSY DATA (NaN & Infinity)
 // ============================================================================
 
-#define TENSOR_IS_CHECK(OP_NAME, CHECK_FUNC) \
-Tensor* OP_NAME(Tensor* A) { \
-    if (A->dtype != DTYPE_FLOAT32) TENSOR_ERROR("Requires FLOAT32."); \
-    Tensor* out = tensor_create_uninitialized(A->ndim, A->shape, DTYPE_FLOAT32); \
-    if (tensor_is_contiguous(A)) { \
-        for (size_t i = 0; i < A->total_size; i++) F32(out)[i] = CHECK_FUNC(F32(A)[i]) ? 1.0f : 0.0f; \
-    } else { \
-        int idx[8] = {0}; \
-        for (size_t i = 0; i < out->total_size; i++) { \
-            size_t offset = 0; \
-            for (int d = 0; d < A->ndim; d++) offset += idx[d] * A->stride[d]; \
-            F32(out)[i] = CHECK_FUNC(F32(A)[offset]) ? 1.0f : 0.0f; \
-            for (int d = A->ndim - 1; d >= 0; d--) { \
-                idx[d]++; if (idx[d] < A->shape[d]) break; idx[d] = 0; \
-            } \
-        } \
-    } \
-    return out; \
+Tensor* tensor_isnan(Tensor* A) {
+    if (A->dtype != DTYPE_FLOAT32) TENSOR_ERROR("Requires FLOAT32.");
+    Tensor* out = tensor_create_uninitialized(A->ndim, A->shape, DTYPE_FLOAT32);
+    if (tensor_is_contiguous(A)) {
+        size_t n = A->total_size;
+        float* a = F32(A); float* o = F32(out);
+        size_t i = 0;
+#ifdef __AVX2__
+        __m256 vone = _mm256_set1_ps(1.0f);
+        size_t limit = n & ~7UL;
+        for (; i < limit; i += 8) {
+            __m256 v = _mm256_loadu_ps(a + i);
+            /* NaN != NaN: unordered compare gives all-ones mask for NaN lanes */
+            __m256 cmp = _mm256_cmp_ps(v, v, _CMP_UNORD_Q);
+            _mm256_storeu_ps(o + i, _mm256_and_ps(cmp, vone));
+        }
+#endif
+        for (; i < n; i++) o[i] = isnan(a[i]) ? 1.0f : 0.0f;
+    } else {
+        int idx[8] = {0};
+        for (size_t i = 0; i < out->total_size; i++) {
+            size_t offset = 0;
+            for (int d = 0; d < A->ndim; d++) offset += idx[d] * A->stride[d];
+            F32(out)[i] = isnan(F32(A)[offset]) ? 1.0f : 0.0f;
+            for (int d = A->ndim - 1; d >= 0; d--) {
+                idx[d]++; if (idx[d] < A->shape[d]) break; idx[d] = 0;
+            }
+        }
+    }
+    return out;
 }
 
-TENSOR_IS_CHECK(tensor_isnan, isnan)
-TENSOR_IS_CHECK(tensor_isinf, isinf)
+Tensor* tensor_isinf(Tensor* A) {
+    if (A->dtype != DTYPE_FLOAT32) TENSOR_ERROR("Requires FLOAT32.");
+    Tensor* out = tensor_create_uninitialized(A->ndim, A->shape, DTYPE_FLOAT32);
+    if (tensor_is_contiguous(A)) {
+        size_t n = A->total_size;
+        float* a = F32(A); float* o = F32(out);
+        size_t i = 0;
+#ifdef __AVX2__
+        /* |a| == INF: abs(a) == +∞. Use _mm256_andnot_ps to clear sign bit. */
+        __m256 vinf  = _mm256_set1_ps(INFINITY);
+        __m256 vsign = _mm256_set1_ps(-0.0f);   /* sign-bit mask */
+        __m256 vone  = _mm256_set1_ps(1.0f);
+        size_t limit = n & ~7UL;
+        for (; i < limit; i += 8) {
+            __m256 v    = _mm256_loadu_ps(a + i);
+            __m256 vabs = _mm256_andnot_ps(vsign, v);  /* abs(v) */
+            __m256 cmp  = _mm256_cmp_ps(vabs, vinf, _CMP_EQ_OQ);
+            _mm256_storeu_ps(o + i, _mm256_and_ps(cmp, vone));
+        }
+#endif
+        for (; i < n; i++) o[i] = isinf(a[i]) ? 1.0f : 0.0f;
+    } else {
+        int idx[8] = {0};
+        for (size_t i = 0; i < out->total_size; i++) {
+            size_t offset = 0;
+            for (int d = 0; d < A->ndim; d++) offset += idx[d] * A->stride[d];
+            F32(out)[i] = isinf(F32(A)[offset]) ? 1.0f : 0.0f;
+            for (int d = A->ndim - 1; d >= 0; d--) {
+                idx[d]++; if (idx[d] < A->shape[d]) break; idx[d] = 0;
+            }
+        }
+    }
+    return out;
+}
 
 void tensor_nan_to_num_inplace(Tensor* A, float nan_val, float posinf_val, float neginf_val) {
     if (A->dtype != DTYPE_FLOAT32) return;
     if (tensor_is_contiguous(A)) {
-        for (size_t i = 0; i < A->total_size; i++) {
-            if (isnan(F32(A)[i])) F32(A)[i] = nan_val;
-            else if (isinf(F32(A)[i])) F32(A)[i] = F32(A)[i] > 0 ? posinf_val : neginf_val;
+        float* data = F32(A);
+        size_t n = A->total_size;
+        size_t i = 0;
+#ifdef __AVX2__
+        __m256 vnan     = _mm256_set1_ps(nan_val);
+        __m256 vposinf  = _mm256_set1_ps(posinf_val);
+        __m256 vneginf  = _mm256_set1_ps(neginf_val);
+        __m256 vinf     = _mm256_set1_ps(INFINITY);
+        __m256 vsign    = _mm256_set1_ps(-0.0f);
+        __m256 vzero    = _mm256_setzero_ps();
+        size_t limit = n & ~7UL;
+        for (; i < limit; i += 8) {
+            __m256 v    = _mm256_loadu_ps(data + i);
+            __m256 vabs = _mm256_andnot_ps(vsign, v);
+            /* NaN mask: v != v */
+            __m256 nan_mask  = _mm256_cmp_ps(v, v, _CMP_UNORD_Q);
+            /* Inf masks: |v| == INF, split by sign */
+            __m256 inf_mask  = _mm256_cmp_ps(vabs, vinf, _CMP_EQ_OQ);
+            __m256 pos_mask  = _mm256_and_ps(inf_mask, _mm256_cmp_ps(v, vzero, _CMP_GT_OQ));
+            __m256 neg_mask  = _mm256_andnot_ps(pos_mask, inf_mask);
+            /* Apply replacements: NaN → nan_val, +Inf → posinf_val, -Inf → neginf_val */
+            __m256 result = _mm256_blendv_ps(v,       vneginf, neg_mask);
+            result        = _mm256_blendv_ps(result,  vposinf, pos_mask);
+            result        = _mm256_blendv_ps(result,  vnan,    nan_mask);
+            _mm256_storeu_ps(data + i, result);
+        }
+#endif
+        for (; i < n; i++) {
+            if (isnan(data[i])) data[i] = nan_val;
+            else if (isinf(data[i])) data[i] = data[i] > 0 ? posinf_val : neginf_val;
         }
     } else {
         int idx[8] = {0};
@@ -2137,7 +2765,6 @@ void tensor_nan_to_num_inplace(Tensor* A, float nan_val, float posinf_val, float
             for (int d = 0; d < A->ndim; d++) offset += idx[d] * A->stride[d];
             if (isnan(F32(A)[offset])) F32(A)[offset] = nan_val;
             else if (isinf(F32(A)[offset])) F32(A)[offset] = F32(A)[offset] > 0 ? posinf_val : neginf_val;
-            
             for (int d = A->ndim - 1; d >= 0; d--) {
                 idx[d]++; if (idx[d] < A->shape[d]) break; idx[d] = 0;
             }
@@ -2273,29 +2900,48 @@ Tensor* tensor_im2col(Tensor* A, int kernel_h, int kernel_w,
     return out;
 }
 
-Tensor* tensor_col2im(Tensor* cols_tensor, int batch, int channels, int height, int width, 
+/*
+ * tensor_col2im — cache-friendly rewrite.
+ *
+ * Old order: (c, kh, kw) outer → (b, oh, ow) inner
+ *   reads  cols_tensor with stride `cols` (scattered)
+ *   writes out with contiguous inner loops but non-sequential outer pattern
+ *
+ * New order: (b, oh, ow) outer → (c, kh, kw) inner
+ *   reads  cols_tensor row-major (sequential — one cache line per output pixel)
+ *   writes out at scattered positions, but inner (c, kh, kw) loop is the same
+ *   access pattern as im2col, so hardware prefetcher has a chance.
+ */
+Tensor* tensor_col2im(Tensor* cols_tensor, int batch, int channels, int height, int width,
                       int kernel_h, int kernel_w, int stride_h, int stride_w, int pad_h, int pad_w) {
-                          
     Tensor* out = tensor_zeros(4, (int[]){batch, channels, height, width});
     int out_h = (height + 2 * pad_h - kernel_h) / stride_h + 1;
-    int out_w = (width + 2 * pad_w - kernel_w) / stride_w + 1;
-    int cols = channels * kernel_h * kernel_w;
-    
-    for (int c = 0; c < channels; c++) {
-        for (int kh = 0; kh < kernel_h; kh++) {
-            for (int kw = 0; kw < kernel_w; kw++) {
-                int col_idx = c * (kernel_h * kernel_w) + kh * kernel_w + kw;
-                float* in_col = F32(cols_tensor) + col_idx; 
-                for (int b = 0; b < batch; b++) {
-                    for (int oh = 0; oh < out_h; oh++) {
-                        for (int ow = 0; ow < out_w; ow++) { 
-                            int row_idx = b * (out_h * out_w) + oh * out_w + ow;
-                            int im_h = oh * stride_h - pad_h + kh;
-                            int im_w = ow * stride_w - pad_w + kw;
-                            
-                            if (im_h >= 0 && im_h < height && im_w >= 0 && im_w < width) {
-                                size_t a_idx = b * out->stride[0] + c * out->stride[1] + im_h * out->stride[2] + im_w * out->stride[3];
-                                F32(out)[a_idx] += in_col[row_idx * cols];
+    int out_w = (width  + 2 * pad_w - kernel_w) / stride_w + 1;
+    int cols  = channels * kernel_h * kernel_w;
+
+    /* Pre-compute output tensor strides (always contiguous after tensor_zeros) */
+    size_t os0 = out->stride[0]; /* batch  */
+    size_t os1 = out->stride[1]; /* channel */
+    size_t os2 = out->stride[2]; /* height  */
+    /* stride[3] == 1 */
+
+    for (int b = 0; b < batch; b++) {
+        for (int oh = 0; oh < out_h; oh++) {
+            for (int ow = 0; ow < out_w; ow++) {
+                /* Pointer to this pixel's full column vector — sequential read */
+                int row_idx = b * (out_h * out_w) + oh * out_w + ow;
+                const float* col_row = F32(cols_tensor) + (size_t)row_idx * cols;
+
+                int col_idx = 0;
+                for (int c = 0; c < channels; c++) {
+                    for (int kh_i = 0; kh_i < kernel_h; kh_i++) {
+                        int im_h = oh * stride_h - pad_h + kh_i;
+                        bool h_valid = (im_h >= 0 && im_h < height);
+                        for (int kw_i = 0; kw_i < kernel_w; kw_i++, col_idx++) {
+                            int im_w = ow * stride_w - pad_w + kw_i;
+                            if (h_valid && im_w >= 0 && im_w < width) {
+                                F32(out)[b * os0 + c * os1 + im_h * os2 + im_w]
+                                    += col_row[col_idx];
                             }
                         }
                     }
@@ -2641,11 +3287,15 @@ Tensor* tensor_linear(Tensor* X, Tensor* W, Tensor* bias) {
     Tensor* out = tensor_create_uninitialized(X->ndim, out_shape, DTYPE_FLOAT32);
 
     /* SGEMM: out = X * W^T  (W stored as [n,k], so Trans gives [k,n]) */
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                m, n, k, 1.0f,
-                F32(x_work), k,
-                F32(w_work), k,
-                0.0f, F32(out), n);
+    if (m <= 128 && n <= 128 && k <= 128) {
+        micro_sgemm_transB(m, n, k, F32(x_work), k, F32(w_work), k, F32(out), n);
+    } else {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    m, n, k, 1.0f,
+                    F32(x_work), k,
+                    F32(w_work), k,
+                    0.0f, F32(out), n);
+    }
 
     /* Fused bias addition: single AVX2 pass over the output matrix */
     if (bias != NULL) {
@@ -2790,5 +3440,1222 @@ void tensor_configure_threading(int omp_threads, int blas_threads) {
     if (blas_threads > 0) {
         if (openblas_set_num_threads) openblas_set_num_threads(blas_threads);
         else if (goto_set_num_threads) goto_set_num_threads(blas_threads);
+    }
+}
+
+// ============================================================================
+// 18. TRANSFORMER INFERENCE PRIMITIVES
+// ============================================================================
+
+/* ---------------------------------------------------------------------------
+ * fast_expf — scalar Cephes polynomial exp, ~4× faster than libm expf.
+ * Accurate to <1 ULP for x in [-87.3, 88.4].  Called with x <= 0 in all
+ * attention/softmax paths so the upper clamp is a no-op hint for the compiler.
+ * --------------------------------------------------------------------------- */
+static inline float fast_expf(float x) {
+    if (__builtin_expect(x < -88.3762626647949f, 0)) return 0.0f;
+
+    /* range reduction: x = g + n*ln2 */
+    float fx = floorf(x * 1.44269504088896341f + 0.5f);
+    x -= fx * 0.693359375f;
+    x -= fx * (-2.12194440e-4f);
+
+    /* degree-7 polynomial for exp(g) */
+    float z = x * x;
+    float y = 1.9875691500e-4f;
+    y = y * x + 1.3981999507e-3f;
+    y = y * x + 8.3334519073e-3f;
+    y = y * x + 4.1665795894e-2f;
+    y = y * x + 1.6666665459e-1f;
+    y = y * x + 5.0000001201e-1f;
+    y = y * z + x + 1.0f;
+
+    /* scale by 2^n via IEEE bit manipulation */
+    int fi = (int)fx;
+    int bits = (fi + 127) << 23;
+    float pw2; memcpy(&pw2, &bits, sizeof pw2);
+    return y * pw2;
+}
+
+/* ---------------------------------------------------------------------------
+ * avx2_expf — 8-wide AVX2 vectorized exp(x), same Cephes polynomial.
+ * Throughput: 8 floats per ~20 cycles vs ~80 cycles for 8× scalar expf.
+ * --------------------------------------------------------------------------- */
+#ifdef __AVX2__
+static inline __m256 avx2_expf(__m256 x) {
+    x = _mm256_max_ps(x, _mm256_set1_ps(-88.3762626647949f));
+    x = _mm256_min_ps(x, _mm256_set1_ps( 88.3762626647949f));
+
+    __m256 fx = _mm256_floor_ps(
+        _mm256_fmadd_ps(x, _mm256_set1_ps(1.44269504088896341f),
+                           _mm256_set1_ps(0.5f)));
+    x = _mm256_fnmadd_ps(fx, _mm256_set1_ps( 0.693359375f),    x);
+    x = _mm256_fnmadd_ps(fx, _mm256_set1_ps(-2.12194440e-4f),  x);
+
+    __m256 z = _mm256_mul_ps(x, x);
+    __m256 y = _mm256_set1_ps(1.9875691500e-4f);
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(1.3981999507e-3f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(8.3334519073e-3f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(4.1665795894e-2f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(1.6666665459e-1f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(5.0000001201e-1f));
+    y = _mm256_fmadd_ps(y, z, _mm256_add_ps(x, _mm256_set1_ps(1.0f)));
+
+    __m256i n = _mm256_add_epi32(_mm256_cvttps_epi32(fx), _mm256_set1_epi32(127));
+    return _mm256_mul_ps(y, _mm256_castsi256_ps(_mm256_slli_epi32(n, 23)));
+}
+#endif
+
+/* ---------------------------------------------------------------------------
+ * dot_f32 — 4-accumulator AVX2 FMA dot product; scalar fallback.
+ * --------------------------------------------------------------------------- */
+static inline float dot_f32(const float* __restrict a,
+                            const float* __restrict b, int n) {
+    int i = 0;
+    float sum = 0.0f;
+#ifdef __AVX2__
+    __m256 s0 = _mm256_setzero_ps(), s1 = s0, s2 = s0, s3 = s0;
+    for (; i <= n - 32; i += 32) {
+        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a+i),    _mm256_loadu_ps(b+i),    s0);
+        s1 = _mm256_fmadd_ps(_mm256_loadu_ps(a+i+ 8), _mm256_loadu_ps(b+i+ 8), s1);
+        s2 = _mm256_fmadd_ps(_mm256_loadu_ps(a+i+16), _mm256_loadu_ps(b+i+16), s2);
+        s3 = _mm256_fmadd_ps(_mm256_loadu_ps(a+i+24), _mm256_loadu_ps(b+i+24), s3);
+    }
+    s0 = _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3));
+    for (; i <= n - 8; i += 8)
+        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a+i), _mm256_loadu_ps(b+i), s0);
+    {
+        __m128 lo = _mm256_castps256_ps128(s0);
+        __m128 hi = _mm256_extractf128_ps(s0, 1);
+        lo = _mm_add_ps(lo, hi);
+        lo = _mm_hadd_ps(lo, lo);
+        lo = _mm_hadd_ps(lo, lo);
+        sum = _mm_cvtss_f32(lo);
+    }
+#endif
+    for (; i < n; i++) sum += a[i] * b[i];
+    return sum;
+}
+
+/* ---------------------------------------------------------------------------
+ * softmax_rows — shared row-wise stable softmax on a raw float buffer.
+ * Single exp pass: max-reduce → AVX2 vectorized exp+sum fused → normalize.
+ * No Tensor wrapper; called from tensor_softmax_inplace and tensor_attention.
+ * --------------------------------------------------------------------------- */
+static void softmax_rows(float* __restrict data, int rows, int cols) {
+#pragma omp parallel for schedule(static) if(rows > 64)
+    for (int r = 0; r < rows; r++) {
+        float* __restrict row = data + (size_t)r * cols;
+
+        /* 1. max-reduce — 4-wide AVX2 unroll */
+        float vmax = -FLT_MAX;
+        int j = 0;
+#ifdef __AVX2__
+        {
+            __m256 mx0 = _mm256_set1_ps(-FLT_MAX);
+            __m256 mx1 = mx0, mx2 = mx0, mx3 = mx0;
+            for (; j <= cols - 32; j += 32) {
+                mx0 = _mm256_max_ps(mx0, _mm256_loadu_ps(row + j));
+                mx1 = _mm256_max_ps(mx1, _mm256_loadu_ps(row + j +  8));
+                mx2 = _mm256_max_ps(mx2, _mm256_loadu_ps(row + j + 16));
+                mx3 = _mm256_max_ps(mx3, _mm256_loadu_ps(row + j + 24));
+            }
+            mx0 = _mm256_max_ps(_mm256_max_ps(mx0, mx1), _mm256_max_ps(mx2, mx3));
+            for (; j <= cols - 8; j += 8)
+                mx0 = _mm256_max_ps(mx0, _mm256_loadu_ps(row + j));
+            __m128 lo = _mm256_castps256_ps128(mx0);
+            __m128 hi = _mm256_extractf128_ps(mx0, 1);
+            lo = _mm_max_ps(lo, hi);
+            lo = _mm_max_ps(lo, _mm_movehl_ps(lo, lo));
+            lo = _mm_max_ss(lo, _mm_shuffle_ps(lo, lo, 1));
+            vmax = _mm_cvtss_f32(lo);
+        }
+#endif
+        for (; j < cols; j++) if (row[j] > vmax) vmax = row[j];
+
+        /* 2. exp(x-max) + sum — single pass, 4-wide AVX2 exp, scalar tail */
+        float sum = 0.0f;
+        j = 0;
+#ifdef __AVX2__
+        {
+            __m256 vs0 = _mm256_setzero_ps(), vs1 = vs0, vs2 = vs0, vs3 = vs0;
+            __m256 vm  = _mm256_set1_ps(vmax);
+            for (; j <= cols - 32; j += 32) {
+                __m256 e0 = avx2_expf(_mm256_sub_ps(_mm256_loadu_ps(row + j),      vm));
+                __m256 e1 = avx2_expf(_mm256_sub_ps(_mm256_loadu_ps(row + j +  8), vm));
+                __m256 e2 = avx2_expf(_mm256_sub_ps(_mm256_loadu_ps(row + j + 16), vm));
+                __m256 e3 = avx2_expf(_mm256_sub_ps(_mm256_loadu_ps(row + j + 24), vm));
+                _mm256_storeu_ps(row + j,      e0);
+                _mm256_storeu_ps(row + j +  8, e1);
+                _mm256_storeu_ps(row + j + 16, e2);
+                _mm256_storeu_ps(row + j + 24, e3);
+                vs0 = _mm256_add_ps(vs0, e0); vs1 = _mm256_add_ps(vs1, e1);
+                vs2 = _mm256_add_ps(vs2, e2); vs3 = _mm256_add_ps(vs3, e3);
+            }
+            vs0 = _mm256_add_ps(_mm256_add_ps(vs0, vs1), _mm256_add_ps(vs2, vs3));
+            for (; j <= cols - 8; j += 8) {
+                __m256 e = avx2_expf(_mm256_sub_ps(_mm256_loadu_ps(row + j), vm));
+                _mm256_storeu_ps(row + j, e);
+                vs0 = _mm256_add_ps(vs0, e);
+            }
+            __m128 lo = _mm256_castps256_ps128(vs0);
+            __m128 hi = _mm256_extractf128_ps(vs0, 1);
+            lo = _mm_add_ps(lo, hi);
+            lo = _mm_hadd_ps(lo, lo);
+            lo = _mm_hadd_ps(lo, lo);
+            sum = _mm_cvtss_f32(lo);
+        }
+#endif
+        for (; j < cols; j++) { float e = fast_expf(row[j] - vmax); row[j] = e; sum += e; }
+
+        /* 3. normalize — 4-wide AVX2 unroll */
+        float inv_sum = 1.0f / sum;
+        j = 0;
+#ifdef __AVX2__
+        {
+            __m256 vi = _mm256_set1_ps(inv_sum);
+            for (; j <= cols - 32; j += 32) {
+                _mm256_storeu_ps(row + j,      _mm256_mul_ps(_mm256_loadu_ps(row + j),      vi));
+                _mm256_storeu_ps(row + j +  8, _mm256_mul_ps(_mm256_loadu_ps(row + j +  8), vi));
+                _mm256_storeu_ps(row + j + 16, _mm256_mul_ps(_mm256_loadu_ps(row + j + 16), vi));
+                _mm256_storeu_ps(row + j + 24, _mm256_mul_ps(_mm256_loadu_ps(row + j + 24), vi));
+            }
+            for (; j <= cols - 8; j += 8)
+                _mm256_storeu_ps(row + j, _mm256_mul_ps(_mm256_loadu_ps(row + j), vi));
+        }
+#endif
+        for (; j < cols; j++) row[j] *= inv_sum;
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * tensor_rmsnorm — in-place row-wise RMS Layer Normalization.
+ * Fused: 4-acc AVX2 FMA sum-of-squares → scale → 4-wide AVX2 mul.
+ * Two passes (minimum — RMS must precede scaling), both fully vectorized.
+ * --------------------------------------------------------------------------- */
+void tensor_rmsnorm(Tensor* x, float eps) {
+    if (!x || x->dtype != DTYPE_FLOAT32) {
+        tensor_set_error("FATAL [RMSNorm]: Requires FLOAT32."); return;
+    }
+    if (!tensor_is_contiguous(x)) {
+        tensor_set_error("FATAL [RMSNorm]: Input must be contiguous."); return;
+    }
+
+    int    ndim  = x->ndim;
+    int    cols  = x->shape[ndim - 1];
+    size_t rows  = x->total_size / (size_t)cols;
+    float  inv_n = 1.0f / (float)cols;
+    float* __restrict data = F32(x);
+
+#pragma omp parallel for schedule(static) if(rows > 64)
+    for (size_t r = 0; r < rows; r++) {
+        float* __restrict row = data + r * (size_t)cols;
+
+        /* Pass 1: 4-acc sum-of-squares */
+        float ss = 0.0f;
+        int j = 0;
+#ifdef __AVX2__
+        {
+            __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+            for (; j <= cols - 32; j += 32) {
+                __m256 v0 = _mm256_loadu_ps(row + j);
+                __m256 v1 = _mm256_loadu_ps(row + j +  8);
+                __m256 v2 = _mm256_loadu_ps(row + j + 16);
+                __m256 v3 = _mm256_loadu_ps(row + j + 24);
+                a0 = _mm256_fmadd_ps(v0, v0, a0);
+                a1 = _mm256_fmadd_ps(v1, v1, a1);
+                a2 = _mm256_fmadd_ps(v2, v2, a2);
+                a3 = _mm256_fmadd_ps(v3, v3, a3);
+            }
+            a0 = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+            for (; j <= cols - 8; j += 8) {
+                __m256 v = _mm256_loadu_ps(row + j);
+                a0 = _mm256_fmadd_ps(v, v, a0);
+            }
+            __m128 lo = _mm256_castps256_ps128(a0);
+            __m128 hi = _mm256_extractf128_ps(a0, 1);
+            lo = _mm_add_ps(lo, hi);
+            lo = _mm_hadd_ps(lo, lo);
+            lo = _mm_hadd_ps(lo, lo);
+            ss = _mm_cvtss_f32(lo);
+        }
+#endif
+        for (; j < cols; j++) { float v = row[j]; ss += v * v; }
+
+        float scale = 1.0f / sqrtf(ss * inv_n + eps);
+
+        /* Pass 2: 4-wide multiply-scale */
+        j = 0;
+#ifdef __AVX2__
+        {
+            __m256 vs = _mm256_set1_ps(scale);
+            for (; j <= cols - 32; j += 32) {
+                _mm256_storeu_ps(row + j,      _mm256_mul_ps(_mm256_loadu_ps(row + j),      vs));
+                _mm256_storeu_ps(row + j +  8, _mm256_mul_ps(_mm256_loadu_ps(row + j +  8), vs));
+                _mm256_storeu_ps(row + j + 16, _mm256_mul_ps(_mm256_loadu_ps(row + j + 16), vs));
+                _mm256_storeu_ps(row + j + 24, _mm256_mul_ps(_mm256_loadu_ps(row + j + 24), vs));
+            }
+            for (; j <= cols - 8; j += 8)
+                _mm256_storeu_ps(row + j, _mm256_mul_ps(_mm256_loadu_ps(row + j), vs));
+        }
+#endif
+        for (; j < cols; j++) row[j] *= scale;
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * RoPE frequency table — thread-local, keyed by (head_dim, base_freq).
+ * powf() calls are amortized: only recomputed when either changes.
+ * head_dim <= 256 covers every known production architecture.
+ * --------------------------------------------------------------------------- */
+#define ROPE_MAX_HALF 128
+
+static __thread float rope_freqs[ROPE_MAX_HALF];
+static __thread int   rope_freq_hd   = -1;
+static __thread float rope_freq_base = -1.0f;
+
+static inline void rope_ensure_freqs(int head_dim, float base_freq) {
+    if (__builtin_expect(head_dim == rope_freq_hd && base_freq == rope_freq_base, 1)) return;
+    int half = head_dim / 2;
+    for (int i = 0; i < half; i++)
+        rope_freqs[i] = 1.0f / powf(base_freq, (2.0f * i) / (float)head_dim);
+    rope_freq_hd   = head_dim;
+    rope_freq_base = base_freq;
+}
+
+/* ---------------------------------------------------------------------------
+ * tensor_apply_rope — in-place RoPE with configurable base frequency and scale.
+ * No VLA; no powf per call; sin/cos computed once into fixed stack arrays.
+ * base_freq: rotary embedding base (10000.0 for most models; 500000.0 for LLaMA-3)
+ * scale:     position scaling factor (1.0 = standard; < 1.0 for extended context)
+ * --------------------------------------------------------------------------- */
+void tensor_apply_rope(Tensor* q, Tensor* k, int head_dim, int pos,
+                       float base_freq, float scale) {
+    if (!q || !k || q->dtype != DTYPE_FLOAT32 || k->dtype != DTYPE_FLOAT32) {
+        tensor_set_error("FATAL [RoPE]: Requires FLOAT32."); return;
+    }
+    if (!tensor_is_contiguous(q) || !tensor_is_contiguous(k)) {
+        tensor_set_error("FATAL [RoPE]: Inputs must be contiguous."); return;
+    }
+    if (head_dim <= 0 || head_dim % 2 != 0 || head_dim > ROPE_MAX_HALF * 2) {
+        tensor_set_error("FATAL [RoPE]: head_dim must be positive, even, <= 256."); return;
+    }
+    if (base_freq <= 0.0f) {
+        tensor_set_error("FATAL [RoPE]: base_freq must be > 0."); return;
+    }
+
+    rope_ensure_freqs(head_dim, base_freq);   /* powf cached; only reruns on change */
+
+    int half = head_dim / 2;
+    float cos_buf[ROPE_MAX_HALF];             /* fixed-size stack arrays — no VLA   */
+    float sin_buf[ROPE_MAX_HALF];
+    float scaled_pos = (float)pos * scale;
+    for (int i = 0; i < half; i++) {
+        float angle = scaled_pos * rope_freqs[i];
+        cos_buf[i] = cosf(angle);
+        sin_buf[i] = sinf(angle);
+    }
+
+    /* Apply to q */
+    {
+        size_t nrows = q->total_size / (size_t)head_dim;
+        float* __restrict d = F32(q);
+        for (size_t r = 0; r < nrows; r++) {
+            float* __restrict row = d + r * (size_t)head_dim;
+            for (int i = 0; i < half; i++) {
+                float c = cos_buf[i], s = sin_buf[i];
+                float x0 = row[2*i], x1 = row[2*i+1];
+                row[2*i]   = x0 * c - x1 * s;
+                row[2*i+1] = x0 * s + x1 * c;
+            }
+        }
+    }
+
+    /* Apply to k */
+    {
+        size_t nrows = k->total_size / (size_t)head_dim;
+        float* __restrict d = F32(k);
+        for (size_t r = 0; r < nrows; r++) {
+            float* __restrict row = d + r * (size_t)head_dim;
+            for (int i = 0; i < half; i++) {
+                float c = cos_buf[i], s = sin_buf[i];
+                float x0 = row[2*i], x1 = row[2*i+1];
+                row[2*i]   = x0 * c - x1 * s;
+                row[2*i+1] = x0 * s + x1 * c;
+            }
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * tensor_softmax_inplace — public API: thin delegate to softmax_rows.
+ * --------------------------------------------------------------------------- */
+void tensor_softmax_inplace(Tensor* x) {
+    if (!x || x->dtype != DTYPE_FLOAT32) {
+        tensor_set_error("FATAL [SoftmaxInplace]: Requires FLOAT32."); return;
+    }
+    if (!tensor_is_contiguous(x)) {
+        tensor_set_error("FATAL [SoftmaxInplace]: Input must be contiguous."); return;
+    }
+    int ndim = x->ndim;
+    softmax_rows(F32(x), (int)(x->total_size / (size_t)x->shape[ndim-1]),
+                         x->shape[ndim-1]);
+}
+
+/* ---------------------------------------------------------------------------
+ * tensor_attention — streaming scaled dot-product attention (online softmax).
+ *
+ * Processes one query row at a time using the Milakov–Gimelshein online
+ * softmax algorithm.  No O(seq²) scores buffer is ever allocated.
+ *
+ * For each query row q_i:
+ *   running_max m, running_denom d, accumulator o (reuses out row)
+ *   for j in [0, seq):
+ *     s   = dot(q_i, k_j) * scale
+ *     m'  = max(m, s)
+ *     α   = exp(m  - m')        ← rescale factor in (0,1]
+ *     β   = exp(s  - m')        ← new weight in (0,1]
+ *     o   = o*α + β*v_j         ← AVX2 FMA
+ *     d   = d*α + β
+ *     m   = m'
+ *   out_i = o / d
+ *
+ * Memory per thread: O(hd) working (in-register + out row).
+ * OMP outer loop: query rows are independent → no false sharing (hd ≥ 16).
+ * --------------------------------------------------------------------------- */
+void tensor_attention(Tensor* out, Tensor* q, Tensor* k, Tensor* v) {
+    if (!out || !q || !k || !v) {
+        tensor_set_error("FATAL [Attention]: NULL pointer."); return;
+    }
+    if (q->dtype  != DTYPE_FLOAT32 || k->dtype  != DTYPE_FLOAT32 ||
+        v->dtype  != DTYPE_FLOAT32 || out->dtype != DTYPE_FLOAT32) {
+        tensor_set_error("FATAL [Attention]: Requires FLOAT32."); return;
+    }
+    if (!tensor_is_contiguous(q) || !tensor_is_contiguous(k) ||
+        !tensor_is_contiguous(v) || !tensor_is_contiguous(out)) {
+        tensor_set_error("FATAL [Attention]: All tensors must be contiguous."); return;
+    }
+    if (q->ndim != 2 || k->ndim != 2 || v->ndim != 2 || out->ndim != 2) {
+        tensor_set_error("FATAL [Attention]: Expects 2D [seq_len, head_dim]."); return;
+    }
+
+    int seq = q->shape[0];
+    int hd  = q->shape[1];
+
+    if (k->shape[0] != seq || k->shape[1] != hd ||
+        v->shape[0] != seq || v->shape[1] != hd ||
+        out->shape[0] != seq || out->shape[1] != hd) {
+        tensor_set_error("FATAL [Attention]: Shape mismatch."); return;
+    }
+    if (__builtin_expect(seq == 0, 0)) return;
+
+    const float* __restrict Q = F32(q);
+    const float* __restrict K = F32(k);
+    const float* __restrict V = F32(v);
+    float*       __restrict O = F32(out);
+    float scale = 1.0f / sqrtf((float)hd);
+
+#pragma omp parallel for schedule(static)
+    for (int qi = 0; qi < seq; qi++) {
+        const float* __restrict q_row = Q + (size_t)qi * hd;
+        float*       __restrict o_row = O + (size_t)qi * hd;
+
+        /* j=0: initialise without rescale (avoids exp(-inf) underflow) */
+        float s0 = dot_f32(q_row, K, hd) * scale;
+        float m = s0, denom = 1.0f;
+        memcpy(o_row, V, (size_t)hd * sizeof(float));
+
+        for (int j = 1; j < seq; j++) {
+            const float* __restrict kj = K + (size_t)j * hd;
+            const float* __restrict vj = V + (size_t)j * hd;
+            /* prefetch K and V two steps ahead — hides L2 latency for next iter */
+            __builtin_prefetch(K + (size_t)(j + 2) * hd, 0, 1);
+            __builtin_prefetch(V + (size_t)(j + 2) * hd, 0, 1);
+
+            float s     = dot_f32(q_row, kj, hd) * scale;
+            float m_new = s > m ? s : m;
+            float alpha = fast_expf(m     - m_new);  /* in (0,1] */
+            float beta  = fast_expf(s     - m_new);  /* in (0,1] */
+
+            /* o_row = o_row * alpha + beta * vj  (fused AVX2 FMA) */
+            int d = 0;
+#ifdef __AVX2__
+            {
+                __m256 va = _mm256_set1_ps(alpha);
+                __m256 vb = _mm256_set1_ps(beta);
+                for (; d <= hd - 8; d += 8)
+                    _mm256_storeu_ps(o_row + d,
+                        _mm256_fmadd_ps(va, _mm256_loadu_ps(o_row + d),
+                                            _mm256_mul_ps(vb, _mm256_loadu_ps(vj + d))));
+            }
+#endif
+            for (; d < hd; d++) o_row[d] = o_row[d] * alpha + beta * vj[d];
+
+            denom = denom * alpha + beta;
+            m     = m_new;
+        }
+
+        /* normalize */
+        float inv_d = 1.0f / denom;
+        int d = 0;
+#ifdef __AVX2__
+        {
+            __m256 vi = _mm256_set1_ps(inv_d);
+            for (; d <= hd - 8; d += 8)
+                _mm256_storeu_ps(o_row + d,
+                    _mm256_mul_ps(_mm256_loadu_ps(o_row + d), vi));
+        }
+#endif
+        for (; d < hd; d++) o_row[d] *= inv_d;
+    }
+}
+
+// ============================================================================
+// 19. KV CACHE — interleaved layout, zero-copy streaming attention
+// ============================================================================
+
+/*
+ * Layout: kvc->data[i * 2*hd .. i*2*hd + hd - 1]  = K for token i
+ *         kvc->data[i * 2*hd + hd .. i*2*hd+2*hd-1] = V for token i
+ *
+ * Interleaving K and V in one contiguous block means a single prefetch
+ * covers both K and V for the same token → half the prefetch instructions
+ * vs separate K/V arrays.  32-byte aligned for AVX2 loads.
+ */
+
+KVCache* kvcache_create(int cap, int head_dim) {
+    if (cap <= 0 || head_dim <= 0) {
+        tensor_set_error("FATAL [kvcache_create]: cap and head_dim must be > 0.");
+        return NULL;
+    }
+    KVCache* c = (KVCache*)safe_malloc(sizeof(KVCache));
+    if (!c) return NULL;
+    c->data = (float*)safe_memalign(32, (size_t)cap * 2 * head_dim * sizeof(float));
+    if (!c->data) { free(c); return NULL; }
+    c->len      = 0;
+    c->cap      = cap;
+    c->head_dim = head_dim;
+    return c;
+}
+
+void kvcache_free(KVCache* c) {
+    if (!c) return;
+    free(c->data);
+    free(c);
+}
+
+void kvcache_reset(KVCache* c) {
+    if (c) c->len = 0;
+}
+
+int kvcache_len(const KVCache* c) {
+    return c ? c->len : 0;
+}
+
+/*
+ * kvcache_append — interleave one or more new K,V token rows into the cache.
+ * k and v must be contiguous FLOAT32, shape [n_new, head_dim].
+ * Advances cache->len by n_new.
+ */
+void kvcache_append(KVCache* c, const Tensor* k, const Tensor* v) {
+    if (!c || !k || !v) {
+        tensor_set_error("FATAL [kvcache_append]: NULL pointer."); return;
+    }
+    if (k->dtype != DTYPE_FLOAT32 || v->dtype != DTYPE_FLOAT32) {
+        tensor_set_error("FATAL [kvcache_append]: Requires FLOAT32."); return;
+    }
+    if (!tensor_is_contiguous(k) || !tensor_is_contiguous(v)) {
+        tensor_set_error("FATAL [kvcache_append]: Inputs must be contiguous."); return;
+    }
+
+    int hd  = c->head_dim;
+    int n   = (int)(k->total_size / (size_t)hd);
+
+    if (c->len + n > c->cap) {
+        tensor_set_error("FATAL [kvcache_append]: Cache capacity exceeded."); return;
+    }
+
+    const float* __restrict ks  = F32(k);
+    const float* __restrict vs  = F32(v);
+    float*       __restrict dst = c->data + (size_t)c->len * 2 * hd;
+
+    for (int i = 0; i < n; i++) {
+        memcpy(dst,      ks + (size_t)i * hd, (size_t)hd * sizeof(float));
+        memcpy(dst + hd, vs + (size_t)i * hd, (size_t)hd * sizeof(float));
+        dst += 2 * hd;
+    }
+    c->len += n;
+}
+
+/*
+ * tensor_attention_kv — streaming Milakov attention against a KV cache.
+ *
+ * q:   contiguous FLOAT32 [seq_q, head_dim]
+ * kvc: KVCache with seq_kv tokens interleaved [seq_kv][2*head_dim]
+ * out: pre-allocated contiguous FLOAT32 [seq_q, head_dim]
+ *
+ * Memory per thread: O(head_dim) — no scores buffer.
+ * A single prefetch covers both K and V for the next token (one cache line
+ * per 2*hd floats if hd <= 8; otherwise two prefetches spaced 32B apart).
+ */
+void tensor_attention_kv(Tensor* out, Tensor* q, const KVCache* kvc) {
+    if (!out || !q || !kvc) {
+        tensor_set_error("FATAL [AttentionKV]: NULL pointer."); return;
+    }
+    if (q->dtype != DTYPE_FLOAT32 || out->dtype != DTYPE_FLOAT32) {
+        tensor_set_error("FATAL [AttentionKV]: Requires FLOAT32."); return;
+    }
+    if (!tensor_is_contiguous(q) || !tensor_is_contiguous(out)) {
+        tensor_set_error("FATAL [AttentionKV]: Tensors must be contiguous."); return;
+    }
+
+    int hd     = kvc->head_dim;
+    int seq_q  = (int)(q->total_size  / (size_t)hd);
+    int seq_kv = kvc->len;
+    int stride = 2 * hd;            /* bytes between consecutive KV pairs (in floats) */
+
+    if (q->shape[q->ndim - 1] != hd || out->shape[out->ndim - 1] != hd ||
+        (int)(out->total_size / (size_t)hd) != seq_q) {
+        tensor_set_error("FATAL [AttentionKV]: Shape mismatch."); return;
+    }
+    if (__builtin_expect(seq_kv == 0, 0)) {
+        memset(F32(out), 0, (size_t)seq_q * hd * sizeof(float)); return;
+    }
+
+    float* __restrict       Q  = F32(q);
+    float* __restrict       O  = F32(out);
+    const float* __restrict KV = kvc->data;
+    float scale = 1.0f / sqrtf((float)hd);
+
+#pragma omp parallel for schedule(static)
+    for (int qi = 0; qi < seq_q; qi++) {
+        const float* __restrict q_row = Q + (size_t)qi * hd;
+        float*       __restrict o_row = O + (size_t)qi * hd;
+
+        /* j=0: initialise — no rescale needed, avoids exp(-inf) */
+        const float* kv0 = KV;                         /* K for token 0 */
+        float s0 = dot_f32(q_row, kv0, hd) * scale;
+        float m = s0, denom = 1.0f;
+        memcpy(o_row, kv0 + hd, (size_t)hd * sizeof(float)); /* V for token 0 */
+
+        for (int j = 1; j < seq_kv; j++) {
+            const float* __restrict kvj = KV + (size_t)j * stride;
+
+            /* One prefetch covers K+V for token j+2 (interleaved layout) */
+            __builtin_prefetch(kvj + stride,      0, 1);
+            __builtin_prefetch(kvj + stride + 32, 0, 1);   /* if 2*hd > 8 floats */
+
+            float s     = dot_f32(q_row, kvj, hd) * scale;
+            float m_new = s > m ? s : m;
+            float alpha = fast_expf(m - m_new);     /* in (0, 1] */
+            float beta  = fast_expf(s - m_new);     /* in (0, 1] */
+
+            /* o_row = o_row * alpha + beta * v_j */
+            const float* __restrict vj = kvj + hd;
+            int d = 0;
+#ifdef __AVX2__
+            {
+                __m256 va = _mm256_set1_ps(alpha);
+                __m256 vb = _mm256_set1_ps(beta);
+                for (; d <= hd - 8; d += 8)
+                    _mm256_storeu_ps(o_row + d,
+                        _mm256_fmadd_ps(va, _mm256_loadu_ps(o_row + d),
+                                            _mm256_mul_ps(vb, _mm256_loadu_ps(vj + d))));
+            }
+#endif
+            for (; d < hd; d++) o_row[d] = o_row[d] * alpha + beta * vj[d];
+
+            denom = denom * alpha + beta;
+            m     = m_new;
+        }
+
+        /* normalize */
+        float inv_d = 1.0f / denom;
+        int d = 0;
+#ifdef __AVX2__
+        {
+            __m256 vi = _mm256_set1_ps(inv_d);
+            for (; d <= hd - 8; d += 8)
+                _mm256_storeu_ps(o_row + d,
+                    _mm256_mul_ps(_mm256_loadu_ps(o_row + d), vi));
+        }
+#endif
+        for (; d < hd; d++) o_row[d] *= inv_d;
+    }
+}
+
+void tensor_copy_from(Tensor* dest, Tensor* src) {
+    if (dest->total_size != src->total_size || dest->total_size == 0) return;
+
+    // 1. FAST PATH: Both Contiguous (Ideal L1/L2 Saturation)
+    if (tensor_is_contiguous(dest) && tensor_is_contiguous(src)) {
+        size_t bytes = dest->total_size * sizeof(float);
+        
+        // OpenMP + SIMD for massive tensors (saturates memory bus)
+        if (dest->total_size > 500000) {
+            float* __restrict d_ptr = F32(dest);
+            float* __restrict s_ptr = F32(src);
+            #pragma omp parallel for simd
+            for (size_t i = 0; i < dest->total_size; i++) {
+                d_ptr[i] = s_ptr[i];
+            }
+        } else {
+            memcpy(F32(dest), F32(src), bytes);
+        }
+        return;
+    }
+
+    // Handle 0D Tensors (Scalars)
+    if (dest->ndim == 0) {
+        F32(dest)[0] = F32(src)[0];
+        return;
+    }
+
+    int ndim = dest->ndim;
+    int* shape = dest->shape;
+    int inner_len = shape[ndim - 1]; // Extract innermost dimension for loop pipelining
+
+    // 2. MEDIUM PATH: Dest Contiguous, Src Strided 
+    // (Extremely hot path: e.g., flattening a transposed matrix view)
+    if (tensor_is_contiguous(dest)) {
+        int s_inner_stride = src->stride[ndim - 1];
+        size_t total_outer = dest->total_size / inner_len;
+
+        float* __restrict d_ptr = F32(dest);
+        float* s_base = F32(src);
+        int s_idx[8] = {0}; // Assumes max tensor rank <= 8
+
+        for (size_t i = 0; i < total_outer; i++) {
+            float* __restrict s_inner = s_base;
+
+            if (s_inner_stride == 1) {
+                memcpy(d_ptr, s_inner, inner_len * sizeof(float));
+                d_ptr += inner_len;
+            } else {
+                int j = 0;
+#ifdef __AVX2__
+                // AVX2 Gather: Loads 8 strided floats concurrently into a vector register
+                // Critical for massive performance gains during matrix transposes
+                __m256i v_indices = _mm256_set_epi32(
+                    7 * s_inner_stride, 6 * s_inner_stride, 5 * s_inner_stride, 4 * s_inner_stride,
+                    3 * s_inner_stride, 2 * s_inner_stride, 1 * s_inner_stride, 0
+                );
+                for (; j <= inner_len - 8; j += 8) {
+                    __m256 v_val = _mm256_i32gather_ps(s_inner, v_indices, 4); // 4 = scale (sizeof float)
+                    _mm256_storeu_ps(d_ptr, v_val); // Store sequentially
+                    s_inner += 8 * s_inner_stride;
+                    d_ptr += 8;
+                }
+#endif
+                // Pipelined Scalar Tail
+                for (; j < inner_len; j++) {
+                    *d_ptr++ = *s_inner;
+                    s_inner += s_inner_stride;
+                }
+            }
+
+            // Pointer Odometer (ZERO MULTIPLICATIONS)
+            // Increments base pointer linearly based on stride limits
+            for (int d = ndim - 2; d >= 0; d--) {
+                s_idx[d]++;
+                if (s_idx[d] < shape[d]) {
+                    s_base += src->stride[d];
+                    break;
+                } else {
+                    s_idx[d] = 0;
+                    s_base -= src->stride[d] * (shape[d] - 1); // Reset dimension shift
+                }
+            }
+        }
+        return;
+    }
+
+    // 3. SLOW PATH: Both Strided (The Dual Odometer)
+    // Used when copying slices into slices, or mixed layouts.
+    int s_inner_stride = src->stride[ndim - 1];
+    int d_inner_stride = dest->stride[ndim - 1];
+    size_t total_outer = dest->total_size / inner_len;
+
+    float* s_base = F32(src);
+    float* d_base = F32(dest);
+    int idx[8] = {0};
+
+    for (size_t i = 0; i < total_outer; i++) {
+        float* __restrict s_inner = s_base;
+        float* __restrict d_inner = d_base;
+
+        // Fully branchless inner loop (CPU branch predictor handles this perfectly)
+        for (int j = 0; j < inner_len; j++) {
+            *d_inner = *s_inner;
+            d_inner += d_inner_stride;
+            s_inner += s_inner_stride;
+        }
+
+        // Dual Pointer Odometer
+        for (int d = ndim - 2; d >= 0; d--) {
+            idx[d]++;
+            if (idx[d] < shape[d]) {
+                s_base += src->stride[d];
+                d_base += dest->stride[d];
+                break;
+            } else {
+                idx[d] = 0;
+                s_base -= src->stride[d] * (shape[d] - 1);
+                d_base -= dest->stride[d] * (shape[d] - 1);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 20. ADVANCED INFERENCE & TRAINING PRIMITIVES
+// ============================================================================
+
+/* ---------------------------------------------------------------------------
+ * tensor_from_mmap — zero-copy tensor backed by a memory-mapped file region.
+ *
+ * Opens `filepath`, seeks to `byte_offset`, maps `ndim*shape` elements of
+ * `dtype` as MAP_PRIVATE | MAP_POPULATE.  MADV_WILLNEED hints the kernel to
+ * prefault pages.  owns_data = false so tensor_free() does NOT call free();
+ * the caller must tensor_mmap_free() or munmap() when done.
+ *
+ * Returns NULL and sets error on failure.
+ * --------------------------------------------------------------------------- */
+Tensor* tensor_from_mmap(const char* filepath, size_t byte_offset,
+                         int ndim, const int* shape, int dtype_int) {
+    if (!filepath || !shape || ndim <= 0 || ndim > 8) {
+        tensor_set_error("FATAL [mmap]: Invalid arguments."); return NULL;
+    }
+    TensorDType dtype = (TensorDType)dtype_int;
+    size_t elem_size  = dtype_size(dtype);
+
+    /* Compute total elements */
+    size_t total = 1;
+    for (int i = 0; i < ndim; i++) {
+        if (shape[i] <= 0) {
+            tensor_set_error("FATAL [mmap]: shape element <= 0."); return NULL;
+        }
+        total *= (size_t)shape[i];
+    }
+    size_t map_bytes = total * elem_size;
+
+    int fd = open(filepath, O_RDONLY);
+    if (fd < 0) {
+        tensor_set_error("FATAL [mmap]: Cannot open file."); return NULL;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0 || (size_t)st.st_size < byte_offset + map_bytes) {
+        tensor_set_error("FATAL [mmap]: File too small for requested region.");
+        close(fd); return NULL;
+    }
+
+    /* page-align the offset */
+    long page_sz      = sysconf(_SC_PAGESIZE);
+    size_t page_off   = byte_offset % (size_t)page_sz;
+    size_t map_off    = byte_offset - page_off;
+    size_t map_total  = map_bytes + page_off;
+
+    void* mapped = mmap(NULL, map_total, PROT_READ, MAP_PRIVATE, fd, (off_t)map_off);
+    close(fd);
+    if (mapped == MAP_FAILED) {
+        tensor_set_error("FATAL [mmap]: mmap() failed."); return NULL;
+    }
+    madvise(mapped, map_total, MADV_WILLNEED);
+
+    /* Build a non-owning Tensor pointing into the mapped region */
+    Tensor* t = (Tensor*)safe_malloc(sizeof(Tensor));
+    if (!t) { munmap(mapped, map_total); return NULL; }
+
+    t->ndim       = ndim;
+    t->total_size = total;
+    t->byte_size  = map_bytes;
+    t->owns_data  = false;   /* tensor_free() must NOT free this pointer */
+    t->is_arena   = false;
+    t->dtype      = dtype;
+    t->data       = (uint8_t*)mapped + page_off;
+
+    /* Compute strides (row-major / C order) */
+    t->stride[ndim - 1] = 1;
+    for (int i = ndim - 2; i >= 0; i--)
+        t->stride[i] = t->stride[i + 1] * (size_t)shape[i + 1];
+    for (int i = 0; i < ndim; i++)
+        t->shape[i] = shape[i];
+
+    return t;
+}
+
+/* Unmap and free the Tensor struct for an mmap-backed tensor.
+ * The Tensor MUST have been created by tensor_from_mmap(). */
+void tensor_mmap_free(Tensor* t) {
+    if (!t) return;
+    if (t->data) {
+        /* Recover the page-aligned base: walk back to nearest page boundary.
+         * We stored data = mapped_base + page_off; we need mapped_base.
+         * Safest: compute aligned base from the stored byte_size + page_off.
+         * But we didn't store page_off.  Use the simpler approach: just
+         * munmap the data pointer rounded DOWN to page boundary.             */
+        long page_sz = sysconf(_SC_PAGESIZE);
+        uintptr_t addr     = (uintptr_t)t->data;
+        uintptr_t page_off = addr % (uintptr_t)page_sz;
+        void*     base     = (void*)(addr - page_off);
+        size_t    total    = t->byte_size + page_off;
+        munmap(base, total);
+    }
+    free(t);
+}
+
+/* ---------------------------------------------------------------------------
+ * tensor_silu — SiLU (Swish) activation: out[i] = x[i] * sigmoid(x[i])
+ *                                                 = x[i] / (1 + exp(-x[i]))
+ * AVX2 path uses avx2_expf for throughput.
+ * --------------------------------------------------------------------------- */
+Tensor* tensor_silu(Tensor* A) {
+    if (!A || A->dtype != DTYPE_FLOAT32) {
+        TENSOR_ERROR("FATAL [SiLU]: Requires FLOAT32 tensor.");
+    }
+    if (!tensor_is_contiguous(A)) {
+        TENSOR_ERROR("FATAL [SiLU]: Input must be contiguous.");
+    }
+
+    Tensor* out = tensor_create_uninitialized(A->ndim, A->shape, DTYPE_FLOAT32);
+    if (!out) return NULL;
+
+    size_t n = A->total_size;
+    const float* __restrict src = F32(A);
+    float*       __restrict dst = F32(out);
+
+    size_t i = 0;
+#ifdef __AVX2__
+    {
+        __m256 ones = _mm256_set1_ps(1.0f);
+        for (; i + 8 <= n; i += 8) {
+            __m256 x   = _mm256_loadu_ps(src + i);
+            __m256 neg = _mm256_sub_ps(_mm256_setzero_ps(), x);  /* -x */
+            __m256 e   = avx2_expf(neg);                         /* exp(-x) */
+            __m256 sig = _mm256_div_ps(ones,
+                             _mm256_add_ps(ones, e));             /* 1/(1+exp(-x)) */
+            _mm256_storeu_ps(dst + i, _mm256_mul_ps(x, sig));    /* x * sigmoid(x) */
+        }
+    }
+#endif
+    for (; i < n; i++) {
+        float x  = src[i];
+        float ex = fast_expf(-x);
+        dst[i]   = x / (1.0f + ex);
+    }
+
+    return out;
+}
+
+/* ---------------------------------------------------------------------------
+ * tensor_swiglu — fused SwiGLU: out[i] = silu(gate[i]) * up[i]
+ * gate and up must have the same shape.  Result has the same shape.
+ * --------------------------------------------------------------------------- */
+Tensor* tensor_swiglu(Tensor* gate, Tensor* up) {
+    if (!gate || !up || gate->dtype != DTYPE_FLOAT32 || up->dtype != DTYPE_FLOAT32) {
+        TENSOR_ERROR("FATAL [SwiGLU]: Requires FLOAT32 tensors.");
+    }
+    if (!tensor_is_contiguous(gate) || !tensor_is_contiguous(up)) {
+        TENSOR_ERROR("FATAL [SwiGLU]: Inputs must be contiguous.");
+    }
+    if (gate->total_size != up->total_size) {
+        TENSOR_ERROR("FATAL [SwiGLU]: gate and up must have the same total size.");
+    }
+
+    Tensor* out = tensor_create_uninitialized(gate->ndim, gate->shape, DTYPE_FLOAT32);
+    if (!out) return NULL;
+
+    size_t n = gate->total_size;
+    const float* __restrict g   = F32(gate);
+    const float* __restrict u   = F32(up);
+    float*       __restrict dst = F32(out);
+
+    size_t i = 0;
+#ifdef __AVX2__
+    {
+        __m256 ones = _mm256_set1_ps(1.0f);
+        for (; i + 8 <= n; i += 8) {
+            __m256 gv  = _mm256_loadu_ps(g + i);
+            __m256 uv  = _mm256_loadu_ps(u + i);
+            __m256 neg = _mm256_sub_ps(_mm256_setzero_ps(), gv);
+            __m256 e   = avx2_expf(neg);
+            __m256 sig = _mm256_div_ps(ones, _mm256_add_ps(ones, e));
+            __m256 silu_g = _mm256_mul_ps(gv, sig);
+            _mm256_storeu_ps(dst + i, _mm256_mul_ps(silu_g, uv));
+        }
+    }
+#endif
+    for (; i < n; i++) {
+        float gx  = g[i];
+        float ex  = fast_expf(-gx);
+        float silu = gx / (1.0f + ex);
+        dst[i]    = silu * u[i];
+    }
+
+    return out;
+}
+
+/* ---------------------------------------------------------------------------
+ * tensor_fused_cross_entropy_loss_and_grad
+ *
+ * Single-pass fused kernel:
+ *   1. Numerically stable softmax over last axis (per row)
+ *   2. NLL loss:   L = -log(probs[target_id])
+ *   3. Gradient:   grads[i] = probs[i] - (i == target_id ? 1.0 : 0.0)
+ *
+ * logits:         [batch, vocab]  FLOAT32  contiguous
+ * target_ids:     [batch]         INT32    contiguous  (row-major token ids)
+ * grads:          [batch, vocab]  FLOAT32  pre-allocated contiguous output
+ * out_loss:       pointer to float; receives mean loss over the batch
+ * --------------------------------------------------------------------------- */
+void tensor_fused_cross_entropy_loss_and_grad(Tensor* logits, Tensor* target_ids,
+                                               Tensor* grads,  float*  out_loss) {
+    if (!logits || !target_ids || !grads || !out_loss) {
+        tensor_set_error("FATAL [CrossEntropy]: NULL pointer."); return;
+    }
+    if (logits->dtype != DTYPE_FLOAT32 || grads->dtype != DTYPE_FLOAT32) {
+        tensor_set_error("FATAL [CrossEntropy]: logits/grads must be FLOAT32."); return;
+    }
+    if (target_ids->dtype != DTYPE_INT32) {
+        tensor_set_error("FATAL [CrossEntropy]: target_ids must be INT32."); return;
+    }
+    if (!tensor_is_contiguous(logits) || !tensor_is_contiguous(target_ids) ||
+        !tensor_is_contiguous(grads)) {
+        tensor_set_error("FATAL [CrossEntropy]: All tensors must be contiguous."); return;
+    }
+    if (logits->ndim < 2) {
+        tensor_set_error("FATAL [CrossEntropy]: logits must be at least 2D."); return;
+    }
+
+    int ndim  = logits->ndim;
+    int vocab = logits->shape[ndim - 1];
+    int batch = (int)(logits->total_size / (size_t)vocab);
+
+    if ((int)(grads->total_size / (size_t)vocab) != batch ||
+        (int)target_ids->total_size != batch) {
+        tensor_set_error("FATAL [CrossEntropy]: Shape mismatch."); return;
+    }
+
+    const float* __restrict L  = F32(logits);
+    float*       __restrict G  = F32(grads);
+    const int*   __restrict T  = (const int*)target_ids->data;
+
+    float total_loss = 0.0f;
+
+#pragma omp parallel for schedule(static) reduction(+:total_loss)
+    for (int b = 0; b < batch; b++) {
+        const float* __restrict row_l = L + (size_t)b * vocab;
+        float*       __restrict row_g = G + (size_t)b * vocab;
+        int tid = T[b];
+
+        /* Numerically stable softmax: max subtract */
+        float mx = row_l[0];
+        for (int i = 1; i < vocab; i++)
+            if (row_l[i] > mx) mx = row_l[i];
+
+        float sum = 0.0f;
+        for (int i = 0; i < vocab; i++) {
+            float e = fast_expf(row_l[i] - mx);
+            row_g[i] = e;   /* temporarily store exp values in grads */
+            sum += e;
+        }
+
+        float inv_sum = 1.0f / sum;
+        for (int i = 0; i < vocab; i++)
+            row_g[i] *= inv_sum;  /* now row_g holds probs */
+
+        /* NLL loss */
+        float p_target = row_g[tid];
+        /* Clamp to avoid log(0) */
+        if (p_target < 1e-12f) p_target = 1e-12f;
+        total_loss += -logf(p_target);
+
+        /* Gradient: probs - one_hot */
+        row_g[tid] -= 1.0f;
+    }
+
+    *out_loss = total_loss / (float)batch;
+}
+
+/* ---------------------------------------------------------------------------
+ * tensor_rmsnorm_backward — gradient of tensor_rmsnorm w.r.t. input X.
+ *
+ * Forward:  y_j = w_j * x_j / r,    r = sqrt(mean(x²) + eps)
+ * Gradient: dx_j = (1/r) * w_j * dy_j  -  x_j * S / (d * r³)
+ *   where S = Σ_i (w_i * dy_i * x_i)
+ *
+ * dY:      [batch, d]  FLOAT32  gradient from upstream
+ * X:       [batch, d]  FLOAT32  original input (saved from forward)
+ * weights: [d]         FLOAT32  the RMSNorm weight vector
+ * eps:     stabilizer (e.g. 1e-5)
+ * Returns: [batch, d]  FLOAT32  gradient w.r.t. X
+ * --------------------------------------------------------------------------- */
+Tensor* tensor_rmsnorm_backward(Tensor* dY, Tensor* X, Tensor* weights, float eps) {
+    if (!dY || !X || !weights) {
+        TENSOR_ERROR("FATAL [RMSNormBwd]: NULL pointer.");
+    }
+    if (dY->dtype != DTYPE_FLOAT32 || X->dtype != DTYPE_FLOAT32 ||
+        weights->dtype != DTYPE_FLOAT32) {
+        TENSOR_ERROR("FATAL [RMSNormBwd]: All tensors must be FLOAT32.");
+    }
+    if (!tensor_is_contiguous(dY) || !tensor_is_contiguous(X) ||
+        !tensor_is_contiguous(weights)) {
+        TENSOR_ERROR("FATAL [RMSNormBwd]: All tensors must be contiguous.");
+    }
+    if (dY->ndim < 1 || X->ndim < 1 || weights->ndim != 1) {
+        TENSOR_ERROR("FATAL [RMSNormBwd]: Unexpected dimensionality.");
+    }
+
+    int ndim = X->ndim;
+    int d    = X->shape[ndim - 1];
+    int rows = (int)(X->total_size / (size_t)d);
+
+    if ((int)weights->total_size != d ||
+        X->total_size != dY->total_size) {
+        TENSOR_ERROR("FATAL [RMSNormBwd]: Shape mismatch.");
+    }
+
+    Tensor* dX = tensor_create_uninitialized(X->ndim, X->shape, DTYPE_FLOAT32);
+    if (!dX) return NULL;
+
+    const float* __restrict dy_ptr = F32(dY);
+    const float* __restrict x_ptr  = F32(X);
+    const float* __restrict w_ptr  = F32(weights);
+    float*       __restrict dx_ptr = F32(dX);
+
+#pragma omp parallel for schedule(static)
+    for (int r = 0; r < rows; r++) {
+        const float* __restrict dy = dy_ptr + (size_t)r * d;
+        const float* __restrict xr = x_ptr  + (size_t)r * d;
+        float*       __restrict dx = dx_ptr + (size_t)r * d;
+
+        /* Compute r = sqrt(mean(x²) + eps) */
+        float ss0 = 0.0f, ss1 = 0.0f, ss2 = 0.0f, ss3 = 0.0f;
+        int i = 0;
+#ifdef __AVX2__
+        {
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+            for (; i + 16 <= d; i += 16) {
+                __m256 v0 = _mm256_loadu_ps(xr + i);
+                __m256 v1 = _mm256_loadu_ps(xr + i + 8);
+                acc0 = _mm256_fmadd_ps(v0, v0, acc0);
+                acc1 = _mm256_fmadd_ps(v1, v1, acc1);
+            }
+            __m256 acc = _mm256_add_ps(acc0, acc1);
+            /* horizontal sum */
+            __m128 lo  = _mm256_castps256_ps128(acc);
+            __m128 hi  = _mm256_extractf128_ps(acc, 1);
+            __m128 sum = _mm_add_ps(lo, hi);
+            sum = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
+            sum = _mm_add_ss(sum, _mm_shuffle_ps(sum, sum, 1));
+            ss0 = _mm_cvtss_f32(sum);
+        }
+#endif
+        for (; i < d; i++) { float v = xr[i]; ss0 += v * v; }
+        float rms = 1.0f / sqrtf(ss0 / (float)d + eps);  /* 1/r */
+        float r3  = rms * rms * rms;                      /* 1/r³ */
+
+        /* S = Σ (w_i * dy_i * x_i) */
+        float S = 0.0f;
+        i = 0;
+#ifdef __AVX2__
+        {
+            __m256 sA = _mm256_setzero_ps();
+            for (; i + 8 <= d; i += 8) {
+                __m256 wi  = _mm256_loadu_ps(w_ptr + i);
+                __m256 dyi = _mm256_loadu_ps(dy + i);
+                __m256 xi  = _mm256_loadu_ps(xr + i);
+                sA = _mm256_fmadd_ps(_mm256_mul_ps(wi, dyi), xi, sA);
+            }
+            __m128 lo  = _mm256_castps256_ps128(sA);
+            __m128 hi  = _mm256_extractf128_ps(sA, 1);
+            __m128 sum = _mm_add_ps(lo, hi);
+            sum = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
+            sum = _mm_add_ss(sum, _mm_shuffle_ps(sum, sum, 1));
+            S   = _mm_cvtss_f32(sum);
+        }
+#endif
+        for (; i < d; i++) S += w_ptr[i] * dy[i] * xr[i];
+
+        float coeff = S * r3 / (float)d;   /* S / (d * r³) */
+
+        /* dx_j = rms * w_j * dy_j - x_j * coeff */
+        i = 0;
+#ifdef __AVX2__
+        {
+            __m256 vrms  = _mm256_set1_ps(rms);
+            __m256 vcoef = _mm256_set1_ps(coeff);
+            for (; i + 8 <= d; i += 8) {
+                __m256 wi  = _mm256_loadu_ps(w_ptr + i);
+                __m256 dyi = _mm256_loadu_ps(dy + i);
+                __m256 xi  = _mm256_loadu_ps(xr + i);
+                /* rms * w * dy - x * coeff */
+                __m256 term1 = _mm256_mul_ps(vrms, _mm256_mul_ps(wi, dyi));
+                __m256 term2 = _mm256_mul_ps(xi, vcoef);
+                _mm256_storeu_ps(dx + i, _mm256_sub_ps(term1, term2));
+            }
+        }
+#endif
+        for (; i < d; i++)
+            dx[i] = rms * w_ptr[i] * dy[i] - xr[i] * coeff;
+    }
+
+    return dX;
+}
+
+/* ---------------------------------------------------------------------------
+ * tensor_embedding_backward — accumulate gradients into embedding weight matrix.
+ *
+ * dY:        [seq_len, embed_dim]  FLOAT32  upstream gradients
+ * token_ids: [seq_len]             INT32    token indices
+ * dWeights:  [vocab_size, embed_dim] FLOAT32  gradient accumulator (caller zeros)
+ *
+ * Uses #pragma omp atomic per element to safely handle duplicate token IDs.
+ * --------------------------------------------------------------------------- */
+void tensor_embedding_backward(Tensor* dY, Tensor* token_ids, Tensor* dWeights) {
+    if (!dY || !token_ids || !dWeights) {
+        tensor_set_error("FATAL [EmbeddingBwd]: NULL pointer."); return;
+    }
+    if (dY->dtype != DTYPE_FLOAT32 || dWeights->dtype != DTYPE_FLOAT32) {
+        tensor_set_error("FATAL [EmbeddingBwd]: dY and dWeights must be FLOAT32."); return;
+    }
+    if (token_ids->dtype != DTYPE_INT32) {
+        tensor_set_error("FATAL [EmbeddingBwd]: token_ids must be INT32."); return;
+    }
+    if (!tensor_is_contiguous(dY) || !tensor_is_contiguous(token_ids) ||
+        !tensor_is_contiguous(dWeights)) {
+        tensor_set_error("FATAL [EmbeddingBwd]: All tensors must be contiguous."); return;
+    }
+
+    int seq_len   = (int)token_ids->total_size;
+    int embed_dim = dWeights->ndim >= 2 ? dWeights->shape[dWeights->ndim - 1]
+                                        : (int)dWeights->total_size;
+    int vocab     = (int)(dWeights->total_size / (size_t)embed_dim);
+
+    if ((int)(dY->total_size / (size_t)embed_dim) != seq_len) {
+        tensor_set_error("FATAL [EmbeddingBwd]: dY shape does not match seq_len/embed_dim."); return;
+    }
+
+    const float* __restrict dy  = F32(dY);
+    float*       __restrict dW  = F32(dWeights);
+    const int*   __restrict ids = (const int*)token_ids->data;
+
+#pragma omp parallel for schedule(static)
+    for (int s = 0; s < seq_len; s++) {
+        int tid = ids[s];
+        if (tid < 0 || tid >= vocab) continue;  /* silently skip OOV */
+
+        const float* __restrict dy_row = dy + (size_t)s * embed_dim;
+        float*       __restrict dw_row = dW + (size_t)tid * embed_dim;
+
+        /* Atomic accumulate — correct even when multiple sequence positions
+         * map to the same token_id.  Per-element atomics avoid false sharing
+         * between distinct token rows.                                        */
+        for (int i = 0; i < embed_dim; i++) {
+#pragma omp atomic
+            dw_row[i] += dy_row[i];
+        }
     }
 }

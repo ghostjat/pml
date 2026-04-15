@@ -61,6 +61,7 @@ final class TensorEngine {
 
                 TensorC* tensor_create(int ndim, int* shape);
                 TensorC* tensor_create_dtype(int ndim, int* shape, int dtype);
+                TensorC* tensor_create_uninitialized(int ndim, int* shape, int dtype);
                 TensorC* tensor_create_arena(int ndim, int* shape, int dtype, TensorArena* arena);
                 TensorC* tensor_from_external(void* data, int ndim, int* shape, int dtype);
                 void tensor_free(TensorC* t);
@@ -189,6 +190,9 @@ final class TensorEngine {
                 float tensor_trace(TensorC* A);
                 TensorC* tensor_matmul(TensorC* A, TensorC* B);
                 TensorC* tensor_bmm(TensorC* A, TensorC* B);
+                TensorC* tensor_matmul_ex(TensorC* A, TensorC* B, bool transA, bool transB);
+                void     tensor_matmul_into(TensorC* out, TensorC* A, TensorC* B, bool transA, bool transB);
+                void     tensor_sum_axis_into(TensorC* out, TensorC* A, int axis);
 
                 TensorC* tensor_inverse(TensorC* A);
                 TensorC* tensor_pinv(TensorC* A);
@@ -223,6 +227,27 @@ final class TensorEngine {
                 // --- THREADING CONTROL ---
                 void tensor_configure_threading(int omp_threads, int blas_threads);
 
+                // --- TRANSFORMER INFERENCE PRIMITIVES ---
+                void tensor_rmsnorm(TensorC* x, float eps);
+                void tensor_apply_rope(TensorC* q, TensorC* k, int head_dim, int pos, float base_freq, float scale);
+                void tensor_softmax_inplace(TensorC* x);
+                void tensor_attention(TensorC* out, TensorC* q, TensorC* k, TensorC* v);
+
+                // --- KV CACHE ---
+                typedef struct {
+                    float*  data;
+                    int     len;
+                    int     cap;
+                    int     head_dim;
+                } KVCache;
+
+                KVCache* kvcache_create(int cap, int head_dim);
+                void     kvcache_free(KVCache* cache);
+                void     kvcache_reset(KVCache* cache);
+                int      kvcache_len(KVCache* cache);
+                void     kvcache_append(KVCache* cache, TensorC* k, TensorC* v);
+                void     tensor_attention_kv(TensorC* out, TensorC* q, KVCache* cache);
+
                 typedef struct {
                     int feature_idx;
                     float threshold;
@@ -235,6 +260,16 @@ final class TensorEngine {
                 void tensor_save_to_file(TensorC* t, const char* filepath);
                 TensorC* tensor_load_from_file(const char* filepath);
                 int tensor_save_safetensors(const char* filepath, const char* json_header, uint64_t json_len, TensorC** tensors, int num_tensors);
+                void tensor_copy_from(TensorC* dest, TensorC* src);
+
+                // --- ADVANCED INFERENCE & TRAINING PRIMITIVES ---
+                TensorC* tensor_from_mmap(const char* filepath, size_t byte_offset, int ndim, const int* shape, int dtype);
+                void     tensor_mmap_free(TensorC* t);
+                TensorC* tensor_silu(TensorC* A);
+                TensorC* tensor_swiglu(TensorC* gate, TensorC* up);
+                void     tensor_fused_cross_entropy_loss_and_grad(TensorC* logits, TensorC* target_ids, TensorC* grads, float* out_loss);
+                TensorC* tensor_rmsnorm_backward(TensorC* dY, TensorC* X, TensorC* weights, float eps);
+                void     tensor_embedding_backward(TensorC* dY, TensorC* token_ids, TensorC* dWeights);
 
                 // ---------------------------------------------------------------
                 // Columnar DataFrame + ETL  (src/Lib/dataset_io.c)

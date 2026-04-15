@@ -6,7 +6,7 @@ namespace Pml\Transformers;
 
 use Pml\Interfaces\Transformer;
 use Pml\Tensor;
-use Pml\Tensor\Dataset;
+use Pml\Dataset;
 
 /**
  * One-Hot Label Encoder.

@@ -14,7 +14,8 @@ use RuntimeException;
  * The core weak-learner for Gradient Boosting.
  * * JIT & Memory Optimized:
  * - Employs C-Level Variance reductions to evaluate splits without PHP loops.
- * - Leaf nodes store the C-Level mean() of the target tensor.
+ * - Hardware Split Routing avoids N-sized PHP array evaluations.
+ * - Scalar comparison kernels avoid temporary tensor allocations.
  */
 final class DecisionTreeRegressor implements Learner
 {
@@ -70,20 +71,13 @@ final class DecisionTreeRegressor implements Learner
             return ['value' => $leafValue];
         }
 
-        // Unpack the C-mask to physically route the indices in PHP
-        $maskArray = $split['mask']->toFlatArray();
-        $leftIdx = [];
-        $rightIdx = [];
+        // --- CRITICAL OPTIMIZATION: Hardware Split Routing ---
+        // Replaces the O(N) PHP foreach loop with an AVX2 C-kernel.
+        // Directly returns the Left and Right INT32 index tensors.
+        [$leftT, $rightT] = $split['mask']->splitIndices();
         
-        foreach ($maskArray as $i => $val) {
-            if ($val > 0.5) $leftIdx[] = $i; 
-            else $rightIdx[] = $i;
-        }
-
-        unset($split['mask']); // Clean up pointer
-
-        $leftT = Tensor::fromArray($leftIdx);
-        $rightT = Tensor::fromArray($rightIdx);
+        // Eagerly clean up the mask pointer to free memory pool block
+        unset($split['mask']); 
 
         $node = [
             'feature'   => $split['feature'],
@@ -115,21 +109,30 @@ final class DecisionTreeRegressor implements Learner
             $min = $col->min();
             $max = $col->max();
 
-            if ($min === $max) continue;
+            if ($min === $max) {
+                unset($col);
+                continue;
+            }
 
-            // Randomized Split Search: Evaluate 10 evenly spaced thresholds natively in C.
+            // Randomized Split Search: Evaluate evenly spaced thresholds natively in C.
             $thresholds = Tensor::linspace($min, $max, 10)->toFlatArray();
-            array_pop($thresholds);
-            array_shift($thresholds);
+            $numThresholds = count($thresholds);
 
-            foreach ($thresholds as $threshold) {
-                $threshT = Tensor::zeros($n)->addScalarInplace($threshold);
-                $mask = $col->less($threshT);
+            // Skip min/max boundaries
+            for ($i = 1; $i < $numThresholds - 1; $i++) {
+                $threshold = $thresholds[$i];
+
+                // --- CRITICAL OPTIMIZATION: Scalar SIMD Comparison ---
+                // Replaces Tensor::zeros($n)->addScalarInplace() with an O(1) alloc scalar kernel.
+                $mask = $col->lessScalar($threshold);
 
                 $leftY = $y->booleanIndex($mask);
                 $nLeft = $leftY->size();
 
-                if ($nLeft === 0 || $nLeft === $n) continue;
+                if ($nLeft === 0 || $nLeft === $n) {
+                    unset($mask, $leftY);
+                    continue;
+                }
 
                 $rightMask = $mask->logicalNot();
                 $rightY = $y->booleanIndex($rightMask);
@@ -147,10 +150,16 @@ final class DecisionTreeRegressor implements Learner
                     $bestSplit = [
                         'feature'   => $feature,
                         'threshold' => $threshold,
-                        'mask'      => $mask
+                        'mask'      => $mask // Keep only the best mask
                     ];
+                } else {
+                    // Eager garbage collection to prevent memory ballooning
+                    unset($mask);
                 }
+                
+                unset($leftY, $rightMask, $rightY);
             }
+            unset($col);
         }
 
         return $bestSplit;

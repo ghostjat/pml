@@ -148,8 +148,29 @@ class Tensor {
         $res = self::wrap(TensorEngine::get()->tensor_copy($this->ptr)); 
         self::checkError(); return $res;
     }
-    public function isContiguous(): bool { 
-        $res = TensorEngine::get()->tensor_is_contiguous($this->ptr); 
+    public function isContiguous(): bool {
+        $res = TensorEngine::get()->tensor_is_contiguous($this->ptr);
+        self::checkError(); return $res;
+    }
+    /**
+     * Return a contiguous copy of this tensor, or $this if already contiguous.
+     * Zero-cost for the common case; one C memcpy for non-contiguous views.
+     */
+    public function contiguous(): self {
+        return $this->isContiguous() ? $this : $this->copy();
+    }
+
+    /**
+     * Create an uninitialized tensor with the same shape and dtype as $t.
+     * Skips zero-fill — use when every element will be overwritten immediately.
+     */
+    public static function emptyLike(self $t): self {
+        $ffi  = TensorEngine::get();
+        $shape = $t->shape();
+        $ndim  = count($shape);
+        $cShape = $ffi->new("int[$ndim]");
+        foreach ($shape as $i => $d) $cShape[$i] = $d;
+        $res = self::wrap($ffi->tensor_create_uninitialized($ndim, $ffi->cast("int*", $cShape), $t->dtype()));
         self::checkError(); return $res;
     }
     
@@ -431,6 +452,12 @@ class Tensor {
         $res = self::wrap($ffi->tensor_mean_multi($this->ptr, $ffi->cast("int*", $cAxes), count($axes)));
         self::checkError(); return $res;
     }
+    public function maxMulti(array $axes): self {
+        $ffi = TensorEngine::get();
+        $cAxes = $ffi->new("int[" . count($axes) . "]"); foreach ($axes as $i => $ax) $cAxes[$i] = $ax;
+        $res = self::wrap($ffi->tensor_max_multi($this->ptr, $ffi->cast("int*", $cAxes), count($axes)));
+        self::checkError(); return $res;
+    }
 
     // --- NORMALIZATION ---
     public function normalize(): self { $res = self::wrap(TensorEngine::get()->tensor_normalize($this->ptr)); self::checkError(); return $res; }
@@ -441,8 +468,215 @@ class Tensor {
     // --- LINEAR ALGEBRA & DECOMPOSITIONS ---
     public function dot(Tensor $b): float { $res = TensorEngine::get()->tensor_dot($this->ptr, $b->ptr); self::checkError(); return $res; }
     public function trace(): float { $res = TensorEngine::get()->tensor_trace($this->ptr); self::checkError(); return $res; }
-    public function matmul(Tensor $b): self { $res = self::wrap(TensorEngine::get()->tensor_matmul($this->ptr, $b->ptr)); self::checkError(); return $res; }
+    /**
+     * Matrix multiply. When transA or transB are true the operand is treated as
+     * transposed without allocating a new tensor (BLAS handles it in one call).
+     *
+     * matmul($B)               → this @ B          (standard)
+     * matmul($B, true)         → this^T @ B
+     * matmul($B, false, true)  → this @ B^T
+     */
+    public function matmul(Tensor $b, bool $transA = false, bool $transB = false): self {
+        if (!$transA && !$transB) {
+            $res = self::wrap(TensorEngine::get()->tensor_matmul($this->ptr, $b->ptr));
+        } else {
+            $res = self::wrap(TensorEngine::get()->tensor_matmul_ex($this->ptr, $b->ptr, $transA, $transB));
+        }
+        self::checkError(); return $res;
+    }
+
+    /**
+     * Zero-allocation GEMM: $this = op(A) @ op(B)
+     *
+     * Writes directly into the pre-allocated receiver — no heap allocation.
+     * $this must be a contiguous [m, n] tensor matching the result shape.
+     *
+     * Usage: $dW->matmulInto($dY, $X, transA: true)  // dW = dY^T @ X
+     */
+    public function matmulInto(Tensor $A, Tensor $B, bool $transA = false, bool $transB = false): void {
+        TensorEngine::get()->tensor_matmul_into($this->ptr, $A->ptr, $B->ptr, $transA, $transB);
+        self::checkError();
+    }
+
+    /**
+     * Zero-allocation axis-sum: $this = sum(A, axis)
+     *
+     * Writes into the pre-allocated receiver — no heap allocation.
+     * $this must have the correct reduced shape.
+     *
+     * Usage: $dbias->sumAxisInto($dY, 0)  // dbias = sum(dY, axis=0)
+     */
+    public function sumAxisInto(Tensor $A, int $axis): void {
+        TensorEngine::get()->tensor_sum_axis_into($this->ptr, $A->ptr, $axis);
+        self::checkError();
+    }
+
     public function bmm(Tensor $b): self { $res = self::wrap(TensorEngine::get()->tensor_bmm($this->ptr, $b->ptr)); self::checkError(); return $res; }
+
+    // -------------------------------------------------------------------------
+    // Transformer inference primitives
+    // -------------------------------------------------------------------------
+
+    /**
+     * In-place row-wise RMS Layer Normalization.
+     * $this must be contiguous FLOAT32; last axis is the feature dim.
+     */
+    public function rmsnorm(float $eps = 1e-5): void {
+        TensorEngine::get()->tensor_rmsnorm($this->ptr, $eps);
+        self::checkError();
+    }
+
+    /**
+     * In-place Rotary Position Embedding applied to $this (q) and $k.
+     * Both must be contiguous FLOAT32; $headDim must be even.
+     */
+    /**
+     * @param float $baseFreq Rotary base frequency (10000.0 for LLaMA-2, 500000.0 for LLaMA-3).
+     * @param float $scale    Position scaling factor (1.0 = standard; <1.0 for extended context).
+     */
+    public function applyRope(self $k, int $headDim, int $pos,
+                               float $baseFreq = 10000.0, float $scale = 1.0): void {
+        TensorEngine::get()->tensor_apply_rope($this->ptr, $k->ptr, $headDim, $pos, $baseFreq, $scale);
+        self::checkError();
+    }
+
+    /**
+     * In-place numerically-stable softmax along the last axis.
+     * $this must be contiguous FLOAT32.
+     */
+    public function softmaxInplace(): void {
+        TensorEngine::get()->tensor_softmax_inplace($this->ptr);
+        self::checkError();
+    }
+
+    /**
+     * Scaled dot-product attention (inference, no mask).
+     * $this = q, shape [seq_len, head_dim].
+     * Returns a new Tensor of shape [seq_len, head_dim].
+     */
+    public function attention(self $k, self $v): self {
+        $out = new self([$this->ptr->shape[0], $this->ptr->shape[1]]);
+        TensorEngine::get()->tensor_attention($out->ptr, $this->ptr, $k->ptr, $v->ptr);
+        self::checkError();
+        return $out;
+    }
+
+    /**
+     * Streaming attention against a KV cache (Milakov online softmax).
+     * $this = q, shape [seq_q, head_dim].
+     * Returns a new Tensor of shape [seq_q, head_dim].
+     */
+    public function attentionKV(KVCache $cache): self {
+        $seqQ = (int) ($this->ptr->total_size / $cache->ptr->head_dim);
+        $out  = new self([$seqQ, $cache->ptr->head_dim]);
+        TensorEngine::get()->tensor_attention_kv($out->ptr, $this->ptr, $cache->ptr);
+        self::checkError();
+        return $out;
+    }
+
+    // -------------------------------------------------------------------------
+    // Advanced inference & training primitives (Section 20)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Zero-copy tensor backed by a memory-mapped file region.
+     * Use mmapFree() instead of letting the object destruct normally when
+     * you want to explicitly release the mapping.
+     *
+     * @param string $filepath   Path to the file.
+     * @param int    $byteOffset Byte offset within the file.
+     * @param int[]  $shape      Tensor shape array.
+     * @param int    $dtype      0=FLOAT32, 1=INT32, 2=INT64.
+     */
+    public static function fromMmap(string $filepath, int $byteOffset,
+                                    array $shape, int $dtype = 0): self {
+        $ffi  = TensorEngine::get();
+        $ndim = count($shape);
+        $shapeArr = $ffi->new("int[$ndim]");
+        foreach ($shape as $i => $s) $shapeArr[$i] = $s;
+        $ptr = $ffi->tensor_from_mmap($filepath, $byteOffset, $ndim, $shapeArr, $dtype);
+        self::checkError();
+        if ($ptr === null) throw new \RuntimeException('tensor_from_mmap returned NULL.');
+        $t = self::wrap($ptr);
+        $t->owned = false;   /* do not call tensor_free on an mmap-backed tensor */
+        return $t;
+    }
+
+    /**
+     * Explicitly unmap a tensor created by fromMmap().
+     * After this call the tensor's ptr is null and must not be used.
+     */
+    public function mmapFree(): void {
+        if ($this->ptr !== null) {
+            TensorEngine::get()->tensor_mmap_free($this->ptr);
+            $this->ptr  = null;
+            $this->owned = false;
+        }
+    }
+
+    /** SiLU activation: out[i] = x[i] * sigmoid(x[i]). AVX2 vectorized. */
+    public function silu(): self {
+        $res = self::wrap(TensorEngine::get()->tensor_silu($this->ptr));
+        self::checkError();
+        return $res;
+    }
+
+    /**
+     * Fused SwiGLU: out[i] = silu(gate[i]) * up[i].
+     * $this is the gate tensor; $up must have the same shape.
+     */
+    public function swiglu(self $up): self {
+        $res = self::wrap(TensorEngine::get()->tensor_swiglu($this->ptr, $up->ptr));
+        self::checkError();
+        return $res;
+    }
+
+    /**
+     * Fused cross-entropy: numerically stable softmax + NLL loss + gradient.
+     * $this = logits [batch, vocab].
+     * Returns ['loss' => float, 'grads' => Tensor[batch, vocab]].
+     */
+    public function fusedCrossEntropyLossAndGrad(self $targetIds): array {
+        $ffi   = TensorEngine::get();
+        $ndim  = $this->ptr->ndim;
+        $vocab = $this->ptr->shape[$ndim - 1];
+        $batch = (int) ($this->ptr->total_size / $vocab);
+
+        $shape    = [];
+        for ($i = 0; $i < $ndim; $i++) $shape[] = $this->ptr->shape[$i];
+        $grads    = new self($shape);
+        $lossPtr  = $ffi->new('float');
+
+        $ffi->tensor_fused_cross_entropy_loss_and_grad(
+            $this->ptr, $targetIds->ptr, $grads->ptr, \FFI::addr($lossPtr)
+        );
+        self::checkError();
+
+        return ['loss' => $lossPtr->cdata, 'grads' => $grads];
+    }
+
+    /**
+     * RMSNorm backward.
+     * $this = dY (upstream gradient) [batch, d].
+     * Returns dX [batch, d].
+     */
+    public function rmsnormBackward(self $x, self $weights, float $eps = 1e-5): self {
+        $res = self::wrap(
+            TensorEngine::get()->tensor_rmsnorm_backward($this->ptr, $x->ptr, $weights->ptr, $eps)
+        );
+        self::checkError();
+        return $res;
+    }
+
+    /**
+     * Embedding backward: accumulates $this (dY) into $dWeights for each token.
+     * $dWeights must be pre-zeroed by the caller.
+     * $this = dY [seq_len, embed_dim].
+     */
+    public function embeddingBackward(self $tokenIds, self $dWeights): void {
+        TensorEngine::get()->tensor_embedding_backward($this->ptr, $tokenIds->ptr, $dWeights->ptr);
+        self::checkError();
+    }
     
     public function inverse(): self { $res = self::wrap(TensorEngine::get()->tensor_inverse($this->ptr)); self::checkError(); return $res; }
     public function pinv(): self { $res = self::wrap(TensorEngine::get()->tensor_pinv($this->ptr)); self::checkError(); return $res; }
@@ -511,13 +745,52 @@ class Tensor {
     }
 
     // --- I/O SERIALIZATION ---
-    public function save(string $filepath): void { 
-        TensorEngine::get()->tensor_save_to_file($this->ptr, $filepath); 
-        self::checkError(); 
+    public function save(string $filepath): void {
+        TensorEngine::get()->tensor_save_to_file($this->ptr, $filepath);
+        self::checkError();
     }
-    public static function load(string $filepath): self { 
-        $res = self::wrap(TensorEngine::get()->tensor_load_from_file($filepath)); 
-        self::checkError(); return $res; 
+    public static function load(string $filepath): self {
+        $res = self::wrap(TensorEngine::get()->tensor_load_from_file($filepath));
+        self::checkError(); return $res;
+    }
+
+    /**
+     * Save tensors in the SafeTensors format.
+     *
+     * @param string   $filepath    Output file path.
+     * @param string   $jsonHeader  SafeTensors JSON metadata header (already serialised).
+     * @param self[]   $tensors     Ordered list of Tensor objects matching the header.
+     * @return int  1 on success, 0 on failure (check error via C engine).
+     */
+    public static function saveSafetensors(string $filepath, string $jsonHeader, array $tensors): int {
+        $ffi = TensorEngine::get();
+        $num = count($tensors);
+        $ptrArray = $ffi->new("TensorC*[$num]");
+        foreach ($tensors as $i => $t) $ptrArray[$i] = $t->ptr;
+        $jsonLen = strlen($jsonHeader);
+        $res = $ffi->tensor_save_safetensors($filepath, $jsonHeader, $jsonLen, $ptrArray, $num);
+        self::checkError();
+        return $res;
+    }
+
+    /**
+     * Load a CSV file directly into [samples, labels] Tensor pair.
+     *
+     * Uses the C-level two-pass CSV parser (mmap + MADV_SEQUENTIAL).
+     *
+     * @param string $filepath   Path to CSV file.
+     * @param int    $labelCol   Column index of the label (0-based). Use -1 for no label.
+     * @param bool   $hasHeader  Whether the first row is a header.
+     * @return array{samples: self, labels: self|null}
+     */
+    public static function datasetFromCsv(string $filepath, int $labelCol = -1, bool $hasHeader = true): array {
+        $ffi = TensorEngine::get();
+        $result = $ffi->tensor_dataset_from_csv($filepath, $labelCol, (int)$hasHeader);
+        self::checkError();
+        $samples = self::wrap($result[0]);
+        $labels  = ($labelCol >= 0 && $result[1] !== null) ? self::wrap($result[1]) : null;
+        $ffi->free($result);
+        return ['samples' => $samples, 'labels' => $labels];
     }
 
     // --- DATA INGESTION ---
@@ -618,6 +891,24 @@ class Tensor {
     public function buffer(): \FFI\CData
     {
         return $this->buffer;
+    }
+
+    /**
+     * Hardware-accelerated memory copy.
+     * Safely copies data from a source Tensor into this Tensor, regardless of 
+     * stride differences or transpositions.
+     */
+    public function copyFrom(Tensor $src): void
+    {
+        if ($this->size() !== $src->size()) {
+            throw new \InvalidArgumentException(
+                "Size mismatch in copyFrom. Dest: {$this->size()}, Src: {$src->size()}"
+            );
+        }
+        
+        $ffi = TensorEngine::get();
+        // CRITICAL: Pass ->ptr (Tensor* struct), not ->buffer (float* array)
+        $ffi->tensor_copy_from($this->ptr, $src->ptr);
     }
     
     public function __destruct()

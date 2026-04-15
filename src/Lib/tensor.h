@@ -62,7 +62,7 @@ Tensor* tensor_create_arena(int ndim, int* shape, TensorDType dtype, TensorArena
 Tensor* tensor_from_external(void* data, int ndim, int* shape, TensorDType dtype);
 void tensor_free(Tensor* t);
 Tensor* tensor_copy(Tensor* A);
-void tensor_shape_assert(Tensor* A, Tensor* B, const char* op);
+bool _tensor_shape_assert(Tensor* A, Tensor* B, const char* op);
 bool tensor_is_contiguous(const Tensor* t);
 bool tensor_broadcast_shapes(const Tensor* A, const Tensor* B, int* out_ndim, int* out_shape, size_t* out_stride_A, size_t* out_stride_B);
 
@@ -217,6 +217,13 @@ float tensor_trace(Tensor* A);
 Tensor* tensor_matmul(Tensor* A, Tensor* B);
 Tensor* tensor_bmm(Tensor* A, Tensor* B);
 
+/* Extended GEMM: out = op(A) @ op(B);  op(X)=X^T when trans=true */
+Tensor* tensor_matmul_ex(Tensor* A, Tensor* B, bool transA, bool transB);
+/* Zero-alloc GEMM into a pre-allocated contiguous output tensor */
+void    tensor_matmul_into(Tensor* out, Tensor* A, Tensor* B, bool transA, bool transB);
+/* Zero-alloc axis-sum into a pre-allocated output tensor */
+void    tensor_sum_axis_into(Tensor* out, Tensor* A, int axis);
+
 Tensor* tensor_inverse(Tensor* A);
 Tensor* tensor_pinv(Tensor* A);
 Tensor* tensor_solve(Tensor* A, Tensor* B);
@@ -278,6 +285,56 @@ Tensor* tensor_mul_add(Tensor* A, Tensor* B, Tensor* C);
 void tensor_configure_threading(int omp_threads, int blas_threads);
 
 // ============================================================================
+// 18. TRANSFORMER INFERENCE PRIMITIVES
+// ============================================================================
+
+/* In-place row-wise Root Mean Square Normalization.
+ * x: contiguous FLOAT32, any shape; last axis = feature dim.
+ * eps: small constant for numerical stability (e.g. 1e-5). */
+void tensor_rmsnorm(Tensor* x, float eps);
+
+/* In-place Rotary Position Embedding applied to q and k.
+ * Both must be contiguous FLOAT32; head_dim must be even.
+ * pos:       absolute position index in the sequence.
+ * base_freq: rotary embedding base (e.g. 10000.0 for LLaMA-2, 500000.0 for LLaMA-3).
+ * scale:     position scaling factor (1.0 = standard; <1.0 for extended context). */
+void tensor_apply_rope(Tensor* q, Tensor* k, int head_dim, int pos,
+                       float base_freq, float scale);
+
+/* In-place numerically-stable softmax along the last axis.
+ * x must be contiguous FLOAT32. */
+void tensor_softmax_inplace(Tensor* x);
+
+/* Scaled dot-product attention (inference, no mask, no batch).
+ * q, k, v, out: contiguous FLOAT32 [seq_len, head_dim].
+ * out must be pre-allocated by the caller. */
+void tensor_attention(Tensor* out, Tensor* q, Tensor* k, Tensor* v);
+
+// ============================================================================
+// 19. KV CACHE
+// ============================================================================
+
+/* Interleaved K/V cache.  data[i] = [k_0..k_{hd-1}, v_0..v_{hd-1}] for token i.
+ * 32-byte aligned; append-only; zero-copy reads via tensor_attention_kv. */
+typedef struct {
+    float* data;      /* [cap][2*head_dim], 32-byte aligned               */
+    int    len;       /* tokens currently stored                          */
+    int    cap;       /* maximum tokens (allocated capacity)              */
+    int    head_dim;  /* dimension of each K and V vector                 */
+} KVCache;
+
+KVCache* kvcache_create(int cap, int head_dim);
+void     kvcache_free(KVCache* cache);
+void     kvcache_reset(KVCache* cache);
+int      kvcache_len(const KVCache* cache);
+void     kvcache_append(KVCache* cache, const Tensor* k, const Tensor* v);
+
+/* Streaming attention against a KV cache (Milakov online softmax).
+ * q:   [seq_q, head_dim]; out: [seq_q, head_dim] (pre-allocated).
+ * No O(seq²) scores buffer; O(head_dim) working memory per thread. */
+void tensor_attention_kv(Tensor* out, Tensor* q, const KVCache* cache);
+
+// ============================================================================
 // 14. I/O SERIALIZATION
 // ============================================================================
 void tensor_save_to_file(Tensor* t, const char* filepath);
@@ -291,5 +348,49 @@ int tensor_save_safetensors(const char* filepath, const char* json_header, uint6
 // Returns an array of 2 Tensor Pointers: [Samples, Labels]. 
 // If label_col is -1, Labels will be NULL.
 Tensor** tensor_dataset_from_csv(const char* filepath, int label_col, int has_header);
+
+void tensor_copy_from(Tensor* dest, Tensor* src);
+
+// ============================================================================
+// 20. ADVANCED INFERENCE & TRAINING PRIMITIVES
+// ============================================================================
+
+/* Zero-copy tensor backed by a memory-mapped file region (MAP_PRIVATE).
+ * byte_offset: byte position within the file where the tensor data starts.
+ * owns_data is false; call tensor_mmap_free() instead of tensor_free().    */
+Tensor* tensor_from_mmap(const char* filepath, size_t byte_offset,
+                         int ndim, const int* shape, int dtype);
+
+/* Unmap and free a tensor created by tensor_from_mmap(). */
+void tensor_mmap_free(Tensor* t);
+
+/* SiLU (Swish) activation: out[i] = x[i] * sigmoid(x[i]).
+ * AVX2 vectorized. Returns a new FLOAT32 tensor.                           */
+Tensor* tensor_silu(Tensor* A);
+
+/* Fused SwiGLU: out[i] = silu(gate[i]) * up[i].
+ * gate and up must have identical shape. Returns new FLOAT32 tensor.       */
+Tensor* tensor_swiglu(Tensor* gate, Tensor* up);
+
+/* Fused cross-entropy: numerically stable softmax + NLL loss + gradient.
+ * logits:     [batch, vocab] FLOAT32   input logits
+ * target_ids: [batch]        INT32     correct token ids
+ * grads:      [batch, vocab] FLOAT32   pre-allocated; receives (probs - one_hot)
+ * out_loss:   receives mean loss over the batch                            */
+void tensor_fused_cross_entropy_loss_and_grad(Tensor* logits, Tensor* target_ids,
+                                               Tensor* grads,  float*  out_loss);
+
+/* RMSNorm backward: dx_j = (1/r)*w_j*dy_j - x_j*S/(d*r³).
+ * dY:      [batch, d] upstream gradient
+ * X:       [batch, d] original forward input
+ * weights: [d]        RMSNorm weight vector
+ * Returns: [batch, d] gradient w.r.t. X                                   */
+Tensor* tensor_rmsnorm_backward(Tensor* dY, Tensor* X, Tensor* weights, float eps);
+
+/* Embedding backward: accumulates dY rows into dWeights[token_id] rows.
+ * dY:        [seq_len, embed_dim] upstream gradients
+ * token_ids: [seq_len]            INT32 token indices
+ * dWeights:  [vocab, embed_dim]   gradient accumulator (caller must zero first) */
+void tensor_embedding_backward(Tensor* dY, Tensor* token_ids, Tensor* dWeights);
 
 #endif // TENSOR_H

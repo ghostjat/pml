@@ -15,7 +15,7 @@ use RuntimeException;
  * A highly competitive ensemble model that iteratively fits weak learners to the loss gradients.
  * * JIT & Memory Optimized:
  * - Employs purely In-Place C-tensor accumulation ($F->addInplace) to prevent OOM errors.
- * - Utilizes native PHP `shuffle` driving C-level `tensor_take` for stochastic subsampling.
+ * - Eagerly reuses a pre-allocated Residual buffer to eliminate N-sized allocations per tree.
  */
 final class GradientBoostingRegressor implements Learner
 {
@@ -29,18 +29,10 @@ final class GradientBoostingRegressor implements Learner
     private array $trees = [];
     private float $initialPrediction = 0.0;
 
-    /**
-     * @param int $nEstimators The number of boosting stages (trees) to perform.
-     * @param float $learningRate Shrinks the contribution of each tree (learning rate).
-     * @param int $maxDepth Maximum depth of the individual regression estimators.
-     * @param float $subsample The fraction of samples used for fitting individual trees. 
-     * (Values < 1.0 result in Stochastic Gradient Boosting, reducing variance).
-     * @param int|null $maxFeatures The number of features to consider when looking for the best split.
-     */
     public function __construct(
         int $nEstimators = 100, 
         float $learningRate = 0.1, 
-        int $maxDepth = 3,
+        int $maxDepth = 3, 
         float $subsample = 1.0,
         ?int $maxFeatures = null
     ) {
@@ -55,54 +47,66 @@ final class GradientBoostingRegressor implements Learner
     {
         $x = $dataset->samples();
         $y = $dataset->labels();
-        $n = $y->size();
 
-        // 1. Initialize F_0(x) with the constant minimizing the loss (The Mean)
-        $this->initialPrediction = $y->mean();
+        if ($y === null) {
+            throw new \InvalidArgumentException("Gradient Boosting requires labeled continuous data.");
+        }
+
+        $n = $x->shape()[0];
         
-        // F holds the continuous cumulative predictions. Allocated ONCE.
+        // 1. Initialize F_0(x) with a constant
         $F = Tensor::zeros($n)->addScalarInplace($this->initialPrediction);
 
-        $subsampleCount = (int) max(1, round($n * $this->subsample));
+        // --- CRITICAL OPTIMIZATION: Zero-Allocation Residual Buffer ---
+        // Pre-allocate the memory block once for the entire training session.
+        $residuals = Tensor::emptyLike($y);
 
-        for ($i = 0; $i < $this->nEstimators; $i++) {
+        for ($m = 0; $m < $this->nEstimators; $m++) {
             
-            // 2. Compute Pseudo-Residuals: r_m = y - F_{m-1}(x)
-            // (For Mean Squared Error, the negative gradient is simply the residual)
-            $residuals = $y->sub($F);
+            // 2. Compute pseudo-residuals in-place: residuals = y - F(x)
+            // Copies fresh targets into the buffer and subtracts predictions natively in C.
+            $residuals->copyFrom($y)->subInplace($F);
 
-            // 3. Stochastic Subsampling (Bagging to prevent overfitting)
             if ($this->subsample < 1.0) {
-                $indices = range(0, $n - 1);
-                shuffle($indices);
-                $indices = array_slice($indices, 0, $subsampleCount);
+                // Stochastic Gradient Boosting
+                $subsampleSize = (int) max(1, $n * $this->subsample);
                 
-                // Zero-copy subset extraction using C-level tensor_take
-                $idxT = Tensor::fromArray($indices);
-                $trainX = $x->take($idxT, 0);
-                $trainY = $residuals->take($idxT, 0);
-                $trainDataset = new Dataset($trainX, $trainY);
+                $indices = array_rand(range(0, $n - 1), $subsampleSize);
+                $indicesTensor = Tensor::fromArray((array) $indices);
+
+                // Zero-copy view extractions
+                $subX = $x->take($indicesTensor, 0);
+                $subY = $residuals->take($indicesTensor, 0);
+                
+                unset($indices, $indicesTensor);
             } else {
-                $trainDataset = new Dataset($x, $residuals);
+                $subX = $x;
+                $subY = $residuals;
             }
 
-            // 4. Fit a weak learner to the residuals
+            // 3. Fit a weak learner to the pseudo-residuals
+            $trainDataset = new Dataset($subX, $subY);
+            
             $tree = new DecisionTreeRegressor($this->maxDepth, 2, $this->maxFeatures);
             $tree->train($trainDataset);
 
-            // 5. Predict on the ENTIRE training set to update cumulative predictions
-            // h_m(x)
-            $h_m = $tree->predict(new Dataset($x));
+            // 4. Predict on the ENTIRE training set to update cumulative predictions
+            // Use the original dataset object to prevent redundant PHP object instantiations
+            $h_m = $tree->predict($dataset);
 
-            // 6. Update F_m(x) = F_{m-1}(x) + (learning_rate * h_m(x))
-            // Executes natively in C via chained inplace mutations to prevent GC spikes
+            // 5. Update F_m(x) = F_{m-1}(x) + (learning_rate * h_m(x))
             $h_m->mulScalarInplace($this->learningRate);
             $F->addInplace($h_m);
 
             // Save the weak learner
             $this->trees[] = $tree;
             
-            // $residuals and intermediate tensors fall out of scope here and are cleanly garbage collected.
+            // --- EAGER GARBAGE COLLECTION ---
+            // Instantly drop temporary views and activations to maintain a flat memory profile
+            unset($h_m, $trainDataset);
+            if ($this->subsample < 1.0) {
+                unset($subX, $subY);
+            }
         }
     }
 
@@ -112,7 +116,7 @@ final class GradientBoostingRegressor implements Learner
             throw new RuntimeException("Gradient Boosting Regressor is not trained.");
         }
 
-        $n = $dataset->samples()->shape()[0];
+        $n = $dataset->numRows();
         
         // Initialize cumulative predictions array F(x)
         $F = Tensor::zeros($n)->addScalarInplace($this->initialPrediction);
@@ -124,6 +128,9 @@ final class GradientBoostingRegressor implements Learner
             // F(x) += learning_rate * h_m(x)
             $h_m->mulScalarInplace($this->learningRate);
             $F->addInplace($h_m);
+            
+            // Free the intermediate prediction tensor immediately
+            unset($h_m);
         }
 
         return $F;

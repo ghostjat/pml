@@ -6,68 +6,101 @@ namespace Pml\NeuralNetwork\Layers;
 
 use Pml\Tensor;
 
-/**
- * Dense (Fully Connected) Linear Layer.
- * Mathematical operation: Y = XW + b
- * * JIT & Memory Optimized:
- * - Employs OpenBLAS for massive O(N^3) Matmuls.
- * - Uses Stride=0 Broadcasting for bias addition.
- * - Backprop utilizes Zero-Copy matrix transpositions.
- */
 final class Dense implements Layer
 {
     private Tensor $weights;
     private ?Tensor $bias;
-    
-    // Cached states for Backpropagation
+
     private ?Tensor $input = null;
-    private ?Tensor $dW = null;
-    private ?Tensor $dbias = null;
+
+    // Reusable buffers
+    private Tensor $dW;
+    private ?Tensor $dbias;
+
+    // Cached feature flags (avoid method_exists in hot path)
+    private bool $hasMatmulInto;
+    private bool $hasSumInto;
 
     public function __construct(int $inputDim, int $outputDim, bool $useBias = true)
     {
-        // He Initialization (Optimized for ReLU)
-        $stddev = sqrt(2.0 / $inputDim);
-        $this->weights = Tensor::randomNormal([$inputDim, $outputDim], 0.0, $stddev);
-        
-        $this->bias = $useBias ? Tensor::zeros(1, $outputDim) : null;
+        $stddev = \sqrt(2.0 / $inputDim);
+
+        $this->weights = Tensor::randomNormal([$outputDim, $inputDim], 0.0, $stddev);
+
+        if ($useBias) {
+            $this->bias = Tensor::zeros($outputDim);
+            $this->dbias = Tensor::zeros($outputDim);
+        } else {
+            $this->bias = null;
+            $this->dbias = null;
+        }
+
+        $this->dW = Tensor::zeros($outputDim, $inputDim);
+
+        // Cache capabilities (JIT friendly)
+        $this->hasMatmulInto = method_exists($this->dW, 'matmulInto');
+        $this->hasSumInto = $this->dbias !== null && method_exists($this->dbias, 'sumAxisInto');
     }
 
     public function forward(Tensor $input): Tensor
     {
-        // Cache the input pointer for the backward pass (No memory is copied)
-        $this->input = $input;
-
-        // Y = X * W
-        $output = $input->matmul($this->weights);
-
-        // Y = Y + b (Addition applies Stride=0 AVX2 Broadcasting automatically)
-        if ($this->bias !== null) {
-            $output->addInplace($this->bias);
+        // Optional: only enforce if your backend requires it
+        if (!$input->isContiguous()) {
+            $input = $input->contiguous();
         }
 
-        return $output;
+        $this->input = $input;
+
+        return $input->linear($this->weights, $this->bias);
     }
 
     public function backward(Tensor $dY): Tensor
     {
-        if ($this->input === null) {
-            throw new \RuntimeException("Backward pass called before forward pass.");
+        $input = $this->input;
+
+        if ($input === null) {
+            throw new \RuntimeException("Backward before forward.");
         }
 
-        // 1. Gradient w.r.t Bias: db = sum(dY, axis=0)
-        if ($this->bias !== null) {
-            $this->dbias = $dY->sumAxis(0);
+        // Early release (GOOD optimization)
+        $this->input = null;
+
+        if (!$dY->isContiguous()) {
+            $dY = $dY->contiguous();
         }
 
-        // 2. Gradient w.r.t Weights: dW = X^T * dY
-        // transpose() is a <0.01ms Zero-Copy View modification
-        $inputT = $this->input->transpose();
-        $this->dW = $inputT->matmul($dY);
+        /*
+         * 1. dW = dY^T @ X (NO TRANSPOSE)
+         */
+        if ($this->hasMatmulInto) {
+            $this->dW->matmulInto($dY, $input, true, false);
+        } else {
+            // fallback WITHOUT breaking reuse
+            $tmp = $dY->matmul($input, true, false);
+            $this->dW->copyFrom($tmp);
+        }
 
-        // 3. Gradient w.r.t Input (to pass to the previous layer): dX = dY * W^T
-        $weightsT = $this->weights->transpose();
-        $dX = $dY->matmul($weightsT);
+        /*
+         * 2. dbias
+         */
+        if ($this->dbias !== null) {
+            if ($this->hasSumInto) {
+                $this->dbias->sumAxisInto($dY, 0);
+            } else {
+                $tmp = $dY->sumAxis(0);
+                $this->dbias->copyFrom($tmp);
+            }
+        }
+
+        /*
+         * 3. dX
+         */
+        if ($this->hasMatmulInto) {
+            $dX = Tensor::emptyLike($input);
+            $dX->matmulInto($dY, $this->weights);
+        } else {
+            $dX = $dY->matmul($this->weights);
+        }
 
         return $dX;
     }
@@ -75,18 +108,22 @@ final class Dense implements Layer
     public function getParameters(): array
     {
         $params = ['weights' => $this->weights];
+
         if ($this->bias !== null) {
             $params['bias'] = $this->bias;
         }
+
         return $params;
     }
 
     public function getGradients(): array
     {
         $grads = ['weights' => $this->dW];
+
         if ($this->dbias !== null) {
             $grads['bias'] = $this->dbias;
         }
+
         return $grads;
     }
 }
