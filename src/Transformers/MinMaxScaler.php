@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Pml\Transformers;
 
+use Pml\Interfaces\Stateful;
 use Pml\Interfaces\Transformer;
 use Pml\Tensor;
 use Pml\Dataset;
@@ -15,7 +16,7 @@ use Pml\Dataset;
  * - Uses C-level axis reductions to find Min and Max instantly.
  * - Applies scaling via zero-allocation In-Place broadcasting.
  */
-final class MinMaxScaler implements Transformer
+final class MinMaxScaler implements Transformer, Stateful
 {
     private array $featureRange;
     private ?Tensor $min = null;
@@ -69,5 +70,19 @@ final class MinMaxScaler implements Transformer
     public function fitted(): bool
     {
         return $this->min !== null && $this->range !== null;
+    }
+
+    public function getStateDict(string $prefix = ''): array
+    {
+        $dict = [];
+        if ($this->min   !== null) { $dict[$prefix . 'min']   = $this->min; }
+        if ($this->range !== null) { $dict[$prefix . 'range'] = $this->range; }
+        return $dict;
+    }
+
+    public function loadStateDict(array $dict, string $prefix = ''): void
+    {
+        $this->min   = $dict[$prefix . 'min']   ?? null;
+        $this->range = $dict[$prefix . 'range'] ?? null;
     }
 }

@@ -15,7 +15,7 @@ use RuntimeException;
  * - Employs "Inverted Dropout" scaling natively in C during training.
  * - Inference is a zero-cost pass-through.
  */
-final class Dropout implements Layer
+final class Dropout implements Layer, HasTrainingMode
 {
     private float $rate;
     private ?Tensor $mask = null;
@@ -66,6 +66,11 @@ final class Dropout implements Layer
 
         // Gradients only flow back through the neurons that weren't dropped
         return $dY->mul($this->mask);
+    }
+
+    public function setTraining(bool $mode): void
+    {
+        $this->training = $mode;
     }
 
     public function getParameters(): array { return []; }

@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Pml\Estimators\Classifiers;
 
 use Pml\Interfaces\Learner;
+use Pml\Interfaces\Persistable;
+use Pml\Lib\SafeTensorsIO;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -16,7 +18,7 @@ use RuntimeException;
  * - Maps labels dynamically to {-1, 1} for ultra-fast C-level subgradient vectorization.
  * - Modifies gradients via boolean masking (`less`) to bypass iteration.
  */
-final class SVC implements Learner
+final class SVC implements Learner, Persistable
 {
     private float $c;
     private int $epochs;
@@ -97,5 +99,56 @@ final class SVC implements Learner
     public function trained(): bool
     {
         return $this->weights !== null;
+    }
+
+    public function save(string $dir): void
+    {
+        if (!is_dir($dir)) {
+            mkdir($dir, 0755, true);
+        }
+
+        file_put_contents(
+            $dir . \DIRECTORY_SEPARATOR . 'config.json',
+            json_encode([
+                'class'        => self::class,
+                'c'            => $this->c,
+                'epochs'       => $this->epochs,
+                'learningRate' => $this->learningRate,
+                'batchSize'    => $this->batchSize,
+                'bias'         => $this->bias,
+            ], \JSON_PRETTY_PRINT | \JSON_UNESCAPED_SLASHES)
+        );
+
+        if ($this->weights !== null) {
+            SafeTensorsIO::save(
+                $dir . \DIRECTORY_SEPARATOR . 'model.safetensors',
+                ['weights' => $this->weights]
+            );
+        }
+    }
+
+    public static function load(string $dir): self
+    {
+        $raw = file_get_contents($dir . \DIRECTORY_SEPARATOR . 'config.json');
+        if ($raw === false) {
+            throw new \RuntimeException("SVC::load — config.json missing in '$dir'.");
+        }
+        $config = json_decode($raw, true, 512, \JSON_THROW_ON_ERROR);
+
+        $instance = new self(
+            (float) $config['c'],
+            (int)   $config['epochs'],
+            (float) $config['learningRate'],
+            (int)   $config['batchSize']
+        );
+        $instance->bias = (float) $config['bias'];
+
+        $stPath = $dir . \DIRECTORY_SEPARATOR . 'model.safetensors';
+        if (is_file($stPath)) {
+            $tensors = SafeTensorsIO::load($stPath);
+            $instance->weights = $tensors['weights'] ?? null;
+        }
+
+        return $instance;
     }
 }

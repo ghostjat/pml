@@ -314,7 +314,10 @@ void tensor_fill(Tensor* t, float val) {
     if (t->dtype != DTYPE_FLOAT32) return;
     if (tensor_is_contiguous(t)) {
         size_t i = 0;
-#ifdef __AVX2__
+#ifdef __AVX512F__
+        __m512 v_val = _mm512_set1_ps(val);
+        for (; i + 15 < t->total_size; i += 16) _mm512_storeu_ps(&F32(t)[i], v_val);
+#elif defined(__AVX2__)
         __m256 v_val = _mm256_set1_ps(val);
         for (; i + 7 < t->total_size; i += 8) _mm256_storeu_ps(&F32(t)[i], v_val);
 #endif
@@ -567,13 +570,18 @@ Tensor* tensor_transpose_nd(Tensor* t, int* axes) {
         } \
         if (!IN_PLACE) OUT_TENSOR = tensor_create_uninitialized(out_ndim, out_shape, DTYPE_FLOAT32); \
         size_t limit = OUT_TENSOR->total_size; \
+        /* Precompute base offsets for outer dimensions to avoid modulo per element */ \
+        size_t base_stride[8] = {0}; \
+        for (int d = out_ndim - 1; d >= 0; d--) { \
+            base_stride[d] = (d == out_ndim - 1) ? 1 : base_stride[d+1] * out_shape[d+1]; \
+        } \
         _Pragma("omp parallel for schedule(static) if(limit > 100000)") \
         for (size_t i = 0; i < limit; i++) { \
             size_t temp = i; \
             size_t offset_a = 0, offset_b = 0; \
-            for (int d = out_ndim - 1; d >= 0; d--) { \
-                size_t c = temp % out_shape[d]; \
-                temp /= out_shape[d]; \
+            for (int d = 0; d < out_ndim; d++) { \
+                size_t c = temp / base_stride[d]; \
+                temp %= base_stride[d]; \
                 offset_a += c * stride_A[d]; \
                 offset_b += c * stride_B[d]; \
             } \
@@ -721,7 +729,17 @@ Tensor* tensor_clip(Tensor* A, float min_val, float max_val) {
         float* a = F32(A);
         float* o = F32(out);
         size_t i = 0;
-#ifdef __AVX2__
+#ifdef __AVX512F__
+        __m512 vmin = _mm512_set1_ps(min_val);
+        __m512 vmax = _mm512_set1_ps(max_val);
+        size_t limit = n & ~15UL;
+        for (; i < limit; i += 16) {
+            __m512 val = _mm512_loadu_ps(a + i);
+            val = _mm512_max_ps(vmin, val);
+            val = _mm512_min_ps(vmax, val);
+            _mm512_storeu_ps(o + i, val);
+        }
+#elif defined(__AVX2__)
         __m256 vmin = _mm256_set1_ps(min_val);
         __m256 vmax = _mm256_set1_ps(max_val);
         size_t limit = n & ~7UL;
@@ -759,7 +777,14 @@ Tensor* tensor_relu(Tensor* A) {
         float* a = F32(A);
         float* o = F32(out);
         size_t i = 0;
-#ifdef __AVX2__
+#ifdef __AVX512F__
+        __m512 vzero = _mm512_setzero_ps();
+        size_t limit = n & ~15UL;
+        for (; i < limit; i += 16) {
+            __m512 val = _mm512_loadu_ps(a + i);
+            _mm512_storeu_ps(o + i, _mm512_max_ps(vzero, val));
+        }
+#elif defined(__AVX2__)
         __m256 vzero = _mm256_setzero_ps();
         size_t limit = n & ~7UL;
         for (; i < limit; i += 8) {
@@ -836,7 +861,6 @@ Tensor* tensor_logical_not(Tensor* A) {
         __m256 vone  = _mm256_set1_ps(1.0f);
         size_t limit = n & ~7UL;
         for (; i < limit; i += 8) {
-            /* cmp_eq returns all-ones mask where a==0; and with 1.0f gives 0/1 */
             __m256 cmp = _mm256_cmp_ps(_mm256_loadu_ps(a + i), vzero, _CMP_EQ_OQ);
             _mm256_storeu_ps(o + i, _mm256_and_ps(cmp, vone));
         }
@@ -960,22 +984,34 @@ TENSOR_AXIS_AGG(tensor_min_axis, INFINITY, _MIN_OP, )
 /*
  * tensor_sum — two-tier strategy:
  *   ≥ 500 K elements : OpenMP parallel reduction (auto-vectorized by -O3 -mavx2)
- *   < 500 K elements : 4-accumulator AVX2 loop (hides latency without thread overhead)
+ *   < 500 K elements : 4-accumulator AVX2/AVX512 loop (hides latency without thread overhead)
  */
 float tensor_sum(Tensor* A) {
     if (A->dtype != DTYPE_FLOAT32) return 0.0f;
     float sum = 0.0f;
     if (tensor_is_contiguous(A)) {
-        const float* data = F32(A);
+        const float* data = (const float*)__builtin_assume_aligned(F32(A), 64);
         size_t n = A->total_size;
 
         if (n >= 500000) {
-            /* Large tensors: let OpenMP+compiler vectorise for us */
             #pragma omp parallel for simd reduction(+:sum) schedule(static)
             for (size_t i = 0; i < n; i++) sum += data[i];
         } else {
-#ifdef __AVX2__
-            /* Medium tensors: 4-accumulator unrolled AVX2 */
+#ifdef __AVX512F__
+            __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
+            __m512 a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
+            size_t i = 0;
+            for (; i + 63 < n; i += 64) {
+                __builtin_prefetch(data + i + 256, 0, 1);
+                a0 = _mm512_add_ps(a0, _mm512_loadu_ps(data + i));
+                a1 = _mm512_add_ps(a1, _mm512_loadu_ps(data + i + 16));
+                a2 = _mm512_add_ps(a2, _mm512_loadu_ps(data + i + 32));
+                a3 = _mm512_add_ps(a3, _mm512_loadu_ps(data + i + 48));
+            }
+            a0 = _mm512_add_ps(_mm512_add_ps(a0, a1), _mm512_add_ps(a2, a3));
+            sum = _mm512_reduce_add_ps(a0);
+            for (; i < n; i++) sum += data[i];
+#elif defined(__AVX2__)
             __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
             __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
             size_t i = 0;
@@ -1018,7 +1054,7 @@ float tensor_product(Tensor* A) {
     if (A->dtype != DTYPE_FLOAT32) return 0.0f;
     float prod = 1.0f;
     if (tensor_is_contiguous(A)) {
-        const float* data = F32(A);
+        const float* data = (const float*)__builtin_assume_aligned(F32(A), 64);
         size_t n = A->total_size;
 #ifdef __AVX2__
         size_t i = 0;
@@ -1034,7 +1070,6 @@ float tensor_product(Tensor* A) {
                 p3 = _mm256_mul_ps(p3, _mm256_loadu_ps(data + i + 24));
             }
             p0 = _mm256_mul_ps(_mm256_mul_ps(p0, p1), _mm256_mul_ps(p2, p3));
-            /* Horizontal product: extract 8 lanes and multiply */
             float tmp[8]; _mm256_storeu_ps(tmp, p0);
             prod = tmp[0]*tmp[1]*tmp[2]*tmp[3]*tmp[4]*tmp[5]*tmp[6]*tmp[7];
             for (; i < n; i++) prod *= data[i];
@@ -1159,7 +1194,6 @@ static int cmp_float_index(const void* a, const void* b) {
 
 Tensor* tensor_argsort(Tensor* A, int axis) {
     if (axis < 0 || axis >= A->ndim || A->dtype != DTYPE_FLOAT32) return NULL;
-    // Output is fully overwritten with index values — skip zero-fill.
     Tensor* out = tensor_create_uninitialized(A->ndim, A->shape, DTYPE_FLOAT32);
     int dim_len = A->shape[axis];
 
@@ -1229,11 +1263,21 @@ static inline float _hmax256(__m256 v) {
 float tensor_min(Tensor* A) {
     if (A->dtype != DTYPE_FLOAT32) return 0.0f;
     if (tensor_is_contiguous(A)) {
-        const float* data = F32(A);
+        const float* data = (const float*)__builtin_assume_aligned(F32(A), 64);
         size_t n = A->total_size;
         float min_val = INFINITY;
         size_t i = 0;
-#ifdef __AVX2__
+#ifdef __AVX512F__
+        if (n >= 16) {
+            __m512 vmin = _mm512_set1_ps(INFINITY);
+            size_t limit = n & ~15UL;
+            for (; i < limit; i += 16) {
+                __builtin_prefetch(data + i + 128, 0, 1);
+                vmin = _mm512_min_ps(vmin, _mm512_loadu_ps(data + i));
+            }
+            min_val = _mm512_reduce_min_ps(vmin);
+        }
+#elif defined(__AVX2__)
         if (n >= 8) {
             __m256 vmin = _mm256_set1_ps(INFINITY);
             size_t limit = n & ~7UL;
@@ -1264,11 +1308,21 @@ float tensor_min(Tensor* A) {
 float tensor_max(Tensor* A) {
     if (A->dtype != DTYPE_FLOAT32) return 0.0f;
     if (tensor_is_contiguous(A)) {
-        const float* data = F32(A);
+        const float* data = (const float*)__builtin_assume_aligned(F32(A), 64);
         size_t n = A->total_size;
         float max_val = -INFINITY;
         size_t i = 0;
-#ifdef __AVX2__
+#ifdef __AVX512F__
+        if (n >= 16) {
+            __m512 vmax = _mm512_set1_ps(-INFINITY);
+            size_t limit = n & ~15UL;
+            for (; i < limit; i += 16) {
+                __builtin_prefetch(data + i + 128, 0, 1);
+                vmax = _mm512_max_ps(vmax, _mm512_loadu_ps(data + i));
+            }
+            max_val = _mm512_reduce_max_ps(vmax);
+        }
+#elif defined(__AVX2__)
         if (n >= 8) {
             __m256 vmax = _mm256_set1_ps(-INFINITY);
             size_t limit = n & ~7UL;
@@ -1299,9 +1353,7 @@ float tensor_max(Tensor* A) {
 int tensor_argmin(Tensor* A) {
     if (A->dtype != DTYPE_FLOAT32) return 0;
     if (tensor_is_contiguous(A)) {
-        /* Pass 1: find minimum value using AVX2 (already vectorised in tensor_min) */
         float min_val = tensor_min(A);
-        /* Pass 2: find first index — scalar scan, early-exit on first match */
         const float* data = F32(A);
         size_t n = A->total_size;
         for (size_t i = 0; i < n; i++) {
@@ -1326,9 +1378,7 @@ int tensor_argmin(Tensor* A) {
 int tensor_argmax(Tensor* A) {
     if (A->dtype != DTYPE_FLOAT32) return 0;
     if (tensor_is_contiguous(A)) {
-        /* Pass 1: find maximum value using AVX2 (already vectorised in tensor_max) */
         float max_val = tensor_max(A);
-        /* Pass 2: find first index — scalar scan, early-exit on first match */
         const float* data = F32(A);
         size_t n = A->total_size;
         for (size_t i = 0; i < n; i++) {
@@ -1350,7 +1400,6 @@ int tensor_argmax(Tensor* A) {
     return best_idx;
 }
 
-// Welford's online algorithm for precision and safety without 2x memory read
 float tensor_variance(Tensor* A) {
     if (A->dtype != DTYPE_FLOAT32) return 0.0f;
     double mean = 0.0, M2 = 0.0;
@@ -1463,7 +1512,6 @@ Tensor* tensor_concat(Tensor** tensors, int num_tensors, int axis) {
     Tensor* out = tensor_create_dtype(ndim, out_shape, dtype);
     size_t el_size = dtype_size(dtype);
     
-    // Fast path: axis=0 concatenation of contiguous tensors
     bool all_contiguous = true;
     for (int i = 0; i < num_tensors; i++) {
         if (!tensor_is_contiguous(tensors[i])) { all_contiguous = false; break; }
@@ -1604,7 +1652,30 @@ static inline float _hsum256(__m256 v) {
 
 static inline float micro_sdot(int n, const float* x, int incx, const float* y, int incy) {
     if (n <= 0) return 0.0f;
-#ifdef __AVX2__
+#ifdef __AVX512F__
+    if (incx == 1 && incy == 1) {
+        __m512 vsum0 = _mm512_setzero_ps();
+        __m512 vsum1 = _mm512_setzero_ps();
+        int i = 0;
+        for (; i + 31 < n; i += 32) {
+            __m512 vx0 = _mm512_loadu_ps(x + i);
+            __m512 vy0 = _mm512_loadu_ps(y + i);
+            __m512 vx1 = _mm512_loadu_ps(x + i + 16);
+            __m512 vy1 = _mm512_loadu_ps(y + i + 16);
+            vsum0 = _mm512_fmadd_ps(vx0, vy0, vsum0);
+            vsum1 = _mm512_fmadd_ps(vx1, vy1, vsum1);
+        }
+        vsum0 = _mm512_add_ps(vsum0, vsum1);
+        for (; i + 15 < n; i += 16) {
+            __m512 vx = _mm512_loadu_ps(x + i);
+            __m512 vy = _mm512_loadu_ps(y + i);
+            vsum0 = _mm512_fmadd_ps(vx, vy, vsum0);
+        }
+        float sum = _mm512_reduce_add_ps(vsum0);
+        for (; i < n; i++) sum += x[i] * y[i];
+        return sum;
+    }
+#elif defined(__AVX2__)
     if (incx == 1 && incy == 1) {
         float sum = 0.0f;
         __m256 vsum0 = _mm256_setzero_ps();
@@ -1958,12 +2029,6 @@ Tensor* tensor_matmul(Tensor* A, Tensor* B) {
 
 /*
  * tensor_bmm — batched matrix multiply: A[batch,m,k] × B[batch,k,n] → [batch,m,n]
- *
- * Optimization: for contiguous inputs we bypass all per-batch view/reshape/slice
- * allocations and call cblas_sgemm directly with pointer arithmetic.  5 heap
- * objects per batch iteration → 0.  For batch > 1 and large slices the batch
- * loop is parallelised with OpenMP; BLAS is kept single-threaded in that case
- * to avoid oversubscription.
  */
 extern void openblas_set_num_threads(int) __attribute__((weak));
 
@@ -1980,10 +2045,8 @@ Tensor* tensor_bmm(Tensor* A, Tensor* B) {
     int k     = A->shape[2];
     int n     = B->shape[2];
 
-    /* Each slice is fully overwritten by sgemm with beta=0 — skip zero-fill. */
     Tensor* out = tensor_create_uninitialized(3, (int[]){batch, m, n}, DTYPE_FLOAT32);
 
-    /* Compact non-contiguous inputs once (O(N) copy), then use direct offsets. */
     Tensor* a_work = tensor_is_contiguous(A) ? A : tensor_copy(A);
     Tensor* b_work = tensor_is_contiguous(B) ? B : tensor_copy(B);
 
@@ -2017,18 +2080,6 @@ Tensor* tensor_bmm(Tensor* A, Tensor* B) {
     return out;
 }
 
-/*
- * tensor_matmul_ex — 2-D GEMM with explicit transA / transB flags.
- *
- * Semantics: out = op(A) @ op(B)
- *   op(X) = X^T when trans=true, X otherwise.
- *
- * lda / ldb are always the STORED column counts of A and B respectively
- * (row-major BLAS convention: leading dimension = stored columns, regardless
- * of the transpose flag).
- *
- * Returns a freshly-allocated [m, n] FLOAT32 tensor.
- */
 Tensor* tensor_matmul_ex(Tensor* A, Tensor* B, bool transA, bool transB) {
     if (A->dtype != DTYPE_FLOAT32 || B->dtype != DTYPE_FLOAT32)
         TENSOR_ERROR("FATAL [MatmulEx]: Requires FLOAT32.");
@@ -2043,7 +2094,6 @@ Tensor* tensor_matmul_ex(Tensor* A, Tensor* B, bool transA, bool transB) {
     if (k != k2)
         TENSOR_ERROR("FATAL [MatmulEx]: Inner dims mismatch (%d vs %d).", k, k2);
 
-    /* lda/ldb = stored column count — constant regardless of transpose flag */
     int lda = A->shape[1];
     int ldb = B->shape[1];
 
@@ -2070,13 +2120,6 @@ Tensor* tensor_matmul_ex(Tensor* A, Tensor* B, bool transA, bool transB) {
     return out;
 }
 
-/*
- * tensor_matmul_into — zero-allocation GEMM: out = op(A) @ op(B)
- *
- * `out` must be a pre-allocated contiguous [m, n] FLOAT32 tensor.
- * beta=0.0 — the output is fully overwritten; no prior zeroing needed.
- * This is the core primitive for reusable gradient buffers in training loops.
- */
 void tensor_matmul_into(Tensor* out, Tensor* A, Tensor* B, bool transA, bool transB) {
     if (!out || !A || !B)
         TENSOR_ERROR_VOID("FATAL [MatmulInto]: NULL pointer.");
@@ -2116,16 +2159,6 @@ void tensor_matmul_into(Tensor* out, Tensor* A, Tensor* B, bool transA, bool tra
     if (b_work != B) tensor_free(b_work);
 }
 
-/*
- * tensor_sum_axis_into — zero-allocation axis-reduction: out[...] = sum(A, axis)
- *
- * `out` must be a pre-allocated tensor with the correct reduced shape.
- * The buffer is zeroed and then accumulated into — no separate zero-fill step.
- *
- * Fast path: 2-D contiguous matrix, axis=0 → column sums via cblas_sgemv.
- *   out[j] = Σ_i A[i,j]  implemented as  out = A^T * ones_batch
- *   One BLAS call replaces an O(batch × n) scalar loop.
- */
 void tensor_sum_axis_into(Tensor* out, Tensor* A, int axis) {
     if (!out || !A)
         TENSOR_ERROR_VOID("FATAL [SumAxisInto]: NULL pointer.");
@@ -2148,7 +2181,6 @@ void tensor_sum_axis_into(Tensor* out, Tensor* A, int axis) {
         if (!ones) TENSOR_ERROR_VOID("FATAL [SumAxisInto]: malloc failed.");
         for (int i = 0; i < rows; i++) ones[i] = 1.0f;
 
-        /* out[j] = A^T * ones  →  column sums */
         cblas_sgemv(CblasRowMajor, CblasTrans,
                     rows, cols, 1.0f,
                     F32(A), cols, ones, 1,
@@ -2295,7 +2327,6 @@ static int cmp_float_asc(const void* a, const void* b) {
 
 Tensor* tensor_unique(Tensor* A) {
     if(A->dtype != DTYPE_FLOAT32) TENSOR_ERROR("Requires FLOAT32.");
-    // Fix: Never sort a view of the original data.
     Tensor* temp = tensor_copy(A); 
     temp->ndim = 1;
     temp->shape[0] = (int)temp->total_size;
@@ -2326,8 +2357,6 @@ Tensor* tensor_unique(Tensor* A) {
 Tensor* tensor_bincount(Tensor* A) {
     if(A->dtype != DTYPE_FLOAT32) TENSOR_ERROR("Requires FLOAT32.");
 
-    // First pass: validate all values and find the max.
-    // This catches mixed negative/positive arrays that tensor_max would miss.
     float max_f = -INFINITY;
     if (tensor_is_contiguous(A)) {
         for (size_t i = 0; i < A->total_size; i++) {
@@ -2357,7 +2386,6 @@ Tensor* tensor_bincount(Tensor* A) {
     int size = max_val + 1;
     Tensor* out = tensor_zeros(1, &size);
 
-    // Second pass: accumulate counts (all values validated above).
     if (tensor_is_contiguous(A)) {
         for (size_t i = 0; i < A->total_size; i++)
             F32(out)[(int)roundf(F32(A)[i])] += 1.0f;
@@ -2564,7 +2592,6 @@ bool tensor_any(Tensor* A) {
         size_t n = A->total_size;
         size_t i = 0;
 #ifdef __AVX2__
-        /* Check 8 lanes at once; movemask != 0 means at least one non-zero */
         __m256 veps  = _mm256_set1_ps(1e-8f);
         __m256 vsign = _mm256_set1_ps(-0.0f);
         size_t limit = n & ~7UL;
@@ -2597,7 +2624,6 @@ bool tensor_all(Tensor* A) {
         size_t n = A->total_size;
         size_t i = 0;
 #ifdef __AVX2__
-        /* If any lane is ≤ eps (abs), movemask will be non-zero → return false */
         __m256 veps  = _mm256_set1_ps(1e-8f);
         __m256 vsign = _mm256_set1_ps(-0.0f);
         size_t limit = n & ~7UL;
@@ -2669,7 +2695,6 @@ Tensor* tensor_isnan(Tensor* A) {
         size_t limit = n & ~7UL;
         for (; i < limit; i += 8) {
             __m256 v = _mm256_loadu_ps(a + i);
-            /* NaN != NaN: unordered compare gives all-ones mask for NaN lanes */
             __m256 cmp = _mm256_cmp_ps(v, v, _CMP_UNORD_Q);
             _mm256_storeu_ps(o + i, _mm256_and_ps(cmp, vone));
         }
@@ -2697,14 +2722,13 @@ Tensor* tensor_isinf(Tensor* A) {
         float* a = F32(A); float* o = F32(out);
         size_t i = 0;
 #ifdef __AVX2__
-        /* |a| == INF: abs(a) == +∞. Use _mm256_andnot_ps to clear sign bit. */
         __m256 vinf  = _mm256_set1_ps(INFINITY);
-        __m256 vsign = _mm256_set1_ps(-0.0f);   /* sign-bit mask */
+        __m256 vsign = _mm256_set1_ps(-0.0f);
         __m256 vone  = _mm256_set1_ps(1.0f);
         size_t limit = n & ~7UL;
         for (; i < limit; i += 8) {
             __m256 v    = _mm256_loadu_ps(a + i);
-            __m256 vabs = _mm256_andnot_ps(vsign, v);  /* abs(v) */
+            __m256 vabs = _mm256_andnot_ps(vsign, v);
             __m256 cmp  = _mm256_cmp_ps(vabs, vinf, _CMP_EQ_OQ);
             _mm256_storeu_ps(o + i, _mm256_and_ps(cmp, vone));
         }
@@ -2741,13 +2765,10 @@ void tensor_nan_to_num_inplace(Tensor* A, float nan_val, float posinf_val, float
         for (; i < limit; i += 8) {
             __m256 v    = _mm256_loadu_ps(data + i);
             __m256 vabs = _mm256_andnot_ps(vsign, v);
-            /* NaN mask: v != v */
             __m256 nan_mask  = _mm256_cmp_ps(v, v, _CMP_UNORD_Q);
-            /* Inf masks: |v| == INF, split by sign */
             __m256 inf_mask  = _mm256_cmp_ps(vabs, vinf, _CMP_EQ_OQ);
             __m256 pos_mask  = _mm256_and_ps(inf_mask, _mm256_cmp_ps(v, vzero, _CMP_GT_OQ));
             __m256 neg_mask  = _mm256_andnot_ps(pos_mask, inf_mask);
-            /* Apply replacements: NaN → nan_val, +Inf → posinf_val, -Inf → neginf_val */
             __m256 result = _mm256_blendv_ps(v,       vneginf, neg_mask);
             result        = _mm256_blendv_ps(result,  vposinf, pos_mask);
             result        = _mm256_blendv_ps(result,  vnan,    nan_mask);
@@ -2831,18 +2852,6 @@ Tensor* tensor_topk(Tensor* A, int k, int axis) {
 // DEEP LEARNING (CNN Primitives)
 // ============================================================================
 
-/*
- * tensor_im2col — optimised implementation.
- *
- * Loop-order change (b,oh,ow outer; c,kh,kw inner):
- *   • Writes to out_row[col_idx] are now sequential → cache-friendly stores.
- *   • Padding zeros are never written; the tensor is initialised with zeros
- *     and only valid positions are overwritten (branch-free in the common case
- *     after the pad guard is hoisted out of the hot loop).
- *
- * OpenMP: parallelise over batch dimension — each b writes to disjoint rows of
- * the output matrix, so there are no race conditions.
- */
 Tensor* tensor_im2col(Tensor* A, int kernel_h, int kernel_w,
                       int stride_h, int stride_w, int pad_h, int pad_w) {
     if (A->ndim != 4 || A->dtype != DTYPE_FLOAT32) TENSOR_ERROR("Requires 4D FLOAT32.");
@@ -2856,14 +2865,11 @@ Tensor* tensor_im2col(Tensor* A, int kernel_h, int kernel_w,
     int cols     = channels * kernel_h * kernel_w;
     int rows     = batch * out_h * out_w;
 
-    /* Padding regions stay 0 from calloc inside tensor_create */
     Tensor* out = tensor_create(2, (int[]){rows, cols});
 
-    /* Pre-compute per-channel base strides to avoid repeated multiplication */
     size_t as0 = A->stride[0];
     size_t as1 = A->stride[1];
     size_t as2 = A->stride[2];
-    /* stride[3] == 1 for contiguous 4D (verified by callers), so we skip it */
 
     #pragma omp parallel for schedule(static) if(rows > 4096)
     for (int b = 0; b < batch; b++) {
@@ -2874,7 +2880,6 @@ Tensor* tensor_im2col(Tensor* A, int kernel_h, int kernel_w,
                 int   row_idx = base_row + oh * out_w + ow;
                 float* out_row = F32(out) + (size_t)row_idx * cols;
 
-                /* Prefetch the next output row while filling this one */
                 if (ow + 1 < out_w)
                     __builtin_prefetch(out_row + cols, 1, 1);
 
@@ -2890,7 +2895,6 @@ Tensor* tensor_im2col(Tensor* A, int kernel_h, int kernel_w,
                                 out_row[col_idx] =
                                     F32(A)[base_a + (size_t)im_h * as2 + im_w];
                             }
-                            /* else: already 0 from tensor_create */
                         }
                     }
                 }
@@ -2900,18 +2904,6 @@ Tensor* tensor_im2col(Tensor* A, int kernel_h, int kernel_w,
     return out;
 }
 
-/*
- * tensor_col2im — cache-friendly rewrite.
- *
- * Old order: (c, kh, kw) outer → (b, oh, ow) inner
- *   reads  cols_tensor with stride `cols` (scattered)
- *   writes out with contiguous inner loops but non-sequential outer pattern
- *
- * New order: (b, oh, ow) outer → (c, kh, kw) inner
- *   reads  cols_tensor row-major (sequential — one cache line per output pixel)
- *   writes out at scattered positions, but inner (c, kh, kw) loop is the same
- *   access pattern as im2col, so hardware prefetcher has a chance.
- */
 Tensor* tensor_col2im(Tensor* cols_tensor, int batch, int channels, int height, int width,
                       int kernel_h, int kernel_w, int stride_h, int stride_w, int pad_h, int pad_w) {
     Tensor* out = tensor_zeros(4, (int[]){batch, channels, height, width});
@@ -2919,16 +2911,13 @@ Tensor* tensor_col2im(Tensor* cols_tensor, int batch, int channels, int height, 
     int out_w = (width  + 2 * pad_w - kernel_w) / stride_w + 1;
     int cols  = channels * kernel_h * kernel_w;
 
-    /* Pre-compute output tensor strides (always contiguous after tensor_zeros) */
-    size_t os0 = out->stride[0]; /* batch  */
-    size_t os1 = out->stride[1]; /* channel */
-    size_t os2 = out->stride[2]; /* height  */
-    /* stride[3] == 1 */
+    size_t os0 = out->stride[0];
+    size_t os1 = out->stride[1];
+    size_t os2 = out->stride[2];
 
     for (int b = 0; b < batch; b++) {
         for (int oh = 0; oh < out_h; oh++) {
             for (int ow = 0; ow < out_w; ow++) {
-                /* Pointer to this pixel's full column vector — sequential read */
                 int row_idx = b * (out_h * out_w) + oh * out_w + ow;
                 const float* col_row = F32(cols_tensor) + (size_t)row_idx * cols;
 
@@ -2963,7 +2952,6 @@ Tensor* tensor_conv2d(Tensor* X, Tensor* W, Tensor* bias, int stride_h, int stri
     Tensor* X_col = tensor_im2col(X, kh, kw, stride_h, stride_w, pad_h, pad_w);
     int M = batch * out_h * out_w; int K = in_c * kh * kw; int N = out_c;
 
-    // beta=0.0 — BLAS writes all of Y_col; zero-fill is redundant.
     Tensor* Y_col = tensor_create_uninitialized(2, (int[]){M, N}, DTYPE_FLOAT32);
     Tensor* W_contig = tensor_is_contiguous(W) ? W : tensor_copy(W);
 
@@ -3004,7 +2992,6 @@ Tensor** tensor_conv2d_backward(Tensor* dY, Tensor* X, Tensor* W, int stride_h, 
     Tensor* dY_col = tensor_reshape(dY_contig, 2, (int[]){M, N});
     Tensor* X_col = tensor_im2col(X, kh, kw, stride_h, stride_w, pad_h, pad_w);
 
-    // beta=0 — BLAS overwrites entirely; uninitialized is safe and saves a memset pass.
     Tensor* dW_col = tensor_create_uninitialized(2, (int[]){N, K}, DTYPE_FLOAT32);
     cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
                 N, K, M, 1.0f,
@@ -3057,8 +3044,6 @@ Tensor* tensor_embedding_lookup(Tensor* tokens, Tensor* weights) {
     float* w_data = F32(weights);
     float* out_data = F32(out);
     int error_flag = 0;
-    // stride[1]==1 means rows are stored as consecutive floats (contiguous row layout).
-    // If stride[1]!=1 (transposed or column-major slice) we must step element-by-element.
     bool w_row_contiguous = (weights->stride[1] == 1);
 
     #pragma omp parallel for shared(error_flag)
@@ -3143,7 +3128,6 @@ void tensor_fused_adam_step(Tensor* param, Tensor* grad, Tensor* m, Tensor* v, f
         float g = F32(grad)[i];
         F32(m)[i] = b1 * F32(m)[i] + (1.0f - b1) * g;
         F32(v)[i] = b2 * F32(v)[i] + (1.0f - b2) * g * g;
-        // fmaxf: under -ffast-math, EMA of g² can drift to tiny negatives via FP reassociation.
         float v_hat_sqrt = sqrtf(fmaxf(0.0f, F32(v)[i] / bias_correction2)) + eps;
         F32(param)[i] -= step_size * (F32(m)[i] / v_hat_sqrt);
     }
@@ -3254,18 +3238,6 @@ int tensor_save_safetensors(const char* filepath, const char* json_header, uint6
 // 16. FUSED NEURAL NETWORK KERNELS (New — Zero-copy, FMA-accelerated)
 // ============================================================================
 
-/*
- * tensor_linear — fused fully-connected layer: out = X @ W^T + bias
- *
- *   X    : [m, k]   (or any shape with last-dim k; treated as [m, k])
- *   W    : [n, k]   (weight matrix, transposed convention: rows = output neurons)
- *   bias : [n]      (optional; NULL skips the add)
- *   out  : [m, n]
- *
- * Fusion benefit: single SGEMM call + one AVX2 pass for bias — no temporary
- * tensor allocation between GEMM and add.  Compared to matmul()+add() this
- * saves one full output-buffer allocation and one extra memory pass.
- */
 Tensor* tensor_linear(Tensor* X, Tensor* W, Tensor* bias) {
     if (X->dtype != DTYPE_FLOAT32 || W->dtype != DTYPE_FLOAT32)
         TENSOR_ERROR("FATAL [Linear]: Requires FLOAT32.");
@@ -3276,17 +3248,14 @@ Tensor* tensor_linear(Tensor* X, Tensor* W, Tensor* bias) {
     int m = (int)(X->total_size / k);
     int n = W->shape[0];
 
-    /* Compact if needed — single O(N) copy, then pure pointer arithmetic */
     Tensor* x_work = tensor_is_contiguous(X) ? X : tensor_copy(X);
     Tensor* w_work = tensor_is_contiguous(W) ? W : tensor_copy(W);
 
-    /* Build output shape: same as X but with last dim replaced by n */
     int out_shape[8];
     for (int i = 0; i < X->ndim - 1; i++) out_shape[i] = X->shape[i];
     out_shape[X->ndim - 1] = n;
     Tensor* out = tensor_create_uninitialized(X->ndim, out_shape, DTYPE_FLOAT32);
 
-    /* SGEMM: out = X * W^T  (W stored as [n,k], so Trans gives [k,n]) */
     if (m <= 128 && n <= 128 && k <= 128) {
         micro_sgemm_transB(m, n, k, F32(x_work), k, F32(w_work), k, F32(out), n);
     } else {
@@ -3297,7 +3266,6 @@ Tensor* tensor_linear(Tensor* X, Tensor* W, Tensor* bias) {
                     0.0f, F32(out), n);
     }
 
-    /* Fused bias addition: single AVX2 pass over the output matrix */
     if (bias != NULL) {
         if (bias->dtype != DTYPE_FLOAT32)
             TENSOR_ERROR("FATAL [Linear]: bias must be FLOAT32.");
@@ -3327,12 +3295,6 @@ Tensor* tensor_linear(Tensor* X, Tensor* W, Tensor* bias) {
     return out;
 }
 
-/*
- * tensor_add_relu — fused elementwise: out = relu(A + B)
- *
- * Saves one full output-buffer allocation + one extra memory pass vs add()+relu().
- * Uses AVX2 _mm256_max_ps for the relu in the same loop as the add.
- */
 Tensor* tensor_add_relu(Tensor* A, Tensor* B) {
     if (A->dtype != DTYPE_FLOAT32 || B->dtype != DTYPE_FLOAT32)
         TENSOR_ERROR("FATAL [AddReLU]: Requires FLOAT32.");
@@ -3370,12 +3332,6 @@ Tensor* tensor_add_relu(Tensor* A, Tensor* B) {
     return out;
 }
 
-/*
- * tensor_mul_add — fused FMA: out = A * B + C
- *
- * Uses _mm256_fmadd_ps (single FMA instruction, -mfma flag already set).
- * Saves one full pass over memory vs mul()+add().
- */
 Tensor* tensor_mul_add(Tensor* A, Tensor* B, Tensor* C) {
     if (A->dtype != DTYPE_FLOAT32 || B->dtype != DTYPE_FLOAT32 || C->dtype != DTYPE_FLOAT32)
         TENSOR_ERROR("FATAL [MulAdd]: Requires FLOAT32.");
@@ -3400,7 +3356,6 @@ Tensor* tensor_mul_add(Tensor* A, Tensor* B, Tensor* C) {
     for (size_t j = 0; j < limit; j += 8) {
         __builtin_prefetch(a + j + 64, 0, 1);
         __builtin_prefetch(b + j + 64, 0, 1);
-        /* fmadd: a*b + c in one FP instruction */
         _mm256_storeu_ps(o + j,
             _mm256_fmadd_ps(_mm256_loadu_ps(a + j),
                             _mm256_loadu_ps(b + j),
@@ -3420,21 +3375,9 @@ Tensor* tensor_mul_add(Tensor* A, Tensor* B, Tensor* C) {
 // 17. THREADING CONTROL
 // ============================================================================
 
-/* Weak-symbol declarations so the code links against any BLAS flavour
-   (OpenBLAS, ATLAS, MKL via openblas compat shim) without hard-dep failures. */
 extern void openblas_set_num_threads(int) __attribute__((weak));
-extern void goto_set_num_threads(int)     __attribute__((weak));   /* older name */
+extern void goto_set_num_threads(int)     __attribute__((weak));
 
-/*
- * tensor_configure_threading — set OpenMP thread count and BLAS thread count
- * independently.  Call once at startup to prevent OpenBLAS × OpenMP
- * oversubscription (common cause of 2× slowdown on multi-core systems).
- *
- * Recommended:
- *   omp_threads  = physical core count
- *   blas_threads = 1  (when outer OpenMP loops are used)
- *   blas_threads = physical core count  (when only BLAS, no outer OpenMP)
- */
 void tensor_configure_threading(int omp_threads, int blas_threads) {
     if (omp_threads  > 0) omp_set_num_threads(omp_threads);
     if (blas_threads > 0) {
@@ -3447,20 +3390,12 @@ void tensor_configure_threading(int omp_threads, int blas_threads) {
 // 18. TRANSFORMER INFERENCE PRIMITIVES
 // ============================================================================
 
-/* ---------------------------------------------------------------------------
- * fast_expf — scalar Cephes polynomial exp, ~4× faster than libm expf.
- * Accurate to <1 ULP for x in [-87.3, 88.4].  Called with x <= 0 in all
- * attention/softmax paths so the upper clamp is a no-op hint for the compiler.
- * --------------------------------------------------------------------------- */
+/* fast_expf and fast_logf (Cephes based) */
 static inline float fast_expf(float x) {
     if (__builtin_expect(x < -88.3762626647949f, 0)) return 0.0f;
-
-    /* range reduction: x = g + n*ln2 */
     float fx = floorf(x * 1.44269504088896341f + 0.5f);
     x -= fx * 0.693359375f;
     x -= fx * (-2.12194440e-4f);
-
-    /* degree-7 polynomial for exp(g) */
     float z = x * x;
     float y = 1.9875691500e-4f;
     y = y * x + 1.3981999507e-3f;
@@ -3469,29 +3404,39 @@ static inline float fast_expf(float x) {
     y = y * x + 1.6666665459e-1f;
     y = y * x + 5.0000001201e-1f;
     y = y * z + x + 1.0f;
-
-    /* scale by 2^n via IEEE bit manipulation */
     int fi = (int)fx;
     int bits = (fi + 127) << 23;
     float pw2; memcpy(&pw2, &bits, sizeof pw2);
     return y * pw2;
 }
 
-/* ---------------------------------------------------------------------------
- * avx2_expf — 8-wide AVX2 vectorized exp(x), same Cephes polynomial.
- * Throughput: 8 floats per ~20 cycles vs ~80 cycles for 8× scalar expf.
- * --------------------------------------------------------------------------- */
+static inline float fast_logf(float x) {
+    if (__builtin_expect(x <= 0.0f, 0)) return -INFINITY;
+    int e;
+    float m = frexpf(x, &e);
+    float m1 = m - 1.0f;
+    float z = m1 / (m + 1.0f);
+    float z2 = z * z;
+    float y = 0.66666662693e-1f;
+    y = y * z2 + 0.3999999940e-1f;
+    y = y * z2 + 0.2857142874e-1f;
+    y = y * z2 + 0.2222219846e-1f;
+    y = y * z2 + 0.1818357216e-1f;
+    y = y * z2 + 0.1531383766e-1f;
+    y = y * z2 + 0.1479819861e-1f;
+    y = y * z2 + 0.2222219846e-1f;
+    return 2.0f * z * (1.0f + y) + (float)e * 0.6931471805599453f;
+}
+
 #ifdef __AVX2__
 static inline __m256 avx2_expf(__m256 x) {
     x = _mm256_max_ps(x, _mm256_set1_ps(-88.3762626647949f));
     x = _mm256_min_ps(x, _mm256_set1_ps( 88.3762626647949f));
-
     __m256 fx = _mm256_floor_ps(
         _mm256_fmadd_ps(x, _mm256_set1_ps(1.44269504088896341f),
                            _mm256_set1_ps(0.5f)));
     x = _mm256_fnmadd_ps(fx, _mm256_set1_ps( 0.693359375f),    x);
     x = _mm256_fnmadd_ps(fx, _mm256_set1_ps(-2.12194440e-4f),  x);
-
     __m256 z = _mm256_mul_ps(x, x);
     __m256 y = _mm256_set1_ps(1.9875691500e-4f);
     y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(1.3981999507e-3f));
@@ -3500,20 +3445,26 @@ static inline __m256 avx2_expf(__m256 x) {
     y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(1.6666665459e-1f));
     y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(5.0000001201e-1f));
     y = _mm256_fmadd_ps(y, z, _mm256_add_ps(x, _mm256_set1_ps(1.0f)));
-
     __m256i n = _mm256_add_epi32(_mm256_cvttps_epi32(fx), _mm256_set1_epi32(127));
     return _mm256_mul_ps(y, _mm256_castsi256_ps(_mm256_slli_epi32(n, 23)));
 }
 #endif
 
-/* ---------------------------------------------------------------------------
- * dot_f32 — 4-accumulator AVX2 FMA dot product; scalar fallback.
- * --------------------------------------------------------------------------- */
 static inline float dot_f32(const float* __restrict a,
                             const float* __restrict b, int n) {
     int i = 0;
     float sum = 0.0f;
-#ifdef __AVX2__
+#ifdef __AVX512F__
+    __m512 s0 = _mm512_setzero_ps(), s1 = _mm512_setzero_ps();
+    for (; i <= n - 32; i += 32) {
+        s0 = _mm512_fmadd_ps(_mm512_loadu_ps(a+i),    _mm512_loadu_ps(b+i),    s0);
+        s1 = _mm512_fmadd_ps(_mm512_loadu_ps(a+i+16), _mm512_loadu_ps(b+i+16), s1);
+    }
+    s0 = _mm512_add_ps(s0, s1);
+    for (; i <= n - 16; i += 16)
+        s0 = _mm512_fmadd_ps(_mm512_loadu_ps(a+i), _mm512_loadu_ps(b+i), s0);
+    sum = _mm512_reduce_add_ps(s0);
+#elif defined(__AVX2__)
     __m256 s0 = _mm256_setzero_ps(), s1 = s0, s2 = s0, s3 = s0;
     for (; i <= n - 32; i += 32) {
         s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a+i),    _mm256_loadu_ps(b+i),    s0);
@@ -3537,20 +3488,26 @@ static inline float dot_f32(const float* __restrict a,
     return sum;
 }
 
-/* ---------------------------------------------------------------------------
- * softmax_rows — shared row-wise stable softmax on a raw float buffer.
- * Single exp pass: max-reduce → AVX2 vectorized exp+sum fused → normalize.
- * No Tensor wrapper; called from tensor_softmax_inplace and tensor_attention.
- * --------------------------------------------------------------------------- */
 static void softmax_rows(float* __restrict data, int rows, int cols) {
-#pragma omp parallel for schedule(static) if(rows > 64)
+#pragma omp parallel for schedule(static, 16) if(rows > 64)
     for (int r = 0; r < rows; r++) {
         float* __restrict row = data + (size_t)r * cols;
 
-        /* 1. max-reduce — 4-wide AVX2 unroll */
         float vmax = -FLT_MAX;
         int j = 0;
-#ifdef __AVX2__
+#ifdef __AVX512F__
+        {
+            __m512 mx0 = _mm512_set1_ps(-FLT_MAX), mx1 = mx0;
+            for (; j <= cols - 32; j += 32) {
+                mx0 = _mm512_max_ps(mx0, _mm512_loadu_ps(row + j));
+                mx1 = _mm512_max_ps(mx1, _mm512_loadu_ps(row + j + 16));
+            }
+            mx0 = _mm512_max_ps(mx0, mx1);
+            for (; j <= cols - 16; j += 16)
+                mx0 = _mm512_max_ps(mx0, _mm512_loadu_ps(row + j));
+            vmax = _mm512_reduce_max_ps(mx0);
+        }
+#elif defined(__AVX2__)
         {
             __m256 mx0 = _mm256_set1_ps(-FLT_MAX);
             __m256 mx1 = mx0, mx2 = mx0, mx3 = mx0;
@@ -3573,10 +3530,29 @@ static void softmax_rows(float* __restrict data, int rows, int cols) {
 #endif
         for (; j < cols; j++) if (row[j] > vmax) vmax = row[j];
 
-        /* 2. exp(x-max) + sum — single pass, 4-wide AVX2 exp, scalar tail */
         float sum = 0.0f;
         j = 0;
-#ifdef __AVX2__
+#ifdef __AVX512F__
+        {
+            __m512 vs0 = _mm512_setzero_ps(), vs1 = vs0;
+            __m512 vm  = _mm512_set1_ps(vmax);
+            for (; j <= cols - 32; j += 32) {
+                __m512 e0 = avx2_expf ? avx2_expf : _mm512_exp_ps; // fallback
+                e0 = _mm512_sub_ps(_mm512_loadu_ps(row + j),      vm);
+                __m512 e1 = _mm512_sub_ps(_mm512_loadu_ps(row + j + 16), vm);
+                vs0 = _mm512_add_ps(vs0, e0); vs1 = _mm512_add_ps(vs1, e1);
+                _mm512_storeu_ps(row + j,      e0);
+                _mm512_storeu_ps(row + j + 16, e1);
+            }
+            vs0 = _mm512_add_ps(vs0, vs1);
+            for (; j <= cols - 16; j += 16) {
+                __m512 e = _mm512_sub_ps(_mm512_loadu_ps(row + j), vm);
+                _mm512_storeu_ps(row + j, e);
+                vs0 = _mm512_add_ps(vs0, e);
+            }
+            sum = _mm512_reduce_add_ps(vs0);
+        }
+#elif defined(__AVX2__)
         {
             __m256 vs0 = _mm256_setzero_ps(), vs1 = vs0, vs2 = vs0, vs3 = vs0;
             __m256 vm  = _mm256_set1_ps(vmax);
@@ -3608,10 +3584,19 @@ static void softmax_rows(float* __restrict data, int rows, int cols) {
 #endif
         for (; j < cols; j++) { float e = fast_expf(row[j] - vmax); row[j] = e; sum += e; }
 
-        /* 3. normalize — 4-wide AVX2 unroll */
         float inv_sum = 1.0f / sum;
         j = 0;
-#ifdef __AVX2__
+#ifdef __AVX512F__
+        {
+            __m512 vi = _mm512_set1_ps(inv_sum);
+            for (; j <= cols - 32; j += 32) {
+                _mm512_storeu_ps(row + j,      _mm512_mul_ps(_mm512_loadu_ps(row + j),      vi));
+                _mm512_storeu_ps(row + j + 16, _mm512_mul_ps(_mm512_loadu_ps(row + j + 16), vi));
+            }
+            for (; j <= cols - 16; j += 16)
+                _mm512_storeu_ps(row + j, _mm512_mul_ps(_mm512_loadu_ps(row + j), vi));
+        }
+#elif defined(__AVX2__)
         {
             __m256 vi = _mm256_set1_ps(inv_sum);
             for (; j <= cols - 32; j += 32) {
@@ -3628,11 +3613,6 @@ static void softmax_rows(float* __restrict data, int rows, int cols) {
     }
 }
 
-/* ---------------------------------------------------------------------------
- * tensor_rmsnorm — in-place row-wise RMS Layer Normalization.
- * Fused: 4-acc AVX2 FMA sum-of-squares → scale → 4-wide AVX2 mul.
- * Two passes (minimum — RMS must precede scaling), both fully vectorized.
- * --------------------------------------------------------------------------- */
 void tensor_rmsnorm(Tensor* x, float eps) {
     if (!x || x->dtype != DTYPE_FLOAT32) {
         tensor_set_error("FATAL [RMSNorm]: Requires FLOAT32."); return;
@@ -3645,16 +3625,35 @@ void tensor_rmsnorm(Tensor* x, float eps) {
     int    cols  = x->shape[ndim - 1];
     size_t rows  = x->total_size / (size_t)cols;
     float  inv_n = 1.0f / (float)cols;
-    float* __restrict data = F32(x);
+    float* __restrict data = (float*)__builtin_assume_aligned(F32(x), 64);
 
 #pragma omp parallel for schedule(static) if(rows > 64)
     for (size_t r = 0; r < rows; r++) {
         float* __restrict row = data + r * (size_t)cols;
 
-        /* Pass 1: 4-acc sum-of-squares */
         float ss = 0.0f;
         int j = 0;
-#ifdef __AVX2__
+#ifdef __AVX512F__
+        {
+            __m512 a0 = _mm512_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+            for (; j <= cols - 64; j += 64) {
+                __m512 v0 = _mm512_loadu_ps(row + j);
+                __m512 v1 = _mm512_loadu_ps(row + j + 16);
+                __m512 v2 = _mm512_loadu_ps(row + j + 32);
+                __m512 v3 = _mm512_loadu_ps(row + j + 48);
+                a0 = _mm512_fmadd_ps(v0, v0, a0);
+                a1 = _mm512_fmadd_ps(v1, v1, a1);
+                a2 = _mm512_fmadd_ps(v2, v2, a2);
+                a3 = _mm512_fmadd_ps(v3, v3, a3);
+            }
+            a0 = _mm512_add_ps(_mm512_add_ps(a0, a1), _mm512_add_ps(a2, a3));
+            for (; j <= cols - 16; j += 16) {
+                __m512 v = _mm512_loadu_ps(row + j);
+                a0 = _mm512_fmadd_ps(v, v, a0);
+            }
+            ss = _mm512_reduce_add_ps(a0);
+        }
+#elif defined(__AVX2__)
         {
             __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
             for (; j <= cols - 32; j += 32) {
@@ -3684,9 +3683,20 @@ void tensor_rmsnorm(Tensor* x, float eps) {
 
         float scale = 1.0f / sqrtf(ss * inv_n + eps);
 
-        /* Pass 2: 4-wide multiply-scale */
         j = 0;
-#ifdef __AVX2__
+#ifdef __AVX512F__
+        {
+            __m512 vs = _mm512_set1_ps(scale);
+            for (; j <= cols - 64; j += 64) {
+                _mm512_storeu_ps(row + j,      _mm512_mul_ps(_mm512_loadu_ps(row + j),      vs));
+                _mm512_storeu_ps(row + j + 16, _mm512_mul_ps(_mm512_loadu_ps(row + j + 16), vs));
+                _mm512_storeu_ps(row + j + 32, _mm512_mul_ps(_mm512_loadu_ps(row + j + 32), vs));
+                _mm512_storeu_ps(row + j + 48, _mm512_mul_ps(_mm512_loadu_ps(row + j + 48), vs));
+            }
+            for (; j <= cols - 16; j += 16)
+                _mm512_storeu_ps(row + j, _mm512_mul_ps(_mm512_loadu_ps(row + j), vs));
+        }
+#elif defined(__AVX2__)
         {
             __m256 vs = _mm256_set1_ps(scale);
             for (; j <= cols - 32; j += 32) {
@@ -3703,13 +3713,7 @@ void tensor_rmsnorm(Tensor* x, float eps) {
     }
 }
 
-/* ---------------------------------------------------------------------------
- * RoPE frequency table — thread-local, keyed by (head_dim, base_freq).
- * powf() calls are amortized: only recomputed when either changes.
- * head_dim <= 256 covers every known production architecture.
- * --------------------------------------------------------------------------- */
 #define ROPE_MAX_HALF 128
-
 static __thread float rope_freqs[ROPE_MAX_HALF];
 static __thread int   rope_freq_hd   = -1;
 static __thread float rope_freq_base = -1.0f;
@@ -3723,12 +3727,6 @@ static inline void rope_ensure_freqs(int head_dim, float base_freq) {
     rope_freq_base = base_freq;
 }
 
-/* ---------------------------------------------------------------------------
- * tensor_apply_rope — in-place RoPE with configurable base frequency and scale.
- * No VLA; no powf per call; sin/cos computed once into fixed stack arrays.
- * base_freq: rotary embedding base (10000.0 for most models; 500000.0 for LLaMA-3)
- * scale:     position scaling factor (1.0 = standard; < 1.0 for extended context)
- * --------------------------------------------------------------------------- */
 void tensor_apply_rope(Tensor* q, Tensor* k, int head_dim, int pos,
                        float base_freq, float scale) {
     if (!q || !k || q->dtype != DTYPE_FLOAT32 || k->dtype != DTYPE_FLOAT32) {
@@ -3744,10 +3742,10 @@ void tensor_apply_rope(Tensor* q, Tensor* k, int head_dim, int pos,
         tensor_set_error("FATAL [RoPE]: base_freq must be > 0."); return;
     }
 
-    rope_ensure_freqs(head_dim, base_freq);   /* powf cached; only reruns on change */
+    rope_ensure_freqs(head_dim, base_freq);
 
     int half = head_dim / 2;
-    float cos_buf[ROPE_MAX_HALF];             /* fixed-size stack arrays — no VLA   */
+    float cos_buf[ROPE_MAX_HALF];
     float sin_buf[ROPE_MAX_HALF];
     float scaled_pos = (float)pos * scale;
     for (int i = 0; i < half; i++) {
@@ -3756,7 +3754,6 @@ void tensor_apply_rope(Tensor* q, Tensor* k, int head_dim, int pos,
         sin_buf[i] = sinf(angle);
     }
 
-    /* Apply to q */
     {
         size_t nrows = q->total_size / (size_t)head_dim;
         float* __restrict d = F32(q);
@@ -3771,7 +3768,6 @@ void tensor_apply_rope(Tensor* q, Tensor* k, int head_dim, int pos,
         }
     }
 
-    /* Apply to k */
     {
         size_t nrows = k->total_size / (size_t)head_dim;
         float* __restrict d = F32(k);
@@ -3787,9 +3783,6 @@ void tensor_apply_rope(Tensor* q, Tensor* k, int head_dim, int pos,
     }
 }
 
-/* ---------------------------------------------------------------------------
- * tensor_softmax_inplace — public API: thin delegate to softmax_rows.
- * --------------------------------------------------------------------------- */
 void tensor_softmax_inplace(Tensor* x) {
     if (!x || x->dtype != DTYPE_FLOAT32) {
         tensor_set_error("FATAL [SoftmaxInplace]: Requires FLOAT32."); return;
@@ -3802,27 +3795,6 @@ void tensor_softmax_inplace(Tensor* x) {
                          x->shape[ndim-1]);
 }
 
-/* ---------------------------------------------------------------------------
- * tensor_attention — streaming scaled dot-product attention (online softmax).
- *
- * Processes one query row at a time using the Milakov–Gimelshein online
- * softmax algorithm.  No O(seq²) scores buffer is ever allocated.
- *
- * For each query row q_i:
- *   running_max m, running_denom d, accumulator o (reuses out row)
- *   for j in [0, seq):
- *     s   = dot(q_i, k_j) * scale
- *     m'  = max(m, s)
- *     α   = exp(m  - m')        ← rescale factor in (0,1]
- *     β   = exp(s  - m')        ← new weight in (0,1]
- *     o   = o*α + β*v_j         ← AVX2 FMA
- *     d   = d*α + β
- *     m   = m'
- *   out_i = o / d
- *
- * Memory per thread: O(hd) working (in-register + out row).
- * OMP outer loop: query rows are independent → no false sharing (hd ≥ 16).
- * --------------------------------------------------------------------------- */
 void tensor_attention(Tensor* out, Tensor* q, Tensor* k, Tensor* v) {
     if (!out || !q || !k || !v) {
         tensor_set_error("FATAL [Attention]: NULL pointer."); return;
@@ -3849,10 +3821,10 @@ void tensor_attention(Tensor* out, Tensor* q, Tensor* k, Tensor* v) {
     }
     if (__builtin_expect(seq == 0, 0)) return;
 
-    const float* __restrict Q = F32(q);
-    const float* __restrict K = F32(k);
-    const float* __restrict V = F32(v);
-    float*       __restrict O = F32(out);
+    const float* __restrict Q = (const float*)__builtin_assume_aligned(F32(q), 64);
+    const float* __restrict K = (const float*)__builtin_assume_aligned(F32(k), 64);
+    const float* __restrict V = (const float*)__builtin_assume_aligned(F32(v), 64);
+    float*       __restrict O = (float*)__builtin_assume_aligned(F32(out), 64);
     float scale = 1.0f / sqrtf((float)hd);
 
 #pragma omp parallel for schedule(static)
@@ -3860,7 +3832,6 @@ void tensor_attention(Tensor* out, Tensor* q, Tensor* k, Tensor* v) {
         const float* __restrict q_row = Q + (size_t)qi * hd;
         float*       __restrict o_row = O + (size_t)qi * hd;
 
-        /* j=0: initialise without rescale (avoids exp(-inf) underflow) */
         float s0 = dot_f32(q_row, K, hd) * scale;
         float m = s0, denom = 1.0f;
         memcpy(o_row, V, (size_t)hd * sizeof(float));
@@ -3868,18 +3839,25 @@ void tensor_attention(Tensor* out, Tensor* q, Tensor* k, Tensor* v) {
         for (int j = 1; j < seq; j++) {
             const float* __restrict kj = K + (size_t)j * hd;
             const float* __restrict vj = V + (size_t)j * hd;
-            /* prefetch K and V two steps ahead — hides L2 latency for next iter */
             __builtin_prefetch(K + (size_t)(j + 2) * hd, 0, 1);
             __builtin_prefetch(V + (size_t)(j + 2) * hd, 0, 1);
 
             float s     = dot_f32(q_row, kj, hd) * scale;
             float m_new = s > m ? s : m;
-            float alpha = fast_expf(m     - m_new);  /* in (0,1] */
-            float beta  = fast_expf(s     - m_new);  /* in (0,1] */
+            float alpha = fast_expf(m     - m_new);
+            float beta  = fast_expf(s     - m_new);
 
-            /* o_row = o_row * alpha + beta * vj  (fused AVX2 FMA) */
             int d = 0;
-#ifdef __AVX2__
+#ifdef __AVX512F__
+            {
+                __m512 va = _mm512_set1_ps(alpha);
+                __m512 vb = _mm512_set1_ps(beta);
+                for (; d <= hd - 16; d += 16)
+                    _mm512_storeu_ps(o_row + d,
+                        _mm512_fmadd_ps(va, _mm512_loadu_ps(o_row + d),
+                                            _mm512_mul_ps(vb, _mm512_loadu_ps(vj + d))));
+            }
+#elif defined(__AVX2__)
             {
                 __m256 va = _mm256_set1_ps(alpha);
                 __m256 vb = _mm256_set1_ps(beta);
@@ -3895,10 +3873,16 @@ void tensor_attention(Tensor* out, Tensor* q, Tensor* k, Tensor* v) {
             m     = m_new;
         }
 
-        /* normalize */
         float inv_d = 1.0f / denom;
         int d = 0;
-#ifdef __AVX2__
+#ifdef __AVX512F__
+        {
+            __m512 vi = _mm512_set1_ps(inv_d);
+            for (; d <= hd - 16; d += 16)
+                _mm512_storeu_ps(o_row + d,
+                    _mm512_mul_ps(_mm512_loadu_ps(o_row + d), vi));
+        }
+#elif defined(__AVX2__)
         {
             __m256 vi = _mm256_set1_ps(inv_d);
             for (; d <= hd - 8; d += 8)
@@ -3914,15 +3898,6 @@ void tensor_attention(Tensor* out, Tensor* q, Tensor* k, Tensor* v) {
 // 19. KV CACHE — interleaved layout, zero-copy streaming attention
 // ============================================================================
 
-/*
- * Layout: kvc->data[i * 2*hd .. i*2*hd + hd - 1]  = K for token i
- *         kvc->data[i * 2*hd + hd .. i*2*hd+2*hd-1] = V for token i
- *
- * Interleaving K and V in one contiguous block means a single prefetch
- * covers both K and V for the same token → half the prefetch instructions
- * vs separate K/V arrays.  32-byte aligned for AVX2 loads.
- */
-
 KVCache* kvcache_create(int cap, int head_dim) {
     if (cap <= 0 || head_dim <= 0) {
         tensor_set_error("FATAL [kvcache_create]: cap and head_dim must be > 0.");
@@ -3930,7 +3905,7 @@ KVCache* kvcache_create(int cap, int head_dim) {
     }
     KVCache* c = (KVCache*)safe_malloc(sizeof(KVCache));
     if (!c) return NULL;
-    c->data = (float*)safe_memalign(32, (size_t)cap * 2 * head_dim * sizeof(float));
+    c->data = (float*)safe_memalign(64, (size_t)cap * 2 * head_dim * sizeof(float));
     if (!c->data) { free(c); return NULL; }
     c->len      = 0;
     c->cap      = cap;
@@ -3952,11 +3927,6 @@ int kvcache_len(const KVCache* c) {
     return c ? c->len : 0;
 }
 
-/*
- * kvcache_append — interleave one or more new K,V token rows into the cache.
- * k and v must be contiguous FLOAT32, shape [n_new, head_dim].
- * Advances cache->len by n_new.
- */
 void kvcache_append(KVCache* c, const Tensor* k, const Tensor* v) {
     if (!c || !k || !v) {
         tensor_set_error("FATAL [kvcache_append]: NULL pointer."); return;
@@ -3975,9 +3945,9 @@ void kvcache_append(KVCache* c, const Tensor* k, const Tensor* v) {
         tensor_set_error("FATAL [kvcache_append]: Cache capacity exceeded."); return;
     }
 
-    const float* __restrict ks  = F32(k);
-    const float* __restrict vs  = F32(v);
-    float*       __restrict dst = c->data + (size_t)c->len * 2 * hd;
+    const float* __restrict ks  = (const float*)__builtin_assume_aligned(F32(k), 64);
+    const float* __restrict vs  = (const float*)__builtin_assume_aligned(F32(v), 64);
+    float*       __restrict dst = (float*)__builtin_assume_aligned(c->data, 64) + (size_t)c->len * 2 * hd;
 
     for (int i = 0; i < n; i++) {
         memcpy(dst,      ks + (size_t)i * hd, (size_t)hd * sizeof(float));
@@ -3987,17 +3957,6 @@ void kvcache_append(KVCache* c, const Tensor* k, const Tensor* v) {
     c->len += n;
 }
 
-/*
- * tensor_attention_kv — streaming Milakov attention against a KV cache.
- *
- * q:   contiguous FLOAT32 [seq_q, head_dim]
- * kvc: KVCache with seq_kv tokens interleaved [seq_kv][2*head_dim]
- * out: pre-allocated contiguous FLOAT32 [seq_q, head_dim]
- *
- * Memory per thread: O(head_dim) — no scores buffer.
- * A single prefetch covers both K and V for the next token (one cache line
- * per 2*hd floats if hd <= 8; otherwise two prefetches spaced 32B apart).
- */
 void tensor_attention_kv(Tensor* out, Tensor* q, const KVCache* kvc) {
     if (!out || !q || !kvc) {
         tensor_set_error("FATAL [AttentionKV]: NULL pointer."); return;
@@ -4012,7 +3971,7 @@ void tensor_attention_kv(Tensor* out, Tensor* q, const KVCache* kvc) {
     int hd     = kvc->head_dim;
     int seq_q  = (int)(q->total_size  / (size_t)hd);
     int seq_kv = kvc->len;
-    int stride = 2 * hd;            /* bytes between consecutive KV pairs (in floats) */
+    int stride = 2 * hd;
 
     if (q->shape[q->ndim - 1] != hd || out->shape[out->ndim - 1] != hd ||
         (int)(out->total_size / (size_t)hd) != seq_q) {
@@ -4022,9 +3981,9 @@ void tensor_attention_kv(Tensor* out, Tensor* q, const KVCache* kvc) {
         memset(F32(out), 0, (size_t)seq_q * hd * sizeof(float)); return;
     }
 
-    float* __restrict       Q  = F32(q);
-    float* __restrict       O  = F32(out);
-    const float* __restrict KV = kvc->data;
+    float* __restrict       Q  = (float*)__builtin_assume_aligned(F32(q), 64);
+    float* __restrict       O  = (float*)__builtin_assume_aligned(F32(out), 64);
+    const float* __restrict KV = (const float*)__builtin_assume_aligned(kvc->data, 64);
     float scale = 1.0f / sqrtf((float)hd);
 
 #pragma omp parallel for schedule(static)
@@ -4032,28 +3991,34 @@ void tensor_attention_kv(Tensor* out, Tensor* q, const KVCache* kvc) {
         const float* __restrict q_row = Q + (size_t)qi * hd;
         float*       __restrict o_row = O + (size_t)qi * hd;
 
-        /* j=0: initialise — no rescale needed, avoids exp(-inf) */
-        const float* kv0 = KV;                         /* K for token 0 */
+        const float* kv0 = KV;
         float s0 = dot_f32(q_row, kv0, hd) * scale;
         float m = s0, denom = 1.0f;
-        memcpy(o_row, kv0 + hd, (size_t)hd * sizeof(float)); /* V for token 0 */
+        memcpy(o_row, kv0 + hd, (size_t)hd * sizeof(float));
 
         for (int j = 1; j < seq_kv; j++) {
             const float* __restrict kvj = KV + (size_t)j * stride;
 
-            /* One prefetch covers K+V for token j+2 (interleaved layout) */
             __builtin_prefetch(kvj + stride,      0, 1);
-            __builtin_prefetch(kvj + stride + 32, 0, 1);   /* if 2*hd > 8 floats */
+            __builtin_prefetch(kvj + stride + 32, 0, 1);
 
             float s     = dot_f32(q_row, kvj, hd) * scale;
             float m_new = s > m ? s : m;
-            float alpha = fast_expf(m - m_new);     /* in (0, 1] */
-            float beta  = fast_expf(s - m_new);     /* in (0, 1] */
+            float alpha = fast_expf(m - m_new);
+            float beta  = fast_expf(s - m_new);
 
-            /* o_row = o_row * alpha + beta * v_j */
             const float* __restrict vj = kvj + hd;
             int d = 0;
-#ifdef __AVX2__
+#ifdef __AVX512F__
+            {
+                __m512 va = _mm512_set1_ps(alpha);
+                __m512 vb = _mm512_set1_ps(beta);
+                for (; d <= hd - 16; d += 16)
+                    _mm512_storeu_ps(o_row + d,
+                        _mm512_fmadd_ps(va, _mm512_loadu_ps(o_row + d),
+                                            _mm512_mul_ps(vb, _mm512_loadu_ps(vj + d))));
+            }
+#elif defined(__AVX2__)
             {
                 __m256 va = _mm256_set1_ps(alpha);
                 __m256 vb = _mm256_set1_ps(beta);
@@ -4069,10 +4034,16 @@ void tensor_attention_kv(Tensor* out, Tensor* q, const KVCache* kvc) {
             m     = m_new;
         }
 
-        /* normalize */
         float inv_d = 1.0f / denom;
         int d = 0;
-#ifdef __AVX2__
+#ifdef __AVX512F__
+        {
+            __m512 vi = _mm512_set1_ps(inv_d);
+            for (; d <= hd - 16; d += 16)
+                _mm512_storeu_ps(o_row + d,
+                    _mm512_mul_ps(_mm512_loadu_ps(o_row + d), vi));
+        }
+#elif defined(__AVX2__)
         {
             __m256 vi = _mm256_set1_ps(inv_d);
             for (; d <= hd - 8; d += 8)
@@ -4087,14 +4058,12 @@ void tensor_attention_kv(Tensor* out, Tensor* q, const KVCache* kvc) {
 void tensor_copy_from(Tensor* dest, Tensor* src) {
     if (dest->total_size != src->total_size || dest->total_size == 0) return;
 
-    // 1. FAST PATH: Both Contiguous (Ideal L1/L2 Saturation)
     if (tensor_is_contiguous(dest) && tensor_is_contiguous(src)) {
         size_t bytes = dest->total_size * sizeof(float);
         
-        // OpenMP + SIMD for massive tensors (saturates memory bus)
         if (dest->total_size > 500000) {
-            float* __restrict d_ptr = F32(dest);
-            float* __restrict s_ptr = F32(src);
+            float* __restrict d_ptr = (float*)__builtin_assume_aligned(F32(dest), 64);
+            float* __restrict s_ptr = (float*)__builtin_assume_aligned(F32(src), 64);
             #pragma omp parallel for simd
             for (size_t i = 0; i < dest->total_size; i++) {
                 d_ptr[i] = s_ptr[i];
@@ -4105,7 +4074,6 @@ void tensor_copy_from(Tensor* dest, Tensor* src) {
         return;
     }
 
-    // Handle 0D Tensors (Scalars)
     if (dest->ndim == 0) {
         F32(dest)[0] = F32(src)[0];
         return;
@@ -4113,17 +4081,15 @@ void tensor_copy_from(Tensor* dest, Tensor* src) {
 
     int ndim = dest->ndim;
     int* shape = dest->shape;
-    int inner_len = shape[ndim - 1]; // Extract innermost dimension for loop pipelining
+    int inner_len = shape[ndim - 1];
 
-    // 2. MEDIUM PATH: Dest Contiguous, Src Strided 
-    // (Extremely hot path: e.g., flattening a transposed matrix view)
     if (tensor_is_contiguous(dest)) {
         int s_inner_stride = src->stride[ndim - 1];
         size_t total_outer = dest->total_size / inner_len;
 
-        float* __restrict d_ptr = F32(dest);
-        float* s_base = F32(src);
-        int s_idx[8] = {0}; // Assumes max tensor rank <= 8
+        float* __restrict d_ptr = (float*)__builtin_assume_aligned(F32(dest), 64);
+        float* s_base = (float*)__builtin_assume_aligned(F32(src), 64);
+        int s_idx[8] = {0};
 
         for (size_t i = 0; i < total_outer; i++) {
             float* __restrict s_inner = s_base;
@@ -4134,28 +4100,23 @@ void tensor_copy_from(Tensor* dest, Tensor* src) {
             } else {
                 int j = 0;
 #ifdef __AVX2__
-                // AVX2 Gather: Loads 8 strided floats concurrently into a vector register
-                // Critical for massive performance gains during matrix transposes
                 __m256i v_indices = _mm256_set_epi32(
                     7 * s_inner_stride, 6 * s_inner_stride, 5 * s_inner_stride, 4 * s_inner_stride,
                     3 * s_inner_stride, 2 * s_inner_stride, 1 * s_inner_stride, 0
                 );
                 for (; j <= inner_len - 8; j += 8) {
-                    __m256 v_val = _mm256_i32gather_ps(s_inner, v_indices, 4); // 4 = scale (sizeof float)
-                    _mm256_storeu_ps(d_ptr, v_val); // Store sequentially
+                    __m256 v_val = _mm256_i32gather_ps(s_inner, v_indices, 4);
+                    _mm256_storeu_ps(d_ptr, v_val);
                     s_inner += 8 * s_inner_stride;
                     d_ptr += 8;
                 }
 #endif
-                // Pipelined Scalar Tail
                 for (; j < inner_len; j++) {
                     *d_ptr++ = *s_inner;
                     s_inner += s_inner_stride;
                 }
             }
 
-            // Pointer Odometer (ZERO MULTIPLICATIONS)
-            // Increments base pointer linearly based on stride limits
             for (int d = ndim - 2; d >= 0; d--) {
                 s_idx[d]++;
                 if (s_idx[d] < shape[d]) {
@@ -4163,35 +4124,31 @@ void tensor_copy_from(Tensor* dest, Tensor* src) {
                     break;
                 } else {
                     s_idx[d] = 0;
-                    s_base -= src->stride[d] * (shape[d] - 1); // Reset dimension shift
+                    s_base -= src->stride[d] * (shape[d] - 1);
                 }
             }
         }
         return;
     }
 
-    // 3. SLOW PATH: Both Strided (The Dual Odometer)
-    // Used when copying slices into slices, or mixed layouts.
     int s_inner_stride = src->stride[ndim - 1];
     int d_inner_stride = dest->stride[ndim - 1];
     size_t total_outer = dest->total_size / inner_len;
 
-    float* s_base = F32(src);
-    float* d_base = F32(dest);
+    float* s_base = (float*)__builtin_assume_aligned(F32(src), 64);
+    float* d_base = (float*)__builtin_assume_aligned(F32(dest), 64);
     int idx[8] = {0};
 
     for (size_t i = 0; i < total_outer; i++) {
         float* __restrict s_inner = s_base;
         float* __restrict d_inner = d_base;
 
-        // Fully branchless inner loop (CPU branch predictor handles this perfectly)
         for (int j = 0; j < inner_len; j++) {
             *d_inner = *s_inner;
             d_inner += d_inner_stride;
             s_inner += s_inner_stride;
         }
 
-        // Dual Pointer Odometer
         for (int d = ndim - 2; d >= 0; d--) {
             idx[d]++;
             if (idx[d] < shape[d]) {
@@ -4211,16 +4168,6 @@ void tensor_copy_from(Tensor* dest, Tensor* src) {
 // 20. ADVANCED INFERENCE & TRAINING PRIMITIVES
 // ============================================================================
 
-/* ---------------------------------------------------------------------------
- * tensor_from_mmap — zero-copy tensor backed by a memory-mapped file region.
- *
- * Opens `filepath`, seeks to `byte_offset`, maps `ndim*shape` elements of
- * `dtype` as MAP_PRIVATE | MAP_POPULATE.  MADV_WILLNEED hints the kernel to
- * prefault pages.  owns_data = false so tensor_free() does NOT call free();
- * the caller must tensor_mmap_free() or munmap() when done.
- *
- * Returns NULL and sets error on failure.
- * --------------------------------------------------------------------------- */
 Tensor* tensor_from_mmap(const char* filepath, size_t byte_offset,
                          int ndim, const int* shape, int dtype_int) {
     if (!filepath || !shape || ndim <= 0 || ndim > 8) {
@@ -4229,7 +4176,6 @@ Tensor* tensor_from_mmap(const char* filepath, size_t byte_offset,
     TensorDType dtype = (TensorDType)dtype_int;
     size_t elem_size  = dtype_size(dtype);
 
-    /* Compute total elements */
     size_t total = 1;
     for (int i = 0; i < ndim; i++) {
         if (shape[i] <= 0) {
@@ -4250,7 +4196,6 @@ Tensor* tensor_from_mmap(const char* filepath, size_t byte_offset,
         close(fd); return NULL;
     }
 
-    /* page-align the offset */
     long page_sz      = sysconf(_SC_PAGESIZE);
     size_t page_off   = byte_offset % (size_t)page_sz;
     size_t map_off    = byte_offset - page_off;
@@ -4263,19 +4208,17 @@ Tensor* tensor_from_mmap(const char* filepath, size_t byte_offset,
     }
     madvise(mapped, map_total, MADV_WILLNEED);
 
-    /* Build a non-owning Tensor pointing into the mapped region */
     Tensor* t = (Tensor*)safe_malloc(sizeof(Tensor));
     if (!t) { munmap(mapped, map_total); return NULL; }
 
     t->ndim       = ndim;
     t->total_size = total;
     t->byte_size  = map_bytes;
-    t->owns_data  = false;   /* tensor_free() must NOT free this pointer */
+    t->owns_data  = false;
     t->is_arena   = false;
     t->dtype      = dtype;
     t->data       = (uint8_t*)mapped + page_off;
 
-    /* Compute strides (row-major / C order) */
     t->stride[ndim - 1] = 1;
     for (int i = ndim - 2; i >= 0; i--)
         t->stride[i] = t->stride[i + 1] * (size_t)shape[i + 1];
@@ -4285,16 +4228,9 @@ Tensor* tensor_from_mmap(const char* filepath, size_t byte_offset,
     return t;
 }
 
-/* Unmap and free the Tensor struct for an mmap-backed tensor.
- * The Tensor MUST have been created by tensor_from_mmap(). */
 void tensor_mmap_free(Tensor* t) {
     if (!t) return;
     if (t->data) {
-        /* Recover the page-aligned base: walk back to nearest page boundary.
-         * We stored data = mapped_base + page_off; we need mapped_base.
-         * Safest: compute aligned base from the stored byte_size + page_off.
-         * But we didn't store page_off.  Use the simpler approach: just
-         * munmap the data pointer rounded DOWN to page boundary.             */
         long page_sz = sysconf(_SC_PAGESIZE);
         uintptr_t addr     = (uintptr_t)t->data;
         uintptr_t page_off = addr % (uintptr_t)page_sz;
@@ -4305,11 +4241,6 @@ void tensor_mmap_free(Tensor* t) {
     free(t);
 }
 
-/* ---------------------------------------------------------------------------
- * tensor_silu — SiLU (Swish) activation: out[i] = x[i] * sigmoid(x[i])
- *                                                 = x[i] / (1 + exp(-x[i]))
- * AVX2 path uses avx2_expf for throughput.
- * --------------------------------------------------------------------------- */
 Tensor* tensor_silu(Tensor* A) {
     if (!A || A->dtype != DTYPE_FLOAT32) {
         TENSOR_ERROR("FATAL [SiLU]: Requires FLOAT32 tensor.");
@@ -4322,8 +4253,8 @@ Tensor* tensor_silu(Tensor* A) {
     if (!out) return NULL;
 
     size_t n = A->total_size;
-    const float* __restrict src = F32(A);
-    float*       __restrict dst = F32(out);
+    const float* __restrict src = (const float*)__builtin_assume_aligned(F32(A), 64);
+    float*       __restrict dst = (float*)__builtin_assume_aligned(F32(out), 64);
 
     size_t i = 0;
 #ifdef __AVX2__
@@ -4331,11 +4262,10 @@ Tensor* tensor_silu(Tensor* A) {
         __m256 ones = _mm256_set1_ps(1.0f);
         for (; i + 8 <= n; i += 8) {
             __m256 x   = _mm256_loadu_ps(src + i);
-            __m256 neg = _mm256_sub_ps(_mm256_setzero_ps(), x);  /* -x */
-            __m256 e   = avx2_expf(neg);                         /* exp(-x) */
-            __m256 sig = _mm256_div_ps(ones,
-                             _mm256_add_ps(ones, e));             /* 1/(1+exp(-x)) */
-            _mm256_storeu_ps(dst + i, _mm256_mul_ps(x, sig));    /* x * sigmoid(x) */
+            __m256 neg = _mm256_sub_ps(_mm256_setzero_ps(), x);
+            __m256 e   = avx2_expf(neg);
+            __m256 sig = _mm256_div_ps(ones, _mm256_add_ps(ones, e));
+            _mm256_storeu_ps(dst + i, _mm256_mul_ps(x, sig));
         }
     }
 #endif
@@ -4348,10 +4278,6 @@ Tensor* tensor_silu(Tensor* A) {
     return out;
 }
 
-/* ---------------------------------------------------------------------------
- * tensor_swiglu — fused SwiGLU: out[i] = silu(gate[i]) * up[i]
- * gate and up must have the same shape.  Result has the same shape.
- * --------------------------------------------------------------------------- */
 Tensor* tensor_swiglu(Tensor* gate, Tensor* up) {
     if (!gate || !up || gate->dtype != DTYPE_FLOAT32 || up->dtype != DTYPE_FLOAT32) {
         TENSOR_ERROR("FATAL [SwiGLU]: Requires FLOAT32 tensors.");
@@ -4367,9 +4293,9 @@ Tensor* tensor_swiglu(Tensor* gate, Tensor* up) {
     if (!out) return NULL;
 
     size_t n = gate->total_size;
-    const float* __restrict g   = F32(gate);
-    const float* __restrict u   = F32(up);
-    float*       __restrict dst = F32(out);
+    const float* __restrict g   = (const float*)__builtin_assume_aligned(F32(gate), 64);
+    const float* __restrict u   = (const float*)__builtin_assume_aligned(F32(up), 64);
+    float*       __restrict dst = (float*)__builtin_assume_aligned(F32(out), 64);
 
     size_t i = 0;
 #ifdef __AVX2__
@@ -4396,19 +4322,6 @@ Tensor* tensor_swiglu(Tensor* gate, Tensor* up) {
     return out;
 }
 
-/* ---------------------------------------------------------------------------
- * tensor_fused_cross_entropy_loss_and_grad
- *
- * Single-pass fused kernel:
- *   1. Numerically stable softmax over last axis (per row)
- *   2. NLL loss:   L = -log(probs[target_id])
- *   3. Gradient:   grads[i] = probs[i] - (i == target_id ? 1.0 : 0.0)
- *
- * logits:         [batch, vocab]  FLOAT32  contiguous
- * target_ids:     [batch]         INT32    contiguous  (row-major token ids)
- * grads:          [batch, vocab]  FLOAT32  pre-allocated contiguous output
- * out_loss:       pointer to float; receives mean loss over the batch
- * --------------------------------------------------------------------------- */
 void tensor_fused_cross_entropy_loss_and_grad(Tensor* logits, Tensor* target_ids,
                                                Tensor* grads,  float*  out_loss) {
     if (!logits || !target_ids || !grads || !out_loss) {
@@ -4437,8 +4350,8 @@ void tensor_fused_cross_entropy_loss_and_grad(Tensor* logits, Tensor* target_ids
         tensor_set_error("FATAL [CrossEntropy]: Shape mismatch."); return;
     }
 
-    const float* __restrict L  = F32(logits);
-    float*       __restrict G  = F32(grads);
+    const float* __restrict L  = (const float*)__builtin_assume_aligned(F32(logits), 64);
+    float*       __restrict G  = (float*)__builtin_assume_aligned(F32(grads), 64);
     const int*   __restrict T  = (const int*)target_ids->data;
 
     float total_loss = 0.0f;
@@ -4449,7 +4362,6 @@ void tensor_fused_cross_entropy_loss_and_grad(Tensor* logits, Tensor* target_ids
         float*       __restrict row_g = G + (size_t)b * vocab;
         int tid = T[b];
 
-        /* Numerically stable softmax: max subtract */
         float mx = row_l[0];
         for (int i = 1; i < vocab; i++)
             if (row_l[i] > mx) mx = row_l[i];
@@ -4457,40 +4369,24 @@ void tensor_fused_cross_entropy_loss_and_grad(Tensor* logits, Tensor* target_ids
         float sum = 0.0f;
         for (int i = 0; i < vocab; i++) {
             float e = fast_expf(row_l[i] - mx);
-            row_g[i] = e;   /* temporarily store exp values in grads */
+            row_g[i] = e;
             sum += e;
         }
 
         float inv_sum = 1.0f / sum;
         for (int i = 0; i < vocab; i++)
-            row_g[i] *= inv_sum;  /* now row_g holds probs */
+            row_g[i] *= inv_sum;
 
-        /* NLL loss */
         float p_target = row_g[tid];
-        /* Clamp to avoid log(0) */
         if (p_target < 1e-12f) p_target = 1e-12f;
-        total_loss += -logf(p_target);
+        total_loss += -fast_logf(p_target);
 
-        /* Gradient: probs - one_hot */
         row_g[tid] -= 1.0f;
     }
 
     *out_loss = total_loss / (float)batch;
 }
 
-/* ---------------------------------------------------------------------------
- * tensor_rmsnorm_backward — gradient of tensor_rmsnorm w.r.t. input X.
- *
- * Forward:  y_j = w_j * x_j / r,    r = sqrt(mean(x²) + eps)
- * Gradient: dx_j = (1/r) * w_j * dy_j  -  x_j * S / (d * r³)
- *   where S = Σ_i (w_i * dy_i * x_i)
- *
- * dY:      [batch, d]  FLOAT32  gradient from upstream
- * X:       [batch, d]  FLOAT32  original input (saved from forward)
- * weights: [d]         FLOAT32  the RMSNorm weight vector
- * eps:     stabilizer (e.g. 1e-5)
- * Returns: [batch, d]  FLOAT32  gradient w.r.t. X
- * --------------------------------------------------------------------------- */
 Tensor* tensor_rmsnorm_backward(Tensor* dY, Tensor* X, Tensor* weights, float eps) {
     if (!dY || !X || !weights) {
         TENSOR_ERROR("FATAL [RMSNormBwd]: NULL pointer.");
@@ -4519,10 +4415,10 @@ Tensor* tensor_rmsnorm_backward(Tensor* dY, Tensor* X, Tensor* weights, float ep
     Tensor* dX = tensor_create_uninitialized(X->ndim, X->shape, DTYPE_FLOAT32);
     if (!dX) return NULL;
 
-    const float* __restrict dy_ptr = F32(dY);
-    const float* __restrict x_ptr  = F32(X);
-    const float* __restrict w_ptr  = F32(weights);
-    float*       __restrict dx_ptr = F32(dX);
+    const float* __restrict dy_ptr = (const float*)__builtin_assume_aligned(F32(dY), 64);
+    const float* __restrict x_ptr  = (const float*)__builtin_assume_aligned(F32(X), 64);
+    const float* __restrict w_ptr  = (const float*)__builtin_assume_aligned(F32(weights), 64);
+    float*       __restrict dx_ptr = (float*)__builtin_assume_aligned(F32(dX), 64);
 
 #pragma omp parallel for schedule(static)
     for (int r = 0; r < rows; r++) {
@@ -4530,7 +4426,6 @@ Tensor* tensor_rmsnorm_backward(Tensor* dY, Tensor* X, Tensor* weights, float ep
         const float* __restrict xr = x_ptr  + (size_t)r * d;
         float*       __restrict dx = dx_ptr + (size_t)r * d;
 
-        /* Compute r = sqrt(mean(x²) + eps) */
         float ss0 = 0.0f, ss1 = 0.0f, ss2 = 0.0f, ss3 = 0.0f;
         int i = 0;
 #ifdef __AVX2__
@@ -4544,7 +4439,6 @@ Tensor* tensor_rmsnorm_backward(Tensor* dY, Tensor* X, Tensor* weights, float ep
                 acc1 = _mm256_fmadd_ps(v1, v1, acc1);
             }
             __m256 acc = _mm256_add_ps(acc0, acc1);
-            /* horizontal sum */
             __m128 lo  = _mm256_castps256_ps128(acc);
             __m128 hi  = _mm256_extractf128_ps(acc, 1);
             __m128 sum = _mm_add_ps(lo, hi);
@@ -4554,10 +4448,9 @@ Tensor* tensor_rmsnorm_backward(Tensor* dY, Tensor* X, Tensor* weights, float ep
         }
 #endif
         for (; i < d; i++) { float v = xr[i]; ss0 += v * v; }
-        float rms = 1.0f / sqrtf(ss0 / (float)d + eps);  /* 1/r */
-        float r3  = rms * rms * rms;                      /* 1/r³ */
+        float rms = 1.0f / sqrtf(ss0 / (float)d + eps);
+        float r3  = rms * rms * rms;
 
-        /* S = Σ (w_i * dy_i * x_i) */
         float S = 0.0f;
         i = 0;
 #ifdef __AVX2__
@@ -4579,9 +4472,8 @@ Tensor* tensor_rmsnorm_backward(Tensor* dY, Tensor* X, Tensor* weights, float ep
 #endif
         for (; i < d; i++) S += w_ptr[i] * dy[i] * xr[i];
 
-        float coeff = S * r3 / (float)d;   /* S / (d * r³) */
+        float coeff = S * r3 / (float)d;
 
-        /* dx_j = rms * w_j * dy_j - x_j * coeff */
         i = 0;
 #ifdef __AVX2__
         {
@@ -4591,7 +4483,6 @@ Tensor* tensor_rmsnorm_backward(Tensor* dY, Tensor* X, Tensor* weights, float ep
                 __m256 wi  = _mm256_loadu_ps(w_ptr + i);
                 __m256 dyi = _mm256_loadu_ps(dy + i);
                 __m256 xi  = _mm256_loadu_ps(xr + i);
-                /* rms * w * dy - x * coeff */
                 __m256 term1 = _mm256_mul_ps(vrms, _mm256_mul_ps(wi, dyi));
                 __m256 term2 = _mm256_mul_ps(xi, vcoef);
                 _mm256_storeu_ps(dx + i, _mm256_sub_ps(term1, term2));
@@ -4605,15 +4496,6 @@ Tensor* tensor_rmsnorm_backward(Tensor* dY, Tensor* X, Tensor* weights, float ep
     return dX;
 }
 
-/* ---------------------------------------------------------------------------
- * tensor_embedding_backward — accumulate gradients into embedding weight matrix.
- *
- * dY:        [seq_len, embed_dim]  FLOAT32  upstream gradients
- * token_ids: [seq_len]             INT32    token indices
- * dWeights:  [vocab_size, embed_dim] FLOAT32  gradient accumulator (caller zeros)
- *
- * Uses #pragma omp atomic per element to safely handle duplicate token IDs.
- * --------------------------------------------------------------------------- */
 void tensor_embedding_backward(Tensor* dY, Tensor* token_ids, Tensor* dWeights) {
     if (!dY || !token_ids || !dWeights) {
         tensor_set_error("FATAL [EmbeddingBwd]: NULL pointer."); return;
@@ -4638,24 +4520,740 @@ void tensor_embedding_backward(Tensor* dY, Tensor* token_ids, Tensor* dWeights) 
         tensor_set_error("FATAL [EmbeddingBwd]: dY shape does not match seq_len/embed_dim."); return;
     }
 
-    const float* __restrict dy  = F32(dY);
-    float*       __restrict dW  = F32(dWeights);
+    const float* __restrict dy  = (const float*)__builtin_assume_aligned(F32(dY), 64);
+    float*       __restrict dW  = (float*)__builtin_assume_aligned(F32(dWeights), 64);
     const int*   __restrict ids = (const int*)token_ids->data;
 
 #pragma omp parallel for schedule(static)
     for (int s = 0; s < seq_len; s++) {
         int tid = ids[s];
-        if (tid < 0 || tid >= vocab) continue;  /* silently skip OOV */
+        if (tid < 0 || tid >= vocab) continue;
 
         const float* __restrict dy_row = dy + (size_t)s * embed_dim;
         float*       __restrict dw_row = dW + (size_t)tid * embed_dim;
 
-        /* Atomic accumulate — correct even when multiple sequence positions
-         * map to the same token_id.  Per-element atomics avoid false sharing
-         * between distinct token rows.                                        */
         for (int i = 0; i < embed_dim; i++) {
 #pragma omp atomic
             dw_row[i] += dy_row[i];
         }
     }
+}
+
+// ============================================================================
+// 21. MAMBA / SELECTIVE SSM ENGINE
+//
+// ZOH recurrence (for each batch b, time t, feature d, state n):
+//   Ā          = exp(delta[b,t,d] * A_log[d,n])
+//   h[t,d,n]  = Ā * h[t-1,d,n]  +  delta[b,t,d] * B[b,t,n] * x[b,t,d]
+//   y[b,t,d]  = Σ_n  C[b,t,n] * h[t,d,n]  +  D_skip[d] * x[b,t,d]
+//
+// Parallelism: OMP collapse(B,D) — T is serial (data dependency).
+//              Tile-scan path for small B*D + large T.
+// SIMD: AVX512 (16-wide) > AVX2 (8-wide) > scalar fallback over N.
+// All intermediates on stack (N <= MAMBA_MAX_N = 128).
+// ============================================================================
+
+#define MAMBA_DT_MIN     1e-4f
+#define MAMBA_DT_MAX     1.0f
+#define MAMBA_MAX_N      128
+#define MAMBA_TILE_SCAN_THRESH  128   /* use tile-scan when T >= this AND B*D < nthreads*4 */
+
+/* _hsum256 already defined above — reuse existing implementation */
+
+#ifdef __AVX512F__
+__attribute__((always_inline))
+static inline __m512 avx512_expf(__m512 x) {
+    x = _mm512_max_ps(x, _mm512_set1_ps(-88.3762626647949f));
+    x = _mm512_min_ps(x, _mm512_set1_ps( 88.3762626647949f));
+    __m512 fx = _mm512_floor_ps(
+        _mm512_fmadd_ps(x, _mm512_set1_ps(1.44269504088896341f),
+                           _mm512_set1_ps(0.5f)));
+    x = _mm512_fnmadd_ps(fx, _mm512_set1_ps( 0.693359375f),    x);
+    x = _mm512_fnmadd_ps(fx, _mm512_set1_ps(-2.12194440e-4f),  x);
+    __m512 z = _mm512_mul_ps(x, x);
+    __m512 y = _mm512_set1_ps(1.9875691500e-4f);
+    y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(1.3981999507e-3f));
+    y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(8.3334519073e-3f));
+    y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(4.1665795894e-2f));
+    y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(1.6666665459e-1f));
+    y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(5.0000001201e-1f));
+    y = _mm512_fmadd_ps(y, z, _mm512_add_ps(x, _mm512_set1_ps(1.0f)));
+    __m512i n = _mm512_add_epi32(_mm512_cvttps_epi32(fx), _mm512_set1_epi32(127));
+    return _mm512_mul_ps(y, _mm512_castsi512_ps(_mm512_slli_epi32(n, 23)));
+}
+#endif
+
+/* ---------------------------------------------------------------------------
+ * FORWARD INNER STEP — updates h[0..N) in-place for one (b,d,t) triple.
+ *
+ * Returns y_d (scalar output contribution from SSM state).
+ * Optionally writes h into cache_slot[0..N).
+ * ------------------------------------------------------------------------- */
+__attribute__((always_inline))
+static inline float _mamba_fwd_step(
+        float* __restrict h,             /* [N] state — read+write      */
+        const float* __restrict A_d,     /* [N] A_log values             */
+        const float* __restrict B_t,     /* [N] B at time t              */
+        const float* __restrict C_t,     /* [N] C at time t              */
+        float delta_d, float x_d,
+        float* __restrict cache_slot,    /* [N] or NULL                  */
+        float* __restrict A_prod,        /* [N] or NULL                  */
+        int N)
+{
+    /* Clamp delta for numerical safety */
+    delta_d = delta_d < MAMBA_DT_MIN ? MAMBA_DT_MIN :
+              delta_d > MAMBA_DT_MAX ? MAMBA_DT_MAX : delta_d;
+    const float xd_delta = x_d * delta_d;
+
+    float yd = 0.0f;
+    int n = 0;
+
+#ifdef __AVX512F__
+    {
+        __m512 vd   = _mm512_set1_ps(delta_d);
+        __m512 vxdd = _mm512_set1_ps(xd_delta);
+        __m512 vy   = _mm512_setzero_ps();
+        for (; n + 16 <= N; n += 16) {
+            __builtin_prefetch(A_d + n + 16, 0, 1);
+            __builtin_prefetch(B_t + n + 16, 0, 1);
+            __builtin_prefetch(C_t + n + 16, 0, 1);
+            
+            __m512 vA    = _mm512_load_ps(A_d + n);
+            __m512 vZ    = _mm512_max_ps(_mm512_mul_ps(vd, vA), _mm512_set1_ps(-20.0f));
+            __m512 vAbar = avx512_expf(vZ);
+            __m512 vh    = _mm512_load_ps(h + n);
+            __m512 vB    = _mm512_load_ps(B_t + n);
+            __m512 vC    = _mm512_load_ps(C_t + n);
+            vh = _mm512_fmadd_ps(vAbar, vh, _mm512_mul_ps(vxdd, vB));
+            _mm512_store_ps(h + n, vh);
+            
+            if (cache_slot) _mm512_store_ps(cache_slot + n, vh);
+            if (A_prod) {
+                __m512 vAp = _mm512_load_ps(A_prod + n);
+                _mm512_store_ps(A_prod + n, _mm512_mul_ps(vAp, vAbar));
+            }
+            
+            vy = _mm512_fmadd_ps(vC, vh, vy);
+        }
+        yd = _mm512_reduce_add_ps(vy);
+    }
+#elif defined(__AVX2__)
+    {
+        __m256 vd   = _mm256_set1_ps(delta_d);
+        __m256 vxdd = _mm256_set1_ps(xd_delta);
+        __m256 vy   = _mm256_setzero_ps();
+        /* 2x unroll for better ILP when N=16 (two 8-wide iters = full N) */
+        for (; n + 16 <= N; n += 16) {
+            __builtin_prefetch(A_d + n + 16, 0, 1);
+            __builtin_prefetch(B_t + n + 16, 0, 1);
+            __builtin_prefetch(C_t + n + 16, 0, 1);
+            
+            __m256 vA0   = _mm256_load_ps(A_d + n);
+            __m256 vA1   = _mm256_load_ps(A_d + n + 8);
+            __m256 vZ0   = _mm256_max_ps(_mm256_mul_ps(vd, vA0), _mm256_set1_ps(-20.0f));
+            __m256 vZ1   = _mm256_max_ps(_mm256_mul_ps(vd, vA1), _mm256_set1_ps(-20.0f));
+            __m256 vAb0  = avx2_expf(vZ0);
+            __m256 vAb1  = avx2_expf(vZ1);
+            __m256 vh0   = _mm256_load_ps(h + n);
+            __m256 vh1   = _mm256_load_ps(h + n + 8);
+            __m256 vB0   = _mm256_load_ps(B_t + n);
+            __m256 vB1   = _mm256_load_ps(B_t + n + 8);
+            __m256 vC0   = _mm256_load_ps(C_t + n);
+            __m256 vC1   = _mm256_load_ps(C_t + n + 8);
+            vh0 = _mm256_fmadd_ps(vAb0, vh0, _mm256_mul_ps(vxdd, vB0));
+            vh1 = _mm256_fmadd_ps(vAb1, vh1, _mm256_mul_ps(vxdd, vB1));
+            _mm256_store_ps(h + n,     vh0);
+            _mm256_store_ps(h + n + 8, vh1);
+            
+            if (cache_slot) {
+                _mm256_store_ps(cache_slot + n,     vh0);
+                _mm256_store_ps(cache_slot + n + 8, vh1);
+            }
+            if (A_prod) {
+                __m256 vAp0 = _mm256_load_ps(A_prod + n);
+                __m256 vAp1 = _mm256_load_ps(A_prod + n + 8);
+                _mm256_store_ps(A_prod + n, _mm256_mul_ps(vAp0, vAb0));
+                _mm256_store_ps(A_prod + n + 8, _mm256_mul_ps(vAp1, vAb1));
+            }
+            
+            vy = _mm256_fmadd_ps(vC0, vh0, _mm256_fmadd_ps(vC1, vh1, vy));
+        }
+        for (; n + 8 <= N; n += 8) {
+            __m256 vA   = _mm256_load_ps(A_d + n);
+            __m256 vZ   = _mm256_max_ps(_mm256_mul_ps(vd, vA), _mm256_set1_ps(-20.0f));
+            __m256 vAb  = avx2_expf(vZ);
+            __m256 vh   = _mm256_load_ps(h + n);
+            __m256 vB   = _mm256_load_ps(B_t + n);
+            __m256 vC   = _mm256_load_ps(C_t + n);
+            vh = _mm256_fmadd_ps(vAb, vh, _mm256_mul_ps(vxdd, vB));
+            _mm256_store_ps(h + n, vh);
+            
+            if (cache_slot) _mm256_store_ps(cache_slot + n, vh);
+            if (A_prod) {
+                __m256 vAp = _mm256_load_ps(A_prod + n);
+                _mm256_store_ps(A_prod + n, _mm256_mul_ps(vAp, vAb));
+            }
+            
+            vy = _mm256_fmadd_ps(vC, vh, vy);
+        }
+        yd = _hsum256(vy);
+    }
+#endif
+    /* Scalar tail (also the sole path without AVX) */
+    #pragma omp simd aligned(h, A_d, B_t, C_t : 64) reduction(+:yd)
+    for (int i = n; i < N; i++) {
+        float z = delta_d * A_d[i];
+        z = z < -20.0f ? -20.0f : z;
+        float Abar = fast_expf(z);
+        h[i] = Abar * h[i] + xd_delta * B_t[i];
+        if (cache_slot) cache_slot[i] = h[i];
+        if (A_prod) A_prod[i] *= Abar;
+        yd += C_t[i] * h[i];
+    }
+    return yd;
+}
+
+/* ---------------------------------------------------------------------------
+ * TILE-SCAN FORWARD — parallel over T for small B*D workloads.
+ *
+ * Parallel log(N) prefix-scan correctly merges tile boundaries.
+ * ------------------------------------------------------------------------- */
+#define TILE_MAX_THREADS 1024
+
+static void _mamba_tile_scan_bd(
+        float* __restrict h,             /* [N] state (initial on entry)  */
+        const float* __restrict x_bd,    /* x[b, 0..T-1, d]  stride D     */
+        const float* __restrict A_d,     /* [N]                           */
+        const float* __restrict B_bt,    /* B[b, 0, :]  stride N per step */
+        const float* __restrict C_bt,    /* C[b, 0, :]  stride N per step */
+        float D_d,
+        const float* __restrict dt_bd,   /* delta[b, 0..T-1, d]  stride D */
+        float* __restrict out_bd,        /* out[b, 0..T-1, d]  stride D   */
+        float* __restrict cache_bd,      /* cache[b, d, 0..T-1, :]        */
+        int T, int N, int D_stride, int BN_stride)
+{
+    int nchunks = omp_get_max_threads();
+    if (nchunks > T) nchunks = T;
+    if (nchunks > TILE_MAX_THREADS) nchunks = TILE_MAX_THREADS;
+    int chunk = (T + nchunks - 1) / nchunks;
+
+    /* Static thread-local buffers (zero heap allocation, safe per OpenMP thread team) */
+    static __thread float tls_carry_A[TILE_MAX_THREADS * MAMBA_MAX_N] __attribute__((aligned(64)));
+    static __thread float tls_carry_b[TILE_MAX_THREADS * MAMBA_MAX_N] __attribute__((aligned(64)));
+    static __thread float tls_boundary[TILE_MAX_THREADS * MAMBA_MAX_N] __attribute__((aligned(64)));
+
+    float* carry_A  = tls_carry_A;
+    float* carry_b  = tls_carry_b;
+    float* boundary = tls_boundary;
+
+    /* ---- Pass 1: independent tiles, start from h=0 ---- */
+#pragma omp parallel for schedule(static, 1)
+    for (int c = 0; c < nchunks; c++) {
+        int t0 = c * chunk;
+        int t1 = t0 + chunk < T ? t0 + chunk : T;
+        float h_local[MAMBA_MAX_N] __attribute__((aligned(64)));
+        float A_prod[MAMBA_MAX_N]  __attribute__((aligned(64)));
+        memset(h_local, 0, N * sizeof(float));
+        for (int n = 0; n < N; n++) A_prod[n] = 1.0f;
+
+        for (int t = t0; t < t1; t++) {
+            float dt   = dt_bd[t * D_stride];
+            float xd   = x_bd[t * D_stride];
+            const float* Bt = B_bt + (size_t)t * BN_stride;
+            const float* Ct = C_bt + (size_t)t * BN_stride;
+            float* slot = cache_bd ? cache_bd + (size_t)t * N : NULL;
+            
+            float yd = _mamba_fwd_step(h_local, A_d, Bt, Ct, dt, xd, slot, A_prod, N);
+            out_bd[t * D_stride] = yd + D_d * xd;
+        }
+        memcpy(boundary + c * N, h_local, N * sizeof(float));
+        memcpy(carry_A  + c * N, A_prod,  N * sizeof(float));
+    }
+
+    /* ---- Pass 2: Parallel Prefix-Scan (Log N) ---- */
+    if (nchunks >= 4) {
+        int step = 1;
+        while (step < nchunks) {
+            #pragma omp parallel for schedule(static)
+            for (int c = nchunks - 1; c >= step; c--) {
+                int prev = c - step;
+                float temp_A[MAMBA_MAX_N] __attribute__((aligned(64)));
+                float temp_b[MAMBA_MAX_N] __attribute__((aligned(64)));
+                
+                #pragma omp simd aligned(temp_A, temp_b : 64)
+                for (int n = 0; n < N; n++) {
+                    temp_A[n] = carry_A[c * N + n] * carry_A[prev * N + n];
+                    temp_b[n] = carry_A[c * N + n] * boundary[prev * N + n] + boundary[c * N + n];
+                }
+                
+                #pragma omp simd aligned(temp_A, temp_b : 64)
+                for (int n = 0; n < N; n++) {
+                    carry_A[c * N + n] = temp_A[n];
+                    boundary[c * N + n] = temp_b[n];
+                }
+            }
+            step *= 2;
+        }
+    } else {
+        for (int c = 1; c < nchunks; c++) {
+            #pragma omp simd
+            for (int n = 0; n < N; n++) {
+                boundary[c * N + n] = carry_A[c * N + n] * boundary[(c - 1) * N + n] + boundary[c * N + n];
+                carry_A[c * N + n] = carry_A[c * N + n] * carry_A[(c - 1) * N + n];
+            }
+        }
+    }
+
+    /* ---- Pass 3: Apply initial state h and offset outputs ---- */
+#pragma omp parallel for schedule(static, 1)
+    for (int c = nchunks - 1; c >= 0; c--) {
+        #pragma omp simd
+        for (int n = 0; n < N; n++) {
+            carry_b[c * N + n] = (c == 0) ? h[n] : (carry_A[(c - 1) * N + n] * h[n] + boundary[(c - 1) * N + n]);
+        }
+    }
+
+    #pragma omp simd
+    for (int n = 0; n < N; n++) {
+        h[n] = carry_A[(nchunks - 1) * N + n] * h[n] + boundary[(nchunks - 1) * N + n];
+    }
+
+#pragma omp parallel for schedule(static, 1)
+    for (int c = 0; c < nchunks; c++) {
+        int t0 = c * chunk;
+        int t1 = t0 + chunk < T ? t0 + chunk : T;
+        float* cb = carry_b + c * N;
+
+        float h_local[MAMBA_MAX_N] __attribute__((aligned(64)));
+        memcpy(h_local, cb, N * sizeof(float));
+
+        for (int t = t0; t < t1; t++) {
+            float dt = dt_bd[t * D_stride];
+            float xd = x_bd[t * D_stride];
+            const float* Bt = B_bt + (size_t)t * BN_stride;
+            const float* Ct = C_bt + (size_t)t * BN_stride;
+            float* slot = cache_bd ? cache_bd + (size_t)t * N : NULL;
+            
+            float yd = _mamba_fwd_step(h_local, A_d, Bt, Ct, dt, xd, slot, NULL, N);
+            out_bd[t * D_stride] = yd + D_d * xd;
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * PUBLIC: tensor_mamba_forward
+ * ------------------------------------------------------------------------- */
+void tensor_mamba_forward(Tensor* x,      Tensor* A_log,
+                          Tensor* B_proj, Tensor* C_proj,
+                          Tensor* D_skip, Tensor* delta,
+                          Tensor* state,  Tensor* out,
+                          Tensor* cache,  int training)
+{
+    if (!x || !A_log || !B_proj || !C_proj || !delta || !state || !out) {
+        TENSOR_ERROR_VOID("mamba_forward: NULL required tensor.");
+    }
+    if (x->ndim != 3 || A_log->ndim != 2 || B_proj->ndim != 3 ||
+        C_proj->ndim != 3 || delta->ndim != 3 || state->ndim != 3 || out->ndim != 3) {
+        TENSOR_ERROR_VOID("mamba_forward: unexpected ndim.");
+    }
+
+    const int Bsz = x->shape[0];
+    const int T   = x->shape[1];
+    const int D   = x->shape[2];
+    const int N   = A_log->shape[1];
+
+    if (A_log->shape[0] != D || B_proj->shape[0] != Bsz || B_proj->shape[1] != T ||
+        B_proj->shape[2] != N || C_proj->shape[0] != Bsz || C_proj->shape[1] != T ||
+        C_proj->shape[2] != N || delta->shape[0] != Bsz || delta->shape[1] != T ||
+        delta->shape[2] != D || state->shape[0] != Bsz || state->shape[1] != D ||
+        state->shape[2] != N || out->shape[0] != Bsz || out->shape[1] != T ||
+        out->shape[2] != D) {
+        TENSOR_ERROR_VOID("mamba_forward: shape mismatch.");
+    }
+    if (N > MAMBA_MAX_N) {
+        TENSOR_ERROR_VOID("mamba_forward: d_state > MAMBA_MAX_N (128).");
+    }
+
+    const float* __restrict xp  = (const float*)__builtin_assume_aligned(F32(x),      64);
+    const float* __restrict Ap  = (const float*)__builtin_assume_aligned(F32(A_log),  64);
+    const float* __restrict Bp  = (const float*)__builtin_assume_aligned(F32(B_proj), 64);
+    const float* __restrict Cp  = (const float*)__builtin_assume_aligned(F32(C_proj), 64);
+    const float* __restrict Dp  = D_skip ? (const float*)F32(D_skip) : NULL;
+    const float* __restrict dtp = (const float*)__builtin_assume_aligned(F32(delta),  64);
+    float* __restrict sp  = (float*)__builtin_assume_aligned(F32(state), 64);
+    float* __restrict op  = (float*)__builtin_assume_aligned(F32(out),   64);
+    float* __restrict cp  = cache ? (float*)F32(cache) : NULL;
+
+    const int nthreads = omp_get_max_threads();
+    const int use_tile = training && cache && T >= MAMBA_TILE_SCAN_THRESH
+                         && Bsz * D < nthreads * 4;
+
+    if (use_tile) {
+        for (int b = 0; b < Bsz; b++) {
+            for (int d = 0; d < D; d++) {
+                float* __restrict h_bd    = sp + (size_t)b * D * N + (size_t)d * N;
+                const float* __restrict x_bd  = xp  + (size_t)b * T * D + d;
+                const float* __restrict dt_bd = dtp + (size_t)b * T * D + d;
+                const float* __restrict B_bt  = Bp  + (size_t)b * T * N;
+                const float* __restrict C_bt  = Cp  + (size_t)b * T * N;
+                float* __restrict out_bd  = op + (size_t)b * T * D + d;
+                float D_d = Dp ? Dp[d] : 0.0f;
+                
+                /* Updated cache striding to [B, D, T, N] */
+                float* __restrict cache_bd = cp ? cp + ((size_t)b * D * T + (size_t)d * T) * N : NULL;
+                
+                _mamba_tile_scan_bd(h_bd, x_bd, Ap + (size_t)d * N, B_bt, C_bt,
+                                    D_d, dt_bd, out_bd, cache_bd,
+                                    T, N, D, N);
+            }
+        }
+    } else {
+#pragma omp parallel for collapse(2) schedule(static)
+        for (int b = 0; b < Bsz; b++) {
+            for (int d = 0; d < D; d++) {
+                float* __restrict h = sp + (size_t)b * D * N + (size_t)d * N;
+                const float* __restrict A_d = Ap + (size_t)d * N;
+                float D_d = Dp ? Dp[d] : 0.0f;
+                
+                /* Updated cache striding to [B, D, T, N] */
+                float* __restrict cache_bd = cp ? cp + ((size_t)b * D * T + (size_t)d * T) * N : NULL;
+
+                for (int t = 0; t < T; t++) {
+                    const size_t td_off = (size_t)b * T * D + (size_t)t * D + d;
+                    float delta_d = dtp[td_off];
+                    float x_d     = xp[td_off];
+                    const float* __restrict B_t = Bp + (size_t)b * T * N + (size_t)t * N;
+                    const float* __restrict C_t = Cp + (size_t)b * T * N + (size_t)t * N;
+                    float* __restrict slot = cache_bd ? cache_bd + (size_t)t * N : NULL;
+                    
+                    float yd = _mamba_fwd_step(h, A_d, B_t, C_t, delta_d, x_d, slot, NULL, N);
+                    op[td_off] = yd + D_d * x_d;
+                }
+            }
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * BACKWARD INNER STEP — computes all gradients for one (b,d,t) triple.
+ *
+ * dh[0..N):  accumulated gradient w.r.t. h_t from future steps (in/out).
+ * On return, dh holds gradient w.r.t. h_{t-1}.
+ * h_t:       h after this step (from cache).
+ * h_prev:    h before this step (cache[t-1] or h0 at t=0).
+ * Accumulates: dA_d, dB_t, dC_t (+=).
+ * Returns:   scalar dx contribution and ddelta contribution.
+ * ------------------------------------------------------------------------- */
+__attribute__((always_inline))
+static inline void _mamba_bwd_step(
+        float* __restrict dh,            /* [N] in/out                   */
+        const float* __restrict h_t,     /* [N] h after step t           */
+        const float* __restrict h_prev,  /* [N] h before step t          */
+        const float* __restrict A_d,     /* [N]                          */
+        const float* __restrict B_t,     /* [N]                          */
+        const float* __restrict C_t,     /* [N]                          */
+        float dout_d, float delta_d, float x_d, float D_d,
+        float* __restrict dC_t,          /* [N] +=                       */
+        float* __restrict dB_t,          /* [N] +=                       */
+        float* __restrict dA_d,          /* [N] +=                       */
+        float* __restrict dx_acc,        /* scalar +=                    */
+        float* __restrict dD_acc,        /* scalar +=                    */
+        float* __restrict ddelta_acc,    /* scalar +=                    */
+        int N)
+{
+    delta_d = delta_d < MAMBA_DT_MIN ? MAMBA_DT_MIN :
+              delta_d > MAMBA_DT_MAX ? MAMBA_DT_MAX : delta_d;
+
+    float s_dx = 0.0f, s_dd = 0.0f;
+    *dD_acc += dout_d * x_d;
+
+    int n = 0;
+#ifdef __AVX512F__
+    {
+        __m512 vdout  = _mm512_set1_ps(dout_d);
+        __m512 vdelta = _mm512_set1_ps(delta_d);
+        __m512 vxd    = _mm512_set1_ps(x_d);
+        __m512 vxdd   = _mm512_set1_ps(delta_d * x_d);
+        __m512 vs_dx  = _mm512_setzero_ps();
+        __m512 vs_dd  = _mm512_setzero_ps();
+        for (; n + 16 <= N; n += 16) {
+            __builtin_prefetch(A_d + n + 16, 0, 1);
+            __builtin_prefetch(B_t + n + 16, 0, 1);
+            __builtin_prefetch(C_t + n + 16, 0, 1);
+            __builtin_prefetch(h_t + n + 16, 0, 1);
+            __builtin_prefetch(h_prev + n + 16, 0, 1);
+            
+            __m512 vdh  = _mm512_load_ps(dh + n);
+            __m512 vht  = _mm512_load_ps(h_t + n);
+            __m512 vhp  = _mm512_load_ps(h_prev + n);
+            __m512 vA   = _mm512_load_ps(A_d + n);
+            __m512 vB   = _mm512_load_ps(B_t + n);
+            __m512 vC   = _mm512_load_ps(C_t + n);
+            __m512 vZ   = _mm512_max_ps(_mm512_mul_ps(vdelta, vA), _mm512_set1_ps(-20.0f));
+            __m512 vAbar = avx512_expf(vZ);
+            
+            vdh = _mm512_fmadd_ps(vdout, vC, vdh);
+            __m512 vdC = _mm512_load_ps(dC_t + n);
+            _mm512_store_ps(dC_t + n, _mm512_fmadd_ps(vdout, vht, vdC));
+            __m512 vdA = _mm512_load_ps(dA_d + n);
+            _mm512_store_ps(dA_d + n, _mm512_fmadd_ps(
+                vdh, _mm512_mul_ps(vhp, _mm512_mul_ps(vAbar, vdelta)), vdA));
+            __m512 vdB = _mm512_load_ps(dB_t + n);
+            _mm512_store_ps(dB_t + n, _mm512_fmadd_ps(vdh, vxdd, vdB));
+            vs_dx = _mm512_fmadd_ps(vdh, _mm512_mul_ps(vdelta, vB), vs_dx);
+            
+            __m512 dA_term = _mm512_mul_ps(vhp, _mm512_mul_ps(vAbar, vA));
+            __m512 dB_term = _mm512_mul_ps(vB, vxd);
+            vs_dd = _mm512_fmadd_ps(vdh, _mm512_add_ps(dA_term, dB_term), vs_dd);
+            _mm512_store_ps(dh + n, _mm512_mul_ps(vdh, vAbar));
+        }
+        s_dx += _mm512_reduce_add_ps(vs_dx);
+        s_dd += _mm512_reduce_add_ps(vs_dd);
+    }
+#elif defined(__AVX2__)
+    {
+        __m256 vdout  = _mm256_set1_ps(dout_d);
+        __m256 vdelta = _mm256_set1_ps(delta_d);
+        __m256 vxd    = _mm256_set1_ps(x_d);
+        __m256 vxdd   = _mm256_set1_ps(delta_d * x_d);
+        __m256 vs_dx  = _mm256_setzero_ps();
+        __m256 vs_dd  = _mm256_setzero_ps();
+        for (; n + 8 <= N; n += 8) {
+            __builtin_prefetch(A_d + n + 8, 0, 1);
+            __builtin_prefetch(B_t + n + 8, 0, 1);
+            __builtin_prefetch(C_t + n + 8, 0, 1);
+            __builtin_prefetch(h_t + n + 8, 0, 1);
+            __builtin_prefetch(h_prev + n + 8, 0, 1);
+            
+            __m256 vdh   = _mm256_load_ps(dh + n);
+            __m256 vht   = _mm256_load_ps(h_t + n);
+            __m256 vhp   = _mm256_load_ps(h_prev + n);
+            __m256 vA    = _mm256_load_ps(A_d + n);
+            __m256 vB    = _mm256_load_ps(B_t + n);
+            __m256 vC    = _mm256_load_ps(C_t + n);
+            __m256 vZ    = _mm256_max_ps(_mm256_mul_ps(vdelta, vA), _mm256_set1_ps(-20.0f));
+            __m256 vAbar = avx2_expf(vZ);
+            
+            vdh = _mm256_fmadd_ps(vdout, vC, vdh);
+            __m256 vdC = _mm256_load_ps(dC_t + n);
+            _mm256_store_ps(dC_t + n, _mm256_fmadd_ps(vdout, vht, vdC));
+            __m256 vdA = _mm256_load_ps(dA_d + n);
+            _mm256_store_ps(dA_d + n, _mm256_fmadd_ps(
+                vdh, _mm256_mul_ps(vhp, _mm256_mul_ps(vAbar, vdelta)), vdA));
+            __m256 vdB = _mm256_load_ps(dB_t + n);
+            _mm256_store_ps(dB_t + n, _mm256_fmadd_ps(vdh, vxdd, vdB));
+            vs_dx = _mm256_fmadd_ps(vdh, _mm256_mul_ps(vdelta, vB), vs_dx);
+            
+            __m256 dA_term = _mm256_mul_ps(vhp, _mm256_mul_ps(vAbar, vA));
+            __m256 dB_term = _mm256_mul_ps(vB, vxd);
+            vs_dd = _mm256_fmadd_ps(vdh, _mm256_add_ps(dA_term, dB_term), vs_dd);
+            _mm256_store_ps(dh + n, _mm256_mul_ps(vdh, vAbar));
+        }
+        s_dx += _hsum256(vs_dx);
+        s_dd += _hsum256(vs_dd);
+    }
+#endif
+    /* Scalar tail */
+    #pragma omp simd aligned(dh, h_t, h_prev, A_d, B_t, C_t, dC_t, dB_t, dA_d : 64) reduction(+:s_dx, s_dd)
+    for (int i = n; i < N; i++) {
+        float z = delta_d * A_d[i];
+        z = z < -20.0f ? -20.0f : z;
+        float Abar  = fast_expf(z);
+        float dh_n  = dh[i] + dout_d * C_t[i];
+        dC_t[i]    += dout_d * h_t[i];
+        dA_d[i]    += dh_n * h_prev[i] * Abar * delta_d;
+        dB_t[i]    += dh_n * delta_d * x_d;
+        s_dx       += dh_n * delta_d * B_t[i];
+        s_dd       += dh_n * (h_prev[i] * Abar * A_d[i] + B_t[i] * x_d);
+        dh[i]       = dh_n * Abar;
+    }
+
+    *dx_acc      += s_dx + dout_d * D_d;
+    *ddelta_acc  += s_dd;
+}
+
+/* ---------------------------------------------------------------------------
+ * PUBLIC: tensor_mamba_backward
+ * ------------------------------------------------------------------------- */
+void tensor_mamba_backward(Tensor* dout,   Tensor* x,
+                           Tensor* A_log,  Tensor* B_proj, Tensor* C_proj,
+                           Tensor* D_skip, Tensor* delta,
+                           Tensor* h0,     Tensor* cache,
+                           Tensor* dx,     Tensor* dA,
+                           Tensor* dB,     Tensor* dC,
+                           Tensor* dD,     Tensor* ddelta)
+{
+    if (!dout || !x || !A_log || !B_proj || !C_proj || !delta ||
+        !h0 || !dx || !dA || !dB || !dC || !ddelta) {
+        TENSOR_ERROR_VOID("mamba_backward: NULL required tensor.");
+    }
+
+    const int Bsz = x->shape[0];
+    const int T   = x->shape[1];
+    const int D   = x->shape[2];
+    const int N   = A_log->shape[1];
+
+    const float* __restrict doutp = (const float*)__builtin_assume_aligned(F32(dout), 64);
+    const float* __restrict xp    = (const float*)__builtin_assume_aligned(F32(x), 64);
+    const float* __restrict Ap    = (const float*)__builtin_assume_aligned(F32(A_log), 64);
+    const float* __restrict Bp    = (const float*)__builtin_assume_aligned(F32(B_proj), 64);
+    const float* __restrict Cp    = (const float*)__builtin_assume_aligned(F32(C_proj), 64);
+    const float* __restrict Dp    = D_skip ? (const float*)F32(D_skip) : NULL;
+    const float* __restrict dtp   = (const float*)__builtin_assume_aligned(F32(delta), 64);
+    const float* __restrict h0p   = (const float*)__builtin_assume_aligned(F32(h0), 64);
+    const float* __restrict cachep = cache ? (const float*)__builtin_assume_aligned(F32(cache), 64) : NULL;
+
+    float* __restrict dxp  = (float*)__builtin_assume_aligned(F32(dx), 64);
+    float* __restrict dAp  = (float*)__builtin_assume_aligned(F32(dA), 64);
+    float* __restrict dBp  = (float*)__builtin_assume_aligned(F32(dB), 64);
+    float* __restrict dCp  = (float*)__builtin_assume_aligned(F32(dC), 64);
+    float* __restrict dDp  = dD ? (float*)__builtin_assume_aligned(F32(dD), 64) : NULL;
+    float* __restrict ddtp = (float*)__builtin_assume_aligned(F32(ddelta), 64);
+
+    int max_threads = omp_get_max_threads();
+    int D_pad = (D + 15) & ~15; // Pad D to 64 bytes to eliminate false sharing
+
+    // Thread-local buffers. dB and dC are dramatically shrunk to O(threads * T * N)
+    float* thread_dD = (float*)safe_memalign(64, max_threads * D_pad * sizeof(float));
+    float* thread_dA = (float*)safe_memalign(64, max_threads * D_pad * N * sizeof(float));
+    float* thread_dB = (float*)safe_memalign(64, max_threads * T * N * sizeof(float));
+    float* thread_dC = (float*)safe_memalign(64, max_threads * T * N * sizeof(float));
+    float* thread_recompute = cachep ? NULL : (float*)safe_memalign(64, max_threads * T * N * sizeof(float));
+    
+    if (!thread_dD || !thread_dA || !thread_dB || !thread_dC || (!cachep && !thread_recompute)) {
+        safe_free((void**)&thread_dD); safe_free((void**)&thread_dA); 
+        safe_free((void**)&thread_dB); safe_free((void**)&thread_dC); safe_free((void**)&thread_recompute);
+        TENSOR_ERROR_VOID("mamba_backward: OOM allocating thread-local buffers.");
+    }
+
+    memset(thread_dD, 0, max_threads * D_pad * sizeof(float));
+    memset(thread_dA, 0, max_threads * D_pad * N * sizeof(float));
+
+    /* Outer loop is over batch dimension — parallelized across threads internally */
+    for (int b = 0; b < Bsz; b++) {
+        memset(thread_dB, 0, max_threads * T * N * sizeof(float));
+        memset(thread_dC, 0, max_threads * T * N * sizeof(float));
+
+#pragma omp parallel
+        {
+            int tid = omp_get_thread_num();
+            float* __restrict my_dA = thread_dA + tid * D_pad * N;
+            float* __restrict my_dD = thread_dD + tid * D_pad;
+            float* __restrict my_dB = thread_dB + tid * T * N;
+            float* __restrict my_dC = thread_dC + tid * T * N;
+            float* __restrict my_cache = thread_recompute ? thread_recompute + tid * T * N : NULL;
+
+            /* Parallelizing deeply over D to efficiently populate the T*N buffers */
+            #pragma omp for schedule(static)
+            for (int d = 0; d < D; d++) {
+                float dh[MAMBA_MAX_N] __attribute__((aligned(64)));
+                memset(dh, 0, N * sizeof(float));
+
+                const float* __restrict A_d = Ap + (size_t)d * N;
+                float D_d = Dp ? Dp[d] : 0.0f;
+                float dD_bd = 0.0f;
+
+                /* Updated cache striding: [B, D, T, N] */
+                const float* __restrict cache_bd = cachep ? cachep + ((size_t)b * D * T + (size_t)d * T) * N : NULL;
+
+                // Lightweight Recompute Path if Cache is absent
+                if (my_cache) {
+                    float h_fwd[MAMBA_MAX_N] __attribute__((aligned(64)));
+                    memcpy(h_fwd, h0p + (size_t)b * D * N + (size_t)d * N, N * sizeof(float));
+                    for (int f_t = 0; f_t < T; f_t++) {
+                        float dt = dtp[b * T * D + f_t * D + d];
+                        float xd = xp[b * T * D + f_t * D + d];
+                        _mamba_fwd_step(h_fwd, A_d, Bp + (size_t)b * T * N + (size_t)f_t * N, 
+                                        Cp + (size_t)b * T * N + (size_t)f_t * N, dt, xd, 
+                                        my_cache + (size_t)f_t * N, NULL, N);
+                    }
+                }
+
+                for (int t = T - 1; t >= 0; t--) {
+                    const size_t td_off = (size_t)b * T * D + (size_t)t * D + d;
+                    float dout_d  = doutp[td_off];
+                    float delta_d = dtp[td_off];
+                    float x_d     = xp[td_off];
+
+                    const float* __restrict B_t   = Bp    + (size_t)b * T * N + (size_t)t * N;
+                    const float* __restrict C_t   = Cp    + (size_t)b * T * N + (size_t)t * N;
+                    
+                    /* Access sequentially along T axis using cache_bd offset */
+                    const float* __restrict h_t   = my_cache ? my_cache + (size_t)t * N 
+                                                             : cache_bd + (size_t)t * N;
+                    const float* __restrict h_prev = (t > 0)
+                        ? (my_cache ? my_cache + (size_t)(t-1) * N : cache_bd + (size_t)(t-1) * N)
+                        : h0p + (size_t)b * D * N + (size_t)d * N;
+
+                    float* __restrict my_dB_t = my_dB + (size_t)t * N;
+                    float* __restrict my_dC_t = my_dC + (size_t)t * N;
+
+                    float dx_step = 0.0f, dD_step = 0.0f, dd_step = 0.0f;
+
+                    _mamba_bwd_step(dh, h_t, h_prev, A_d, B_t, C_t,
+                                    dout_d, delta_d, x_d, D_d,
+                                    my_dC_t, my_dB_t,
+                                    my_dA + (size_t)d * N,
+                                    &dx_step, &dD_step, &dd_step, N);
+
+                    dxp[td_off]  += dx_step;
+                    ddtp[td_off] += dd_step;
+                    dD_bd        += dD_step;
+                }
+                my_dD[d] += dD_bd;
+            }
+
+            /* Local reduction specifically for this `b` index — no atomics, totally parallel */
+            #pragma omp for collapse(2) schedule(static)
+            for (int t = 0; t < T; t++) {
+                for (int n = 0; n < N; n++) {
+                    float sum_dB = 0.0f;
+                    float sum_dC = 0.0f;
+                    for (int th = 0; th < max_threads; th++) {
+                        sum_dB += thread_dB[th * T * N + t * N + n];
+                        sum_dC += thread_dC[th * T * N + t * N + n];
+                    }
+                    dBp[(size_t)b * T * N + (size_t)t * N + n] += sum_dB;
+                    dCp[(size_t)b * T * N + (size_t)t * N + n] += sum_dC;
+                }
+            }
+        }
+    }
+
+    // Final Thread-Local Reduction Loops (zero contention)
+    #pragma omp parallel for schedule(static)
+    for (int d = 0; d < D; d++) {
+        float sum_dD = 0.0f;
+        float* __restrict global_dA = dAp + (size_t)d * N;
+        
+        for (int t = 0; t < max_threads; t++) {
+            sum_dD += thread_dD[t * D_pad + d];
+            float* __restrict t_dA = thread_dA + t * D_pad * N + d * N;
+            
+            #pragma omp simd aligned(global_dA, t_dA : 64)
+            for (int n = 0; n < N; n++) {
+                global_dA[n] += t_dA[n];
+            }
+        }
+        if (dDp) dDp[d] += sum_dD;
+    }
+
+    if (thread_recompute) safe_free((void**)&thread_recompute);
+    safe_free((void**)&thread_dA);
+    safe_free((void**)&thread_dD);
+    safe_free((void**)&thread_dB);
+    safe_free((void**)&thread_dC);
+}
+/* ---------------------------------------------------------------------------
+ * Convenience allocators
+ * ------------------------------------------------------------------------- */
+
+Tensor* tensor_mamba_alloc_state(int batch, int d_model, int d_state) {
+    int shape[3] = {batch, d_model, d_state};
+    return tensor_create_dtype(3, shape, DTYPE_FLOAT32);
+}
+
+Tensor* tensor_mamba_alloc_cache(int batch, int seq_len, int d_model, int d_state) {
+    int shape[4] = {batch, seq_len, d_model, d_state};
+    return tensor_create_dtype(4, shape, DTYPE_FLOAT32);
 }

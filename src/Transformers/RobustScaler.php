@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Pml\Transformers;
 
+use Pml\Interfaces\Stateful;
 use Pml\Interfaces\Transformer;
 use Pml\Tensor;
 use Pml\Dataset;
@@ -16,7 +17,7 @@ use RuntimeException;
  * - Uses single-column extraction and PHP `sort()` to evaluate percentiles at JIT speed.
  * - Compiles statistics back into C-Pointers for mass OpenBLAS broadcasting during transformation.
  */
-final class RobustScaler implements Transformer
+final class RobustScaler implements Transformer, Stateful
 {
     private ?Tensor $medians = null;
     private ?Tensor $iqrs = null;
@@ -72,5 +73,19 @@ final class RobustScaler implements Transformer
     public function fitted(): bool
     {
         return $this->medians !== null && $this->iqrs !== null;
+    }
+
+    public function getStateDict(string $prefix = ''): array
+    {
+        $dict = [];
+        if ($this->medians !== null) { $dict[$prefix . 'medians'] = $this->medians; }
+        if ($this->iqrs    !== null) { $dict[$prefix . 'iqrs']    = $this->iqrs; }
+        return $dict;
+    }
+
+    public function loadStateDict(array $dict, string $prefix = ''): void
+    {
+        $this->medians = $dict[$prefix . 'medians'] ?? null;
+        $this->iqrs    = $dict[$prefix . 'iqrs']    ?? null;
     }
 }

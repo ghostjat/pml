@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Pml\NeuralNetwork\Layers;
 
+use Pml\Interfaces\Stateful;
 use Pml\Tensor;
 
 /**
@@ -12,7 +13,7 @@ use Pml\Tensor;
  * * JIT & Memory Optimized:
  * - Uses native C-level pointer mapping to prevent float-to-int casting overhead.
  */
-final class Embedding implements Layer
+final class Embedding implements Layer, Stateful
 {
     private int $vocabSize;
     private int $embedDim;
@@ -58,5 +59,26 @@ final class Embedding implements Layer
     {
         // Frozen layer for now.
         return [];
+    }
+
+    public function getConfig(): array
+    {
+        return ['vocabSize' => $this->vocabSize, 'embedDim' => $this->embedDim];
+    }
+
+    public static function fromConfig(array $config): static
+    {
+        return new static((int) $config['vocabSize'], (int) $config['embedDim']);
+    }
+
+    public function getStateDict(string $prefix = ''): array
+    {
+        return [$prefix . 'weights' => $this->weights];
+    }
+
+    public function loadStateDict(array $dict, string $prefix = ''): void
+    {
+        $this->weights = $dict[$prefix . 'weights'];
+        $this->input   = null;
     }
 }

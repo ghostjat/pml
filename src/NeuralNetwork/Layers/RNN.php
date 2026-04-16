@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Pml\NeuralNetwork\Layers;
 
+use Pml\Interfaces\Stateful;
 use Pml\Tensor;
 
 /**
@@ -13,7 +14,7 @@ use Pml\Tensor;
  * - Uses Tensor::slice() to iterate over time-steps with zero memory duplication.
  * - Math executes via OpenBLAS inside the PHP temporal loop.
  */
-final class RNN implements Layer
+final class RNN implements Layer, Stateful
 {
     private Tensor $W_ih; // Input-to-Hidden weights
     private Tensor $W_hh; // Hidden-to-Hidden weights
@@ -80,4 +81,35 @@ final class RNN implements Layer
     }
 
     public function getGradients(): array { return []; }
+
+    public function getConfig(): array
+    {
+        return [
+            'inputSize'  => $this->W_ih->shape()[0],
+            'hiddenSize' => $this->hiddenSize,
+        ];
+    }
+
+    public static function fromConfig(array $config): static
+    {
+        return new static((int) $config['inputSize'], (int) $config['hiddenSize']);
+    }
+
+    public function getStateDict(string $prefix = ''): array
+    {
+        return [
+            $prefix . 'W_ih' => $this->W_ih,
+            $prefix . 'W_hh' => $this->W_hh,
+            $prefix . 'b_ih' => $this->b_ih,
+            $prefix . 'b_hh' => $this->b_hh,
+        ];
+    }
+
+    public function loadStateDict(array $dict, string $prefix = ''): void
+    {
+        $this->W_ih = $dict[$prefix . 'W_ih'];
+        $this->W_hh = $dict[$prefix . 'W_hh'];
+        $this->b_ih = $dict[$prefix . 'b_ih'];
+        $this->b_hh = $dict[$prefix . 'b_hh'];
+    }
 }

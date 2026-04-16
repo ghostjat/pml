@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Pml\NeuralNetwork\Layers;
 
+use Pml\Interfaces\Stateful;
 use Pml\Tensor;
 use RuntimeException;
 
@@ -14,7 +15,7 @@ use RuntimeException;
  * - Complies strictly with the DAG Layer interface (Lazy compilation).
  * - Utilizes in-place math to minimize Zend GC overhead.
  */
-final class PReLU implements Layer
+final class PReLU implements Layer, Stateful
 {
     private float $initialAlpha;
     private ?Tensor $alphas = null;
@@ -98,5 +99,29 @@ final class PReLU implements Layer
     {
         if ($this->dAlphas === null) return [];
         return ['alphas' => $this->dAlphas];
+    }
+
+    public function getConfig(): array
+    {
+        return ['initialAlpha' => $this->initialAlpha];
+    }
+
+    public static function fromConfig(array $config): static
+    {
+        return new static((float) $config['initialAlpha']);
+    }
+
+    public function getStateDict(string $prefix = ''): array
+    {
+        $dict = [];
+        if ($this->alphas !== null) { $dict[$prefix . 'alphas'] = $this->alphas; }
+        return $dict;
+    }
+
+    public function loadStateDict(array $dict, string $prefix = ''): void
+    {
+        $this->alphas  = $dict[$prefix . 'alphas'] ?? null;
+        $this->x       = null;
+        $this->dAlphas = null;
     }
 }

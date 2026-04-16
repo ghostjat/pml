@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace Pml\Estimators\Classifiers;
 
 use Pml\Interfaces\Learner;
+use Pml\Interfaces\Persistable;
 use Pml\Interfaces\Probabilistic;
+use Pml\Lib\SafeTensorsIO;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -17,7 +19,7 @@ use RuntimeException;
  * - 100% vector-matrix arithmetic via OpenBLAS.
  * - Memory-flat training loop updates weights purely In-Place.
  */
-final class LogisticRegression implements Learner, Probabilistic
+final class LogisticRegression implements Learner, Probabilistic, Persistable
 {
     private int $epochs;
     private float $learningRate;
@@ -90,5 +92,54 @@ final class LogisticRegression implements Learner, Probabilistic
     public function trained(): bool
     {
         return $this->weights !== null;
+    }
+
+    public function save(string $dir): void
+    {
+        if (!is_dir($dir)) {
+            mkdir($dir, 0755, true);
+        }
+
+        file_put_contents(
+            $dir . \DIRECTORY_SEPARATOR . 'config.json',
+            json_encode([
+                'class'        => self::class,
+                'epochs'       => $this->epochs,
+                'learningRate' => $this->learningRate,
+                'batchSize'    => $this->batchSize,
+                'bias'         => $this->bias,
+            ], \JSON_PRETTY_PRINT | \JSON_UNESCAPED_SLASHES)
+        );
+
+        if ($this->weights !== null) {
+            SafeTensorsIO::save(
+                $dir . \DIRECTORY_SEPARATOR . 'model.safetensors',
+                ['weights' => $this->weights]
+            );
+        }
+    }
+
+    public static function load(string $dir): self
+    {
+        $raw = file_get_contents($dir . \DIRECTORY_SEPARATOR . 'config.json');
+        if ($raw === false) {
+            throw new \RuntimeException("LogisticRegression::load — config.json missing in '$dir'.");
+        }
+        $config = json_decode($raw, true, 512, \JSON_THROW_ON_ERROR);
+
+        $instance = new self(
+            (int)   $config['epochs'],
+            (float) $config['learningRate'],
+            (int)   $config['batchSize']
+        );
+        $instance->bias = (float) $config['bias'];
+
+        $stPath = $dir . \DIRECTORY_SEPARATOR . 'model.safetensors';
+        if (is_file($stPath)) {
+            $tensors = SafeTensorsIO::load($stPath);
+            $instance->weights = $tensors['weights'] ?? null;
+        }
+
+        return $instance;
     }
 }

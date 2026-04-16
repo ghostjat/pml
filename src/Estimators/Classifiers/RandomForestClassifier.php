@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Pml\Estimators\Classifiers;
 
 use Pml\Interfaces\Learner;
+use Pml\Interfaces\Persistable;
 use Pml\Tensor;
 use Pml\Dataset;
 use Pml\Estimators\Classifiers\DecisionTreeClassifier;
@@ -17,7 +18,7 @@ use RuntimeException;
  * - Bootstrapping implemented via fast PHP-index arrays driving C-level tensor_take().
  * - Inference voting executed entirely in PHP JIT cache.
  */
-final class RandomForestClassifier implements Learner
+final class RandomForestClassifier implements Learner, Persistable
 {
     private int $nEstimators;
     private int $maxDepth;
@@ -99,5 +100,59 @@ final class RandomForestClassifier implements Learner
     public function trained(): bool
     {
         return !empty($this->trees);
+    }
+
+    public function save(string $dir): void
+    {
+        if (!is_dir($dir)) {
+            mkdir($dir, 0755, true);
+        }
+
+        $treeData = array_map(
+            static fn(DecisionTreeClassifier $t) => $t->exportPhpTree(),
+            $this->trees
+        );
+
+        file_put_contents(
+            $dir . \DIRECTORY_SEPARATOR . 'config.json',
+            json_encode([
+                'class'           => self::class,
+                'nEstimators'     => $this->nEstimators,
+                'maxDepth'        => $this->maxDepth,
+                'minSamplesSplit' => $this->minSamplesSplit,
+            ], \JSON_PRETTY_PRINT | \JSON_UNESCAPED_SLASHES)
+        );
+
+        file_put_contents(
+            $dir . \DIRECTORY_SEPARATOR . 'trees.json',
+            json_encode($treeData, \JSON_UNESCAPED_SLASHES)
+        );
+    }
+
+    public static function load(string $dir): self
+    {
+        $raw = file_get_contents($dir . \DIRECTORY_SEPARATOR . 'config.json');
+        if ($raw === false) {
+            throw new \RuntimeException("RandomForestClassifier::load — config.json missing in '$dir'.");
+        }
+        $config = json_decode($raw, true, 512, \JSON_THROW_ON_ERROR);
+
+        $treesRaw = file_get_contents($dir . \DIRECTORY_SEPARATOR . 'trees.json');
+        if ($treesRaw === false) {
+            throw new \RuntimeException("RandomForestClassifier::load — trees.json missing in '$dir'.");
+        }
+        $treeData = json_decode($treesRaw, true, 512, \JSON_THROW_ON_ERROR);
+
+        $instance = new self(
+            (int) $config['nEstimators'],
+            (int) $config['maxDepth'],
+            (int) $config['minSamplesSplit']
+        );
+
+        foreach ($treeData as $data) {
+            $instance->trees[] = DecisionTreeClassifier::fromPhpTree($data);
+        }
+
+        return $instance;
     }
 }

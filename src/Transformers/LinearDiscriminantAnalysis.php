@@ -3,6 +3,7 @@ declare(strict_types=1);
 
 namespace Pml\Transformers;
 
+use Pml\Interfaces\Stateful;
 use Pml\Interfaces\Transformer;
 use Pml\Tensor;
 use Pml\Dataset;
@@ -17,7 +18,7 @@ use RuntimeException;
  * - Generalised eigendecomposition via LAPACKE (tensor_eigen_sym on S_W^{-1} S_B).
  * - Projection is a single BLAS matmul — zero PHP-loop arithmetic.
  */
-final class LinearDiscriminantAnalysis implements Transformer
+final class LinearDiscriminantAnalysis implements Transformer, Stateful
 {
     private ?Tensor $W       = null;   // [D × n_components] projection matrix
     private ?Tensor $means   = null;   // overall mean [1 × D]
@@ -90,4 +91,18 @@ final class LinearDiscriminantAnalysis implements Transformer
     }
 
     public function fitted(): bool { return $this->W !== null; }
+
+    public function getStateDict(string $prefix = ''): array
+    {
+        $dict = [];
+        if ($this->W     !== null) { $dict[$prefix . 'W']     = $this->W; }
+        if ($this->means !== null) { $dict[$prefix . 'means'] = $this->means; }
+        return $dict;
+    }
+
+    public function loadStateDict(array $dict, string $prefix = ''): void
+    {
+        $this->W     = $dict[$prefix . 'W']     ?? null;
+        $this->means = $dict[$prefix . 'means'] ?? null;
+    }
 }

@@ -4,13 +4,14 @@ declare(strict_types=1);
 
 namespace Pml\NeuralNetwork\Layers;
 
+use Pml\Interfaces\Stateful;
 use Pml\Tensor;
 
 /**
  * 2D Convolutional Layer for Image Processing.
  * Hardware accelerated using our C-level `im2col` and `col2im` unrolling matrices.
  */
-final class Conv2D implements Layer
+final class Conv2D implements Layer, Stateful
 {
     private Tensor $weights;
     private ?Tensor $bias;
@@ -75,5 +76,46 @@ final class Conv2D implements Layer
         $grads = ['weights' => $this->dW];
         if ($this->dbias !== null) $grads['bias'] = $this->dbias;
         return $grads;
+    }
+
+    public function getConfig(): array
+    {
+        $s = $this->weights->shape(); // [outC, inC, kH, kW]
+        return [
+            'inChannels'  => $s[1],
+            'outChannels' => $s[0],
+            'kernelSize'  => $s[2],
+            'stride'      => $this->stride,
+            'padding'     => $this->padding,
+            'useBias'     => $this->bias !== null,
+        ];
+    }
+
+    public static function fromConfig(array $config): static
+    {
+        return new static(
+            (int)  $config['inChannels'],
+            (int)  $config['outChannels'],
+            (int)  $config['kernelSize'],
+            (int)  $config['stride'],
+            (int)  $config['padding'],
+            (bool) $config['useBias']
+        );
+    }
+
+    public function getStateDict(string $prefix = ''): array
+    {
+        $dict = [$prefix . 'weights' => $this->weights];
+        if ($this->bias !== null) { $dict[$prefix . 'bias'] = $this->bias; }
+        return $dict;
+    }
+
+    public function loadStateDict(array $dict, string $prefix = ''): void
+    {
+        $this->weights = $dict[$prefix . 'weights'];
+        $this->bias    = $dict[$prefix . 'bias'] ?? null;
+        $this->dW      = null;
+        $this->dbias   = null;
+        $this->input   = null;
     }
 }

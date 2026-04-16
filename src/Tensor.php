@@ -98,12 +98,13 @@ class Tensor {
         if ($ffi->tensor_check_error()) {
             // Clear BEFORE reading the string so the error never leaks into
             // subsequent tests even if FFI::string() itself throws.
-            $ffi->tensor_clear_error();
             $errPtr = $ffi->tensor_get_last_error();
             // PHP FFI may return const char* as either FFI\CData or a plain PHP
             // string depending on the runtime version.
             $err = $errPtr instanceof \FFI\CData ? \FFI::string($errPtr) : (string)$errPtr;
+            $ffi->tensor_clear_error();
             throw new \RuntimeException("C-Engine Error: {$err}");
+            
         }
     }
 
@@ -742,6 +743,59 @@ class Tensor {
     public function embeddingLookup(Tensor $weights): self {
         $res = self::wrap(TensorEngine::get()->tensor_embedding_lookup($this->ptr, $weights->ptr));
         self::checkError(); return $res;
+    }
+    
+    // -------------------------------------------------------------------------
+    // MAMBA / SELECTIVE SSM ENGINE
+    // -------------------------------------------------------------------------
+
+    public static function mambaAllocState(int $batch, int $dModel, int $dState): self {
+        $ffi = TensorEngine::get();
+        $res = self::wrap($ffi->tensor_mamba_alloc_state($batch, $dModel, $dState));
+        self::checkError();
+        return $res;
+    }
+
+    public static function mambaAllocCache(int $batch, int $seqLen, int $dModel, int $dState): self {
+        $ffi = TensorEngine::get();
+        $res = self::wrap($ffi->tensor_mamba_alloc_cache($batch, $seqLen, $dModel, $dState));
+        self::checkError();
+        return $res;
+    }
+
+    /**
+     * Mamba Fused Forward
+     */
+    public function mambaForward(
+            self $ALog, self $BProj, self $CProj, ?self $DSkip, self $delta,
+            self $state, self $out, ?self $cache = null, bool $training = false
+    ): void {
+        TensorEngine::get()->tensor_mamba_forward(
+                $this->ptr, $ALog->ptr, $BProj->ptr, $CProj->ptr,
+                $DSkip ? $DSkip->ptr : null, $delta->ptr,
+                $state->ptr, $out->ptr,
+                $cache ? $cache->ptr : null,
+                (int) $training
+        );
+        self::checkError();
+    }
+
+    /**
+     * Mamba Fused Backward
+     */
+    public function mambaBackward(
+            self $x, self $ALog, self $BProj, self $CProj, ?self $DSkip, self $delta,
+            self $h0, ?self $cache,
+            self $dx, self $dA, self $dB, self $dC, ?self $dD, self $ddelta
+    ): void {
+        TensorEngine::get()->tensor_mamba_backward(
+                $this->ptr, $x->ptr, $ALog->ptr, $BProj->ptr, $CProj->ptr,
+                $DSkip ? $DSkip->ptr : null, $delta->ptr,
+                $h0->ptr, $cache ? $cache->ptr : null,
+                $dx->ptr, $dA->ptr, $dB->ptr, $dC->ptr,
+                $dD ? $dD->ptr : null, $ddelta->ptr
+        );
+        self::checkError();
     }
 
     // --- I/O SERIALIZATION ---

@@ -3,6 +3,7 @@ declare(strict_types=1);
 
 namespace Pml\Transformers;
 
+use Pml\Interfaces\Stateful;
 use Pml\Interfaces\Transformer;
 use Pml\Tensor;
 use Pml\Dataset;
@@ -16,7 +17,7 @@ use RuntimeException;
  * - Full SVD via LAPACKE (tensor_svd); only the Vt slice is retained.
  * - Transform is a single BLAS matmul — zero PHP arithmetic.
  */
-final class TruncatedSVD implements Transformer
+final class TruncatedSVD implements Transformer, Stateful
 {
     private ?Tensor $Vt = null;   // [nComponents × D] right singular vectors
 
@@ -44,4 +45,16 @@ final class TruncatedSVD implements Transformer
     }
 
     public function fitted(): bool { return $this->Vt !== null; }
+
+    public function getStateDict(string $prefix = ''): array
+    {
+        $dict = [];
+        if ($this->Vt !== null) { $dict[$prefix . 'Vt'] = $this->Vt; }
+        return $dict;
+    }
+
+    public function loadStateDict(array $dict, string $prefix = ''): void
+    {
+        $this->Vt = $dict[$prefix . 'Vt'] ?? null;
+    }
 }

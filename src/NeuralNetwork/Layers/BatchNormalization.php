@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Pml\NeuralNetwork\Layers;
 
+use Pml\Interfaces\Stateful;
 use Pml\Tensor;
 use RuntimeException;
 
@@ -14,7 +15,7 @@ use RuntimeException;
  * - Evaluates Complex Jacobian gradients using 100% C-level axis reductions and broadcasting.
  * - Safely manages Inference Moving Averages using zero-allocation In-Place mutators.
  */
-final class BatchNormalization implements Layer
+final class BatchNormalization implements Layer, Stateful, HasTrainingMode
 {
     private int $features;
     private float $momentum;
@@ -141,5 +142,50 @@ final class BatchNormalization implements Layer
             'gamma' => $this->dGamma,
             'beta'  => $this->dBeta
         ];
+    }
+
+    public function getConfig(): array
+    {
+        return [
+            'features' => $this->features,
+            'momentum' => $this->momentum,
+            'eps'      => $this->eps,
+        ];
+    }
+
+    public static function fromConfig(array $config): static
+    {
+        return new static(
+            (int)   $config['features'],
+            (float) $config['momentum'],
+            (float) $config['eps']
+        );
+    }
+
+    public function getStateDict(string $prefix = ''): array
+    {
+        return [
+            "{$prefix}gamma"       => $this->gamma,
+            "{$prefix}beta"        => $this->beta,
+            "{$prefix}runningMean" => $this->runningMean,
+            "{$prefix}runningVar"  => $this->runningVar,
+        ];
+    }
+
+    public function loadStateDict(array $dict, string $prefix = ''): void
+    {
+        $this->gamma       = $dict["{$prefix}gamma"];
+        $this->beta        = $dict["{$prefix}beta"];
+        $this->runningMean = $dict["{$prefix}runningMean"];
+        $this->runningVar  = $dict["{$prefix}runningVar"];
+        $this->xNorm       = null;
+        $this->std         = null;
+        $this->dGamma      = null;
+        $this->dBeta       = null;
+    }
+
+    public function setTraining(bool $mode): void
+    {
+        $this->training = $mode;
     }
 }

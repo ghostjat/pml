@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Pml\Estimators\Classifiers;
 
 use Pml\Interfaces\Learner;
+use Pml\Interfaces\Persistable;
+use Pml\Lib\SafeTensorsIO;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -17,7 +19,7 @@ use RuntimeException;
  * - Inference utilizes AVX2 Vector Broadcasting for simultaneous multi-dimensional Euclidean Distance.
  * - Majority voting leverages C-level `bincount` and `argmax` to bypass PHP iterations.
  */
-final class KNNClassifier implements Learner
+final class KNNClassifier implements Learner, Persistable
 {
     private int $k;
     
@@ -102,5 +104,47 @@ final class KNNClassifier implements Learner
     public function trained(): bool
     {
         return $this->fitSamples !== null && $this->fitLabels !== null;
+    }
+
+    public function save(string $dir): void
+    {
+        if (!is_dir($dir)) {
+            mkdir($dir, 0755, true);
+        }
+
+        file_put_contents(
+            $dir . \DIRECTORY_SEPARATOR . 'config.json',
+            json_encode(
+                ['class' => self::class, 'k' => $this->k],
+                \JSON_PRETTY_PRINT | \JSON_UNESCAPED_SLASHES
+            )
+        );
+
+        if ($this->fitSamples !== null) {
+            SafeTensorsIO::save(
+                $dir . \DIRECTORY_SEPARATOR . 'model.safetensors',
+                ['fit_samples' => $this->fitSamples, 'fit_labels' => $this->fitLabels]
+            );
+        }
+    }
+
+    public static function load(string $dir): self
+    {
+        $raw = file_get_contents($dir . \DIRECTORY_SEPARATOR . 'config.json');
+        if ($raw === false) {
+            throw new \RuntimeException("KNNClassifier::load — config.json missing in '$dir'.");
+        }
+        $config = json_decode($raw, true, 512, \JSON_THROW_ON_ERROR);
+
+        $instance = new self((int) $config['k']);
+
+        $stPath = $dir . \DIRECTORY_SEPARATOR . 'model.safetensors';
+        if (is_file($stPath)) {
+            $tensors = SafeTensorsIO::load($stPath);
+            $instance->fitSamples = $tensors['fit_samples'] ?? null;
+            $instance->fitLabels  = $tensors['fit_labels']  ?? null;
+        }
+
+        return $instance;
     }
 }

@@ -17,8 +17,7 @@ final class TensorEngine {
                 // Glob relative to __DIR__ — process CWD is unreliable under php-fpm.
                 $cFiles = implode(' ', array_map('escapeshellarg', glob(__DIR__ . '/*.c')));
                 $result = shell_exec(
-                    "gcc -O3 -march=native -mfma -ffast-math -fopenmp -funroll-loops"
-                    . " -fomit-frame-pointer -shared -fPIC -o "
+                    "gcc -O3 -march=native -mtune=native -mfma -ffast-math -fno-math-errno -funsafe-math-optimizations -fopenmp -funroll-loops -flto -fomit-frame-pointer -D_GNU_SOURCE -shared -fPIC -o "
                     . escapeshellarg($libPath) . " " . $cFiles
                     . " -lopenblas -llapacke -lm 2>&1"
                 );
@@ -270,6 +269,35 @@ final class TensorEngine {
                 void     tensor_fused_cross_entropy_loss_and_grad(TensorC* logits, TensorC* target_ids, TensorC* grads, float* out_loss);
                 TensorC* tensor_rmsnorm_backward(TensorC* dY, TensorC* X, TensorC* weights, float eps);
                 void     tensor_embedding_backward(TensorC* dY, TensorC* token_ids, TensorC* dWeights);
+
+                // ---------------------------------------------------------------
+                // MAMBA / SELECTIVE SSM ENGINE
+                // All tensors are TensorC*; shapes described in tensor.h §21.
+                // ---------------------------------------------------------------
+
+                /* Forward pass — training fills cache, inference streams state. */
+                void tensor_mamba_forward(
+                    TensorC* x,      TensorC* A_log,
+                    TensorC* B_proj, TensorC* C_proj,
+                    TensorC* D_skip, TensorC* delta,
+                    TensorC* state,  TensorC* out,
+                    TensorC* cache,  int training
+                );
+
+                /* Backward pass — all gradient tensors pre-allocated & zeroed by caller. */
+                void tensor_mamba_backward(
+                    TensorC* dout,   TensorC* x,
+                    TensorC* A_log,  TensorC* B_proj, TensorC* C_proj,
+                    TensorC* D_skip, TensorC* delta,
+                    TensorC* h0,     TensorC* cache,
+                    TensorC* dx,     TensorC* dA,
+                    TensorC* dB,     TensorC* dC,
+                    TensorC* dD,     TensorC* ddelta
+                );
+
+                /* Convenience zero-allocators. */
+                TensorC* tensor_mamba_alloc_state(int batch, int d_model, int d_state);
+                TensorC* tensor_mamba_alloc_cache(int batch, int seq_len, int d_model, int d_state);
 
                 // ---------------------------------------------------------------
                 // Columnar DataFrame + ETL  (src/Lib/dataset_io.c)

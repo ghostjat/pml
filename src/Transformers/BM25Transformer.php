@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Pml\Transformers;
 
+use Pml\Interfaces\Stateful;
 use Pml\Interfaces\Transformer;
 use Pml\Tensor;
 use Pml\Dataset;
@@ -17,7 +18,7 @@ use RuntimeException;
  * - 100% Vectorized AVX2 OpenBLAS execution.
  * - Extracts Document Lengths and IDFs natively without traversing PHP arrays.
  */
-final class BM25Transformer implements Transformer
+final class BM25Transformer implements Transformer, Stateful
 {
     private float $k1;
     private float $b;
@@ -87,5 +88,17 @@ final class BM25Transformer implements Transformer
     public function fitted(): bool
     {
         return $this->idf !== null;
+    }
+
+    public function getStateDict(string $prefix = ''): array
+    {
+        $dict = [];
+        if ($this->idf !== null) { $dict[$prefix . 'idf'] = $this->idf; }
+        return $dict;
+    }
+
+    public function loadStateDict(array $dict, string $prefix = ''): void
+    {
+        $this->idf = $dict[$prefix . 'idf'] ?? null;
     }
 }

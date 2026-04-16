@@ -8,7 +8,9 @@ use Pml\Tensor;
 use Pml\Dataset;
 use Pml\Interfaces\Learner;
 use Pml\Interfaces\Persistable;
+use Pml\Interfaces\Stateful;
 use Pml\Interfaces\Verbose;
+use Pml\Lib\SafeTensorsIO;
 use Pml\Losses\Loss;
 use Pml\NeuralNetwork\Optimizers\Optimizer;
 use Psr\Log\LoggerInterface;
@@ -59,7 +61,7 @@ final class Sequential implements Learner, Persistable, Verbose
     public function backward(Tensor $lossGradient): void
     {
         $currentGradient = $lossGradient;
-        for ($i = count($this->layers) - 1; $i >= 0; $i--) {
+        for ($i = \count($this->layers) - 1; $i >= 0; $i--) {
             $currentGradient = $this->layers[$i]->backward($currentGradient);
         }
     }
@@ -70,8 +72,8 @@ final class Sequential implements Learner, Persistable, Verbose
     private function setTrainingMode(bool $mode): void
     {
         foreach ($this->layers as $layer) {
-            if (property_exists($layer, 'training')) {
-                $layer->training = $mode;
+            if ($layer instanceof Layers\HasTrainingMode) {
+                $layer->setTraining($mode);
             }
         }
     }
@@ -93,8 +95,7 @@ final class Sequential implements Learner, Persistable, Verbose
         int $patience = 0,
         float $minDelta = 1e-4
     ): void {
-        $bestLoss = INF;
-        $patienceCounter = 0;
+        $es        = $patience > 0 ? new EarlyStopping($patience, 'min', $minDelta) : null;
         $bestState = [];
 
         for ($epoch = 1; $epoch <= $epochs; $epoch++) {
@@ -141,32 +142,26 @@ final class Sequential implements Learner, Persistable, Verbose
                 $avgValLoss = $valSteps > 0 ? $valLoss / $valSteps : 0.0;
 
                 if ($this->logger !== null) {
-                    $this->logger->info(sprintf("Epoch %d/%d - Train Loss: %.6f, Val Loss: %.6f", $epoch, $epochs, $avgTrainLoss, $avgValLoss));
+                    $this->logger->info(\sprintf("Epoch %d/%d - Train Loss: %.6f, Val Loss: %.6f", $epoch, $epochs, $avgTrainLoss, $avgValLoss));
                 }
 
                 // Check Early Stopping Criteria
-                if ($patience > 0) {
-                    if ($avgValLoss < $bestLoss - $minDelta) {
-                        // Improvement found! Reset patience and snapshot weights.
-                        $bestLoss = $avgValLoss;
-                        $patienceCounter = 0;
+                if ($es !== null) {
+                    $signal = $es->update($avgValLoss);
+                    if ($signal === EarlyStopping::IMPROVED) {
                         $bestState = $this->cloneState();
-                    } else {
-                        // No improvement.
-                        $patienceCounter++;
-                        if ($patienceCounter >= $patience) {
-                            if ($this->logger !== null) {
-                                $this->logger->info(sprintf("Early stopping triggered at Epoch %d (Best Val Loss: %.6f)", $epoch, $bestLoss));
-                            }
-                            $this->restoreState($bestState);
-                            break;
+                    } elseif ($signal === EarlyStopping::STOP) {
+                        if ($this->logger !== null) {
+                            $this->logger->info(\sprintf("Early stopping triggered at Epoch %d (Best Val Loss: %.6f)", $epoch, $es->getBestMetric()));
                         }
+                        $this->restoreState($bestState);
+                        break;
                     }
                 }
             } else {
                 // Basic Logging (No Validation)
                 if ($this->logger !== null) {
-                    $this->logger->info(sprintf("Epoch %d/%d - Train Loss: %.6f", $epoch, $epochs, $avgTrainLoss));
+                    $this->logger->info(\sprintf("Epoch %d/%d - Train Loss: %.6f", $epoch, $epochs, $avgTrainLoss));
                 }
             }
         }
@@ -232,87 +227,178 @@ final class Sequential implements Learner, Persistable, Verbose
     }
 
     // ========================================================================
-    // PERSISTENCE (SSD Serialization)
+    // PERSISTENCE — SafeTensors + JSON bundle (zero Tensor serialisation)
+    //
+    // Saved layout:
+    //   $dir/config.json          — PHP class names, hyperparams, no C-data
+    //   $dir/model.safetensors   — all Stateful tensor weights (HF-compatible)
+    //
+    // PHP serialize() is used ONLY for pure-PHP objects (Loss, Optimizer,
+    // and layer shells that have had every Tensor property stripped out).
+    // C-memory is never passed through PHP serialize().
     // ========================================================================
 
-    public function save(string $filepath): void
+    public function save(string $dir): void
     {
-        if (!is_dir($filepath)) {
-            mkdir($filepath, 0777, true);
+        if (!is_dir($dir)) {
+            mkdir($dir, 0755, true);
         }
 
-        $manifest = [
+        $config = [
+            'class'     => self::class,
             'isTrained' => $this->isTrained,
-            'lossFn'    => serialize($this->lossFn),
-            'optimizer' => serialize($this->optimizer),
-            'layers'    => []
+            // Loss / Optimizer are pure PHP — no C-pointers, safe to serialize.
+            'lossFn'    => base64_encode(serialize($this->lossFn)),
+            'optimizer' => base64_encode(serialize($this->optimizer)),
+            'layers'    => [],
         ];
 
+        $tensorDict = [];   // name → Tensor, fed to SafeTensorsIO::save()
+
         foreach ($this->layers as $i => $layer) {
-            $layerClone = clone $layer;
-            $params = $layer->getParameters();
-            
-            foreach ($params as $name => $tensor) {
-                $tensorFile = "layer_{$i}_{$name}.tns";
-                $tensor->save($filepath . DIRECTORY_SEPARATOR . $tensorFile);
-            }
+            $prefix = "layer_{$i}.";
 
-            $refClass = new \ReflectionClass($layerClone);
-            foreach ($refClass->getProperties() as $prop) {
-                $type = $prop->getType();
-                if ($type instanceof \ReflectionNamedType && $type->getName() === Tensor::class) {
-                    $prop->setAccessible(true);
-                    if ($type->allowsNull()) {
-                        $prop->setValue($layerClone, null);
-                    } else {
-                        $prop->setValue($layerClone, Tensor::zeros(1));
-                    }
+            if ($layer instanceof Stateful) {
+                // Collect live C-memory tensors — zero-copy, just PHP references.
+                foreach ($layer->getStateDict($prefix) as $key => $tensor) {
+                    $tensorDict[$key] = $tensor;
                 }
-            }
 
-            $manifest['layers'][] = serialize($layerClone);
+                if (method_exists($layer, 'getConfig')) {
+                    // Clean path: pure-JSON descriptor, no object serialisation.
+                    $config['layers'][] = [
+                        'type'   => 'stateful_config',
+                        'class'  => \get_class($layer),
+                        'prefix' => $prefix,
+                        'config' => $layer->getConfig(),
+                    ];
+                } else {
+                    // Fallback: serialise a Tensor-stripped shell.
+                    $config['layers'][] = [
+                        'type'   => 'stateful_shell',
+                        'prefix' => $prefix,
+                        'shell'  => base64_encode(serialize(self::stripTensors($layer))),
+                    ];
+                }
+            } else {
+                // Activation / dropout / etc. — only nullable ?Tensor caches,
+                // all reset to null before serialisation by stripTensors().
+                $config['layers'][] = [
+                    'type'  => 'plain',
+                    'shell' => base64_encode(serialize(self::stripTensors($layer))),
+                ];
+            }
         }
 
-        file_put_contents($filepath . DIRECTORY_SEPARATOR . 'manifest.json', json_encode($manifest));
+        // Write tensor weights as a single HF-compatible file.
+        if (!empty($tensorDict)) {
+            SafeTensorsIO::save($dir . \DIRECTORY_SEPARATOR . 'model.safetensors', $tensorDict);
+        }
+
+        file_put_contents(
+            $dir . \DIRECTORY_SEPARATOR . 'config.json',
+            json_encode($config, \JSON_PRETTY_PRINT | \JSON_UNESCAPED_SLASHES)
+        );
     }
 
-    public static function load(string $filepath): self
+    public static function load(string $dir): self
     {
-        if (!is_dir($filepath)) {
-            throw new \RuntimeException("Model directory not found: {$filepath}");
+        if (!is_dir($dir)) {
+            throw new \RuntimeException("Sequential::load — directory not found: '$dir'.");
         }
 
-        $manifestJson = file_get_contents($filepath . DIRECTORY_SEPARATOR . 'manifest.json');
-        if (!$manifestJson) {
-            throw new \RuntimeException("Model manifest is corrupt or missing.");
+        $configPath = $dir . \DIRECTORY_SEPARATOR . 'config.json';
+        $raw = file_get_contents($configPath);
+        if ($raw === false) {
+            throw new \RuntimeException("Sequential::load — config.json missing in '$dir'.");
         }
 
-        $manifest = json_decode($manifestJson, true);
-        $lossFn = unserialize($manifest['lossFn']);
-        $optimizer = unserialize($manifest['optimizer']);
+        /** @var array<string,mixed> $config */
+        $config = json_decode($raw, true, 512, \JSON_THROW_ON_ERROR);
+
+        $lossFn    = unserialize(base64_decode($config['lossFn']));
+        $optimizer = unserialize(base64_decode($config['optimizer']));
+
+        // Load SafeTensors once — all tensor weights are mmap'd (zero-copy).
+        $stPath  = $dir . \DIRECTORY_SEPARATOR . 'model.safetensors';
+        $weights = is_file($stPath) ? SafeTensorsIO::load($stPath) : [];
+
         $layers = [];
+        foreach ($config['layers'] as $layerCfg) {
+            switch ($layerCfg['type']) {
+                case 'stateful_config':
+                    // Reconstruct from pure-JSON descriptor; no unserialize of C-data.
+                    $class = $layerCfg['class'];
+                    /** @var \Pml\NeuralNetwork\Layers\Layer&Stateful $layer */
+                    $layer = $class::fromConfig($layerCfg['config']);
+                    $layer->loadStateDict($weights, $layerCfg['prefix']);
+                    break;
 
-        foreach ($manifest['layers'] as $i => $serializedLayer) {
-            $layer = unserialize($serializedLayer);
-            $refClass = new \ReflectionClass($layer);
-            
-            foreach (glob($filepath . DIRECTORY_SEPARATOR . "layer_{$i}_*.tns") as $tensorFile) {
-                preg_match("/layer_{$i}_(.*)\.tns/", basename($tensorFile), $matches);
-                if ($matches) {
-                    $name = $matches[1];
-                    if ($refClass->hasProperty($name)) {
-                        $prop = $refClass->getProperty($name);
-                        $prop->setAccessible(true);
-                        $prop->setValue($layer, Tensor::load($tensorFile));
+                case 'stateful_shell':
+                    $layer = unserialize(base64_decode($layerCfg['shell']));
+                    if ($layer instanceof Stateful) {
+                        $layer->loadStateDict($weights, $layerCfg['prefix']);
                     }
-                }
+                    break;
+
+                default: // 'plain'
+                    $layer = unserialize(base64_decode($layerCfg['shell']));
+                    break;
             }
             $layers[] = $layer;
         }
 
-        $model = new self($layers, $lossFn, $optimizer);
-        $model->isTrained = $manifest['isTrained'];
+        $model            = new self($layers, $lossFn, $optimizer);
+        $model->isTrained = (bool) $config['isTrained'];
 
         return $model;
+    }
+
+    // -------------------------------------------------------------------------
+    // Helper: produce a clone with all Tensor properties nulled/zeroed so that
+    // PHP serialize() never touches a C-pointer.
+    // -------------------------------------------------------------------------
+
+    /**
+     * Clone $obj and neutralise every Tensor-typed property so that PHP's
+     * serialize() never encounters an \FFI\CData value.
+     *
+     * - Nullable ?Tensor props → set to null via ReflectionProperty::setValue().
+     * - Non-nullable Tensor props → unset() via Closure::bind(), leaving the
+     *   property "uninitialized" (PHP serialises these cleanly; unserialize
+     *   restores them as uninitialized, ready for loadStateDict() to fill in).
+     */
+    private static function stripTensors(object $obj): object
+    {
+        $clone = clone $obj;
+        $class = \get_class($clone);
+
+        foreach ((new \ReflectionClass($clone))->getProperties() as $prop) {
+            $type = $prop->getType();
+            if (!$type instanceof \ReflectionNamedType) {
+                continue;
+            }
+            $typeName = $type->getName();
+            if ($typeName !== Tensor::class && !is_subclass_of($typeName, Tensor::class)) {
+                continue;
+            }
+
+            $prop->setAccessible(true);
+
+            if ($type->allowsNull()) {
+                $prop->setValue($clone, null);
+            } else {
+                // Non-nullable: bypass type enforcement by unsetting via a
+                // closure bound to the object's private scope.
+                $name = $prop->getName();
+                \Closure::bind(
+                    static function (object $o) use ($name): void { unset($o->$name); },
+                    null,
+                    $class
+                )($clone);
+            }
+        }
+
+        return $clone;
     }
 }

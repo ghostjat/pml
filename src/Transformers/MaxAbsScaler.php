@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Pml\Transformers;
 
+use Pml\Interfaces\Stateful;
 use Pml\Interfaces\Transformer;
 use Pml\Tensor;
 use Pml\Dataset;
@@ -17,7 +18,7 @@ use RuntimeException;
  * * JIT & Memory Optimized:
  * - Employs pure C-level `abs()` and `maxAxis()` functions instantly.
  */
-final class MaxAbsScaler implements Transformer
+final class MaxAbsScaler implements Transformer, Stateful
 {
     private ?Tensor $maxAbs = null;
 
@@ -42,5 +43,17 @@ final class MaxAbsScaler implements Transformer
     public function fitted(): bool
     {
         return $this->maxAbs !== null;
+    }
+
+    public function getStateDict(string $prefix = ''): array
+    {
+        $dict = [];
+        if ($this->maxAbs !== null) { $dict[$prefix . 'maxAbs'] = $this->maxAbs; }
+        return $dict;
+    }
+
+    public function loadStateDict(array $dict, string $prefix = ''): void
+    {
+        $this->maxAbs = $dict[$prefix . 'maxAbs'] ?? null;
     }
 }

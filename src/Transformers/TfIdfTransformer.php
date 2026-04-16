@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Pml\Transformers;
 
+use Pml\Interfaces\Stateful;
 use Pml\Interfaces\Transformer;
 use Pml\Tensor;
 use Pml\Dataset;
@@ -16,7 +17,7 @@ use RuntimeException;
  * - 100% pure C-level computation using OpenBLAS Broadcasting.
  * - Extracts Document Frequency (DF) instantly via `greater` masking and `sumAxis`.
  */
-final class TfIdfTransformer implements Transformer
+final class TfIdfTransformer implements Transformer, Stateful
 {
     private ?Tensor $idf = null;
 
@@ -63,5 +64,17 @@ final class TfIdfTransformer implements Transformer
     public function fitted(): bool
     {
         return $this->idf !== null;
+    }
+
+    public function getStateDict(string $prefix = ''): array
+    {
+        $dict = [];
+        if ($this->idf !== null) { $dict[$prefix . 'idf'] = $this->idf; }
+        return $dict;
+    }
+
+    public function loadStateDict(array $dict, string $prefix = ''): void
+    {
+        $this->idf = $dict[$prefix . 'idf'] ?? null;
     }
 }

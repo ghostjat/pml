@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Pml\Estimators\Regression;
 
 use Pml\Interfaces\Learner;
+use Pml\Interfaces\Persistable;
+use Pml\Lib\SafeTensorsIO;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -16,7 +18,7 @@ use RuntimeException;
  * - Executes Gradient Descent rapidly using hardware BLAS.
  * - Extracts absolute L1 Penalty signs natively in C without loops.
  */
-final class Lasso implements Learner
+final class Lasso implements Learner, Persistable
 {
     private float $alpha;
     private int $epochs;
@@ -86,5 +88,54 @@ final class Lasso implements Learner
     public function trained(): bool
     {
         return $this->weights !== null;
+    }
+
+    public function save(string $dir): void
+    {
+        if (!is_dir($dir)) { mkdir($dir, 0755, true); }
+
+        file_put_contents(
+            $dir . \DIRECTORY_SEPARATOR . 'config.json',
+            json_encode([
+                'class'        => self::class,
+                'alpha'        => $this->alpha,
+                'epochs'       => $this->epochs,
+                'learningRate' => $this->learningRate,
+                'batchSize'    => $this->batchSize,
+                'bias'         => $this->bias,
+            ], \JSON_PRETTY_PRINT | \JSON_UNESCAPED_SLASHES)
+        );
+
+        if ($this->weights !== null) {
+            SafeTensorsIO::save(
+                $dir . \DIRECTORY_SEPARATOR . 'model.safetensors',
+                ['weights' => $this->weights]
+            );
+        }
+    }
+
+    public static function load(string $dir): self
+    {
+        $raw = file_get_contents($dir . \DIRECTORY_SEPARATOR . 'config.json');
+        if ($raw === false) {
+            throw new \RuntimeException("Lasso::load — config.json missing in '$dir'.");
+        }
+        $config = json_decode($raw, true, 512, \JSON_THROW_ON_ERROR);
+
+        $instance = new self(
+            (float) $config['alpha'],
+            (int)   $config['epochs'],
+            (float) $config['learningRate'],
+            (int)   $config['batchSize']
+        );
+        $instance->bias = (float) $config['bias'];
+
+        $stPath = $dir . \DIRECTORY_SEPARATOR . 'model.safetensors';
+        if (is_file($stPath)) {
+            $tensors = SafeTensorsIO::load($stPath);
+            $instance->weights = $tensors['weights'] ?? null;
+        }
+
+        return $instance;
     }
 }

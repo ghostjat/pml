@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Pml\Transformers;
 
+use Pml\Interfaces\Stateful;
 use Pml\Interfaces\Transformer;
 use Pml\Tensor;
 use Pml\Dataset;
@@ -16,7 +17,7 @@ use RuntimeException;
  * - Leverages C-level `isnan()` checks and AVX2 `where` masks.
  * - Fills millions of missing values instantly without pulling data into PHP.
  */
-final class Imputer implements Transformer
+final class Imputer implements Transformer, Stateful
 {
     private ?Tensor $fillValues = null;
 
@@ -64,5 +65,17 @@ final class Imputer implements Transformer
     public function fitted(): bool
     {
         return $this->fillValues !== null;
+    }
+
+    public function getStateDict(string $prefix = ''): array
+    {
+        $dict = [];
+        if ($this->fillValues !== null) { $dict[$prefix . 'fillValues'] = $this->fillValues; }
+        return $dict;
+    }
+
+    public function loadStateDict(array $dict, string $prefix = ''): void
+    {
+        $this->fillValues = $dict[$prefix . 'fillValues'] ?? null;
     }
 }

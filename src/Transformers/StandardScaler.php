@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Pml\Transformers;
 
+use Pml\Interfaces\Stateful;
 use Pml\Interfaces\Transformer;
 use Pml\Tensor;
 use Pml\Dataset;
@@ -16,7 +17,7 @@ use RuntimeException;
  * - Computes Variance natively in C using the formula: Var = E[X^2] - E[X]^2.
  * - Applies scaling via zero-allocation In-Place broadcasting.
  */
-final class StandardScaler implements Transformer
+final class StandardScaler implements Transformer, Stateful
 {
     private ?Tensor $means = null;
     private ?Tensor $stds = null;
@@ -55,5 +56,23 @@ final class StandardScaler implements Transformer
     public function fitted(): bool
     {
         return $this->means !== null && $this->stds !== null;
+    }
+
+    public function getStateDict(string $prefix = ''): array
+    {
+        $dict = [];
+        if ($this->means !== null) {
+            $dict[$prefix . 'means'] = $this->means;
+        }
+        if ($this->stds !== null) {
+            $dict[$prefix . 'stds'] = $this->stds;
+        }
+        return $dict;
+    }
+
+    public function loadStateDict(array $dict, string $prefix = ''): void
+    {
+        $this->means = $dict[$prefix . 'means'] ?? null;
+        $this->stds  = $dict[$prefix . 'stds']  ?? null;
     }
 }

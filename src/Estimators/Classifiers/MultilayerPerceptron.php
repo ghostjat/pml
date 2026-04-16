@@ -4,6 +4,7 @@ declare(strict_types=1);
 namespace Pml\Estimators\Classifiers;
 
 use Pml\Interfaces\Learner;
+use Pml\Interfaces\Persistable;
 use Pml\Interfaces\Probabilistic;
 use Pml\Tensor;
 use Pml\Dataset;
@@ -24,7 +25,7 @@ use RuntimeException;
  * - Delegates all computation to Sequential / C-level tensor ops.
  * - One-hot encoding lives in C memory; PHP only reads argmax integer indices.
  */
-final class MultilayerPerceptron implements Learner, Probabilistic
+final class MultilayerPerceptron implements Learner, Probabilistic, Persistable
 {
     private ?Sequential $network = null;
     private array $classMap      = [];
@@ -115,5 +116,54 @@ final class MultilayerPerceptron implements Learner, Probabilistic
     public function trained(): bool
     {
         return $this->network !== null;
+    }
+
+    public function save(string $dir): void
+    {
+        if (!is_dir($dir)) {
+            mkdir($dir, 0755, true);
+        }
+
+        file_put_contents(
+            $dir . \DIRECTORY_SEPARATOR . 'config.json',
+            json_encode([
+                'class'        => self::class,
+                'hidden'       => $this->hidden,
+                'epochs'       => $this->epochs,
+                'batchSize'    => $this->batchSize,
+                'learningRate' => $this->learningRate,
+                'dropout'      => $this->dropout,
+                'classMap'     => $this->classMap,
+                'indexMap'     => $this->indexMap,
+            ], \JSON_PRETTY_PRINT | \JSON_UNESCAPED_SLASHES)
+        );
+
+        if ($this->network !== null) {
+            $this->network->save($dir . \DIRECTORY_SEPARATOR . 'network');
+        }
+    }
+
+    public static function load(string $dir): self
+    {
+        $raw = file_get_contents($dir . \DIRECTORY_SEPARATOR . 'config.json');
+        if ($raw === false) {
+            throw new \RuntimeException("MultilayerPerceptron::load — config.json missing in '$dir'.");
+        }
+        $config = json_decode($raw, true, 512, \JSON_THROW_ON_ERROR);
+
+        $instance = new self(
+            (array) $config['hidden'],
+            (int)   $config['epochs'],
+            (int)   $config['batchSize'],
+            (float) $config['learningRate'],
+            (float) $config['dropout']
+        );
+        $instance->classMap = $config['classMap'];
+        $instance->indexMap = $config['indexMap'];
+        $instance->network  = \Pml\NeuralNetwork\Sequential::load(
+            $dir . \DIRECTORY_SEPARATOR . 'network'
+        );
+
+        return $instance;
     }
 }

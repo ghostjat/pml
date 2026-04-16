@@ -5,8 +5,17 @@ declare(strict_types=1);
 namespace Pml\NeuralNetwork\Layers;
 
 use Pml\Tensor;
+use Pml\Interfaces\Stateful;
 
-final class Dense implements Layer
+/**
+ * Fully-connected linear layer with optional bias.
+ * Implements Stateful for zero-copy SafeTensors checkpoint I/O.
+ *
+ * State-dict keys (relative to prefix):
+ *   "weight" — [outputDim, inputDim] FLOAT32
+ *   "bias"   — [outputDim]           FLOAT32  (omitted when useBias=false)
+ */
+final class Dense implements Layer, Stateful
 {
     private Tensor $weights;
     private ?Tensor $bias;
@@ -125,5 +134,90 @@ final class Dense implements Layer
         }
 
         return $grads;
+    }
+
+    // =========================================================================
+    // Layer config — JSON-safe constructor descriptor for checkpoint rebuild
+    // =========================================================================
+
+    /**
+     * Return the constructor arguments needed to recreate this layer.
+     * Shapes are read from the live C-structs; no PHP copies, no FFI.
+     */
+    public function getConfig(): array
+    {
+        return [
+            'inputDim'  => $this->weights->ptr->shape[1],
+            'outputDim' => $this->weights->ptr->shape[0],
+            'useBias'   => $this->bias !== null,
+        ];
+    }
+
+    /**
+     * Reconstruct a Dense layer from a config array (as stored in config.json).
+     * The returned layer has freshly initialised random weights; call
+     * loadStateDict() immediately after to replace them with checkpoint data.
+     */
+    public static function fromConfig(array $config): static
+    {
+        return new static(
+            (int) $config['inputDim'],
+            (int) $config['outputDim'],
+            (bool) $config['useBias']
+        );
+    }
+
+    // =========================================================================
+    // Stateful — SafeTensors checkpoint interface
+    // =========================================================================
+
+    /**
+     * Export live C-memory tensors as a flat name → Tensor map.
+     * No copies: returns references to the actual weight/bias C-buffers.
+     *
+     * {@inheritdoc}
+     */
+    public function getStateDict(string $prefix = ''): array
+    {
+        $dict = [$prefix . 'weight' => $this->weights];
+
+        if ($this->bias !== null) {
+            $dict[$prefix . 'bias'] = $this->bias;
+        }
+
+        return $dict;
+    }
+
+    /**
+     * O(1) weight ingestion: swaps internal Tensor references to the provided
+     * (typically mmap-backed) tensors.  No memcpy.
+     *
+     * After loading, gradient buffers (dW, dbias) are reinitialised to the
+     * correct shape so the layer is immediately ready for both inference and
+     * fine-tuning without any further setup.
+     *
+     * {@inheritdoc}
+     */
+    public function loadStateDict(array $dict, string $prefix = ''): void
+    {
+        $wKey = $prefix . 'weight';
+        if (isset($dict[$wKey])) {
+            $this->weights = $dict[$wKey];
+            // Reinitialise gradient buffer to match new weight shape
+            $outDim = $this->weights->ptr->shape[0];
+            $inDim  = $this->weights->ptr->shape[1];
+            $this->dW = Tensor::zeros($outDim, $inDim);
+            // Refresh capability flags (class is the same, but good hygiene)
+            $this->hasMatmulInto = method_exists($this->dW, 'matmulInto');
+        }
+
+        $bKey = $prefix . 'bias';
+        if (isset($dict[$bKey])) {
+            $this->bias   = $dict[$bKey];
+            $this->dbias  = Tensor::zeros($this->bias->ptr->shape[0]);
+            $this->hasSumInto = method_exists($this->dbias, 'sumAxisInto');
+        } elseif (!array_key_exists($bKey, $dict) && $this->bias !== null) {
+            // Key absent but layer was constructed with bias: leave existing bias
+        }
     }
 }

@@ -55,49 +55,72 @@ final class DecisionTreeRegressor implements Learner
     private function buildTree(Tensor $x, Tensor $y, int $depth): array
     {
         $n = $y->size();
-        
-        // Fast C-level average for the leaf node value
+
+        // Fast C-level mean for the leaf node value.
         $leafValue = $y->mean();
 
-        // Stopping Criteria
+        // Stopping criteria: max depth or minimum samples.
         if ($depth >= $this->maxDepth || $n < $this->minSamplesSplit) {
             return ['value' => $leafValue];
         }
 
         $split = $this->findBestSplit($x, $y);
-        
-        // If no split improves the variance, become a leaf
-        if (!$split) {
+
+        if ($split === null) {
             return ['value' => $leafValue];
         }
 
-        // --- CRITICAL OPTIMIZATION: Hardware Split Routing ---
-        // Replaces the O(N) PHP foreach loop with an AVX2 C-kernel.
-        // Directly returns the Left and Right INT32 index tensors.
-        [$leftT, $rightT] = $split['mask']->splitIndices();
-        
-        // Eagerly clean up the mask pointer to free memory pool block
-        unset($split['mask']); 
+        // Extract the C boolean mask to a PHP array once — avoids repeated FFI
+        // round-trips during routing; booleanIndex is unsafe on 2D $x matrices.
+        $maskArray = $split['mask']->toFlatArray();
+        unset($split['mask']);          // Return mask C-memory to pool immediately.
+
+        $leftIdx  = [];
+        $rightIdx = [];
+        foreach ($maskArray as $i => $val) {
+            if ($val > 0.5) {
+                $leftIdx[]  = $i;
+            } else {
+                $rightIdx[] = $i;
+            }
+        }
+        unset($maskArray);
 
         $node = [
             'feature'   => $split['feature'],
-            'threshold' => $split['threshold']
+            'threshold' => $split['threshold'],
         ];
 
-        // Zero-copy view extraction via tensor_take
-        $node['left']  = $this->buildTree($x->take($leftT, 0), $y->take($leftT, 0), $depth + 1);
-        $node['right'] = $this->buildTree($x->take($rightT, 0), $y->take($rightT, 0), $depth + 1);
+        // FLOAT32 index tensors (fromArray defaults to F32 — required by tensor_take).
+        $leftT  = Tensor::fromArray($leftIdx);
+        unset($leftIdx);
+        $xLeft  = $x->take($leftT, 0);
+        $yLeft  = $y->take($leftT, 0);
+        unset($leftT);
+
+        $rightT = Tensor::fromArray($rightIdx);
+        unset($rightIdx);
+        $xRight = $x->take($rightT, 0);
+        $yRight = $y->take($rightT, 0);
+        unset($rightT);
+
+        // Recurse left; free branch data the instant recursion returns.
+        $node['left'] = $this->buildTree($xLeft, $yLeft, $depth + 1);
+        unset($xLeft, $yLeft);
+
+        $node['right'] = $this->buildTree($xRight, $yRight, $depth + 1);
+        unset($xRight, $yRight);
 
         return $node;
     }
 
     private function findBestSplit(Tensor $x, Tensor $y): ?array
     {
-        $bestCost = INF;
+        $bestCost  = INF;
         $bestSplit = null;
-        $n = $y->size();
+        $n         = $y->size();
 
-        // Feature Bagging (Colsample_bytree)
+        // Feature bagging (colsample_bytree for GBM integration).
         $features = range(0, $this->nFeatures - 1);
         if ($this->maxFeatures !== null) {
             shuffle($features);
@@ -105,28 +128,26 @@ final class DecisionTreeRegressor implements Learner
         }
 
         foreach ($features as $feature) {
+            // Zero-copy column view — points into existing C buffer, no allocation.
             $col = $x->col($feature);
             $min = $col->min();
             $max = $col->max();
 
-            if ($min === $max) {
+            if ($min >= $max) {
                 unset($col);
                 continue;
             }
 
-            // Randomized Split Search: Evaluate evenly spaced thresholds natively in C.
-            $thresholds = Tensor::linspace($min, $max, 10)->toFlatArray();
-            $numThresholds = count($thresholds);
+            // Pure-PHP threshold arithmetic: zero C allocations for threshold values.
+            // 8 interior points uniformly spaced between min and max (excludes endpoints).
+            $step = ($max - $min) / 9.0;
 
-            // Skip min/max boundaries
-            for ($i = 1; $i < $numThresholds - 1; $i++) {
-                $threshold = $thresholds[$i];
+            for ($t = 1; $t <= 8; $t++) {
+                $threshold = $min + $step * $t;
 
-                // --- CRITICAL OPTIMIZATION: Scalar SIMD Comparison ---
-                // Replaces Tensor::zeros($n)->addScalarInplace() with an O(1) alloc scalar kernel.
-                $mask = $col->lessScalar($threshold);
-
-                $leftY = $y->booleanIndex($mask);
+                // O(1) scalar comparison kernel — no threshold Tensor allocated.
+                $mask  = $col->lessScalar($threshold);
+                $leftY = $y->booleanIndex($mask);   // Safe: $y is 1D targets.
                 $nLeft = $leftY->size();
 
                 if ($nLeft === 0 || $nLeft === $n) {
@@ -134,31 +155,34 @@ final class DecisionTreeRegressor implements Learner
                     continue;
                 }
 
+                // Avoid a second FFI call for $nRight — pure PHP arithmetic.
+                $nRight    = $n - $nLeft;
                 $rightMask = $mask->logicalNot();
-                $rightY = $y->booleanIndex($rightMask);
-                $nRight = $rightY->size();
+                $rightY    = $y->booleanIndex($rightMask);
+                unset($rightMask);              // Pool immediately; not needed again.
 
-                // Cost is measured by the weighted Mean Squared Error (Variance) of the child nodes
-                // ->variance() executes entirely in OpenBLAS C-memory
-                $varLeft = $leftY->variance();
-                $varRight = $rightY->variance();
-
-                $cost = ($nLeft / $n) * $varLeft + ($nRight / $n) * $varRight;
+                // Weighted variance reduction — both variance() calls run in C/OpenBLAS.
+                $cost = ($nLeft  / $n) * $leftY->variance()
+                      + ($nRight / $n) * $rightY->variance();
+                unset($leftY, $rightY);         // Pool label slices the instant cost is done.
 
                 if ($cost < $bestCost) {
-                    $bestCost = $cost;
+                    // Free the PREVIOUS best mask before overwriting to avoid leaking
+                    // its C buffer until PHP's deferred GC runs.
+                    if ($bestSplit !== null) {
+                        unset($bestSplit['mask']);
+                    }
+                    $bestCost  = $cost;
                     $bestSplit = [
                         'feature'   => $feature,
                         'threshold' => $threshold,
-                        'mask'      => $mask // Keep only the best mask
+                        'mask'      => $mask,   // Transfer ownership; do NOT unset here.
                     ];
                 } else {
-                    // Eager garbage collection to prevent memory ballooning
-                    unset($mask);
+                    unset($mask);               // Not the best — return C-memory to pool now.
                 }
-                
-                unset($leftY, $rightMask, $rightY);
             }
+
             unset($col);
         }
 
@@ -237,5 +261,38 @@ final class DecisionTreeRegressor implements Learner
     public function trained(): bool
     {
         return $this->tree !== null;
+    }
+
+    /**
+     * Export the pure-PHP tree structure for external persistence.
+     * The returned array contains no FFI\CData — safe to JSON-encode.
+     */
+    public function exportPhpTree(): array
+    {
+        return [
+            'tree'            => $this->tree,
+            'nFeatures'       => $this->nFeatures,
+            'maxDepth'        => $this->maxDepth,
+            'minSamplesSplit' => $this->minSamplesSplit,
+            'maxFeatures'     => $this->maxFeatures,
+        ];
+    }
+
+    /**
+     * Reconstruct a trained instance from an exported PHP tree.
+     * Rebuilds the FFI HardwareNode array internally.
+     */
+    public static function fromPhpTree(array $data): self
+    {
+        $instance = new self(
+            (int) $data['maxDepth'],
+            (int) $data['minSamplesSplit'],
+            isset($data['maxFeatures']) ? (int) $data['maxFeatures'] : null
+        );
+        $instance->nFeatures = (int) $data['nFeatures'];
+        $instance->tree      = $data['tree'];
+        $instance->buildHardwareNodes();
+
+        return $instance;
     }
 }

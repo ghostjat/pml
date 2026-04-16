@@ -378,7 +378,7 @@ Tensor* tensor_swiglu(Tensor* gate, Tensor* up);
  * grads:      [batch, vocab] FLOAT32   pre-allocated; receives (probs - one_hot)
  * out_loss:   receives mean loss over the batch                            */
 void tensor_fused_cross_entropy_loss_and_grad(Tensor* logits, Tensor* target_ids,
-                                               Tensor* grads,  float*  out_loss);
+                                               Tensor* grads,  float* out_loss);
 
 /* RMSNorm backward: dx_j = (1/r)*w_j*dy_j - x_j*S/(d*r³).
  * dY:      [batch, d] upstream gradient
@@ -392,5 +392,51 @@ Tensor* tensor_rmsnorm_backward(Tensor* dY, Tensor* X, Tensor* weights, float ep
  * token_ids: [seq_len]            INT32 token indices
  * dWeights:  [vocab, embed_dim]   gradient accumulator (caller must zero first) */
 void tensor_embedding_backward(Tensor* dY, Tensor* token_ids, Tensor* dWeights);
+
+// ============================================================================
+// 21. MAMBA / SELECTIVE SSM ENGINE
+//
+// Shapes (B=batch, T=seq_len, D=d_model, N=d_state):
+//   x        [B,T,D]    input sequence                        FLOAT32
+//   A_log    [D,N]      log(-eigenvalues), must be ≤ 0        FLOAT32
+//   B_proj   [B,T,N]    input-dependent B projection          FLOAT32
+//   C_proj   [B,T,N]    input-dependent C projection          FLOAT32
+//   D_skip   [D]        skip-connection weight (NULL=off)     FLOAT32
+//   delta    [B,T,D]    discretization step (post-softplus)   FLOAT32
+//   state    [B,D,N]    recurrent state: initial in, final out FLOAT32
+//   out      [B,T,D]    pre-allocated output                  FLOAT32
+//   cache    [B,D,T,N]  per-step state snapshots (NULL=infer) FLOAT32
+//
+// ZOH recurrence:
+//   Ā[t,d,n] = exp(delta[b,t,d] * A_log[d,n])          (0 < Ā ≤ 1 when A_log ≤ 0)
+//   h[t,d,n] = Ā*h[t-1,d,n] + delta[b,t,d]*B[b,t,n]*x[b,t,d]
+//   y[b,t,d] = Σ_n C[b,t,n]*h[t,d,n]  +  D_skip[d]*x[b,t,d]
+//
+// Parallelism: OpenMP collapse(B,D); T is sequential (serial recurrence).
+//              Automatic tile-scan kicks in when B*D < nthreads*4 && T≥128.
+// SIMD:        AVX512 > AVX2 over the N-dimension; scalar fallback.
+// ============================================================================
+
+/* Fused forward — training fills cache, inference streams state in-place. */
+void tensor_mamba_forward(Tensor* x,      Tensor* A_log,
+                          Tensor* B_proj, Tensor* C_proj,
+                          Tensor* D_skip, Tensor* delta,
+                          Tensor* state,  Tensor* out,
+                          Tensor* cache,  int training);
+
+/* Fused backward — all gradient outputs are pre-allocated and zeroed by
+ * the caller (dA and dD use += accumulation across steps).
+ * h0: [B,D,N] initial state saved with tensor_copy() before forward(). */
+void tensor_mamba_backward(Tensor* dout,   Tensor* x,
+                           Tensor* A_log,  Tensor* B_proj, Tensor* C_proj,
+                           Tensor* D_skip, Tensor* delta,
+                           Tensor* h0,     Tensor* cache,
+                           Tensor* dx,     Tensor* dA,
+                           Tensor* dB,     Tensor* dC,
+                           Tensor* dD,     Tensor* ddelta);
+
+/* Convenience zero-allocators for state and training cache tensors. */
+Tensor* tensor_mamba_alloc_state(int batch, int d_model, int d_state);
+Tensor* tensor_mamba_alloc_cache(int batch, int seq_len, int d_model, int d_state);
 
 #endif // TENSOR_H

@@ -3,6 +3,7 @@ declare(strict_types=1);
 
 namespace Pml\Transformers;
 
+use Pml\Interfaces\Stateful;
 use Pml\Interfaces\Transformer;
 use Pml\Tensor;
 use Pml\Dataset;
@@ -12,7 +13,7 @@ use RuntimeException;
  * Z-Scale Standardizer
  * Now updated with a $center parameter to safely handle sparse TF-IDF matrices!
  */
-final class ZScaleStandardizer implements Transformer
+final class ZScaleStandardizer implements Transformer, Stateful
 {
     private bool $center;
     private ?Tensor $means = null;
@@ -61,4 +62,18 @@ final class ZScaleStandardizer implements Transformer
     }
 
     public function fitted(): bool { return $this->means !== null && $this->stds !== null; }
+
+    public function getStateDict(string $prefix = ''): array
+    {
+        $dict = [];
+        if ($this->means !== null) { $dict[$prefix . 'means'] = $this->means; }
+        if ($this->stds  !== null) { $dict[$prefix . 'stds']  = $this->stds; }
+        return $dict;
+    }
+
+    public function loadStateDict(array $dict, string $prefix = ''): void
+    {
+        $this->means = $dict[$prefix . 'means'] ?? null;
+        $this->stds  = $dict[$prefix . 'stds']  ?? null;
+    }
 }

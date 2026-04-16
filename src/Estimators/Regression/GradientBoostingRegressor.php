@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Pml\Estimators\Regression;
 
 use Pml\Interfaces\Learner;
+use Pml\Interfaces\Persistable;
 use Pml\Tensor;
 use Pml\Dataset;
 use Pml\Estimators\Regression\DecisionTreeRegressor;
@@ -17,7 +18,7 @@ use RuntimeException;
  * - Employs purely In-Place C-tensor accumulation ($F->addInplace) to prevent OOM errors.
  * - Eagerly reuses a pre-allocated Residual buffer to eliminate N-sized allocations per tree.
  */
-final class GradientBoostingRegressor implements Learner
+final class GradientBoostingRegressor implements Learner, Persistable
 {
     private int $nEstimators;
     private float $learningRate;
@@ -65,7 +66,8 @@ final class GradientBoostingRegressor implements Learner
             
             // 2. Compute pseudo-residuals in-place: residuals = y - F(x)
             // Copies fresh targets into the buffer and subtracts predictions natively in C.
-            $residuals->copyFrom($y)->subInplace($F);
+            $residuals->copyFrom($y);
+            $residuals->subInplace($F);
 
             if ($this->subsample < 1.0) {
                 // Stochastic Gradient Boosting
@@ -139,5 +141,63 @@ final class GradientBoostingRegressor implements Learner
     public function trained(): bool
     {
         return !empty($this->trees);
+    }
+
+    public function save(string $dir): void
+    {
+        if (!is_dir($dir)) { mkdir($dir, 0755, true); }
+
+        $treeData = array_map(
+            static fn(DecisionTreeRegressor $t) => $t->exportPhpTree(),
+            $this->trees
+        );
+
+        file_put_contents(
+            $dir . \DIRECTORY_SEPARATOR . 'config.json',
+            json_encode([
+                'class'             => self::class,
+                'nEstimators'       => $this->nEstimators,
+                'learningRate'      => $this->learningRate,
+                'maxDepth'          => $this->maxDepth,
+                'subsample'         => $this->subsample,
+                'maxFeatures'       => $this->maxFeatures,
+                'initialPrediction' => $this->initialPrediction,
+            ], \JSON_PRETTY_PRINT | \JSON_UNESCAPED_SLASHES)
+        );
+
+        file_put_contents(
+            $dir . \DIRECTORY_SEPARATOR . 'trees.json',
+            json_encode($treeData, \JSON_UNESCAPED_SLASHES)
+        );
+    }
+
+    public static function load(string $dir): self
+    {
+        $raw = file_get_contents($dir . \DIRECTORY_SEPARATOR . 'config.json');
+        if ($raw === false) {
+            throw new \RuntimeException("GradientBoostingRegressor::load — config.json missing in '$dir'.");
+        }
+        $config = json_decode($raw, true, 512, \JSON_THROW_ON_ERROR);
+
+        $treesRaw = file_get_contents($dir . \DIRECTORY_SEPARATOR . 'trees.json');
+        if ($treesRaw === false) {
+            throw new \RuntimeException("GradientBoostingRegressor::load — trees.json missing in '$dir'.");
+        }
+        $treeData = json_decode($treesRaw, true, 512, \JSON_THROW_ON_ERROR);
+
+        $instance = new self(
+            (int)   $config['nEstimators'],
+            (float) $config['learningRate'],
+            (int)   $config['maxDepth'],
+            (float) $config['subsample'],
+            isset($config['maxFeatures']) ? (int) $config['maxFeatures'] : null
+        );
+        $instance->initialPrediction = (float) $config['initialPrediction'];
+
+        foreach ($treeData as $data) {
+            $instance->trees[] = DecisionTreeRegressor::fromPhpTree($data);
+        }
+
+        return $instance;
     }
 }

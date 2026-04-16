@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Pml\Estimators\Decomposition;
 
 use Pml\Interfaces\Learner;
+use Pml\Interfaces\Persistable;
+use Pml\Lib\SafeTensorsIO;
 use Pml\Tensor;
 use Pml\Dataset;
 
@@ -15,7 +17,7 @@ use Pml\Dataset;
  * - Direct LAPACKE SVD extraction.
  * - Zero-Copy slicing for principal components.
  */
-final class PrincipalComponentAnalysis implements Learner
+final class PrincipalComponentAnalysis implements Learner, Persistable
 {
     private int $nComponents;
     private ?Tensor $components = null;
@@ -64,5 +66,45 @@ final class PrincipalComponentAnalysis implements Learner
     public function trained(): bool
     {
         return $this->components !== null;
+    }
+
+    public function save(string $dir): void
+    {
+        if (!is_dir($dir)) { mkdir($dir, 0755, true); }
+
+        file_put_contents(
+            $dir . \DIRECTORY_SEPARATOR . 'config.json',
+            json_encode(
+                ['class' => self::class, 'nComponents' => $this->nComponents],
+                \JSON_PRETTY_PRINT
+            )
+        );
+
+        if ($this->components !== null) {
+            SafeTensorsIO::save(
+                $dir . \DIRECTORY_SEPARATOR . 'model.safetensors',
+                ['components' => $this->components, 'means' => $this->means]
+            );
+        }
+    }
+
+    public static function load(string $dir): self
+    {
+        $raw = file_get_contents($dir . \DIRECTORY_SEPARATOR . 'config.json');
+        if ($raw === false) {
+            throw new \RuntimeException("PrincipalComponentAnalysis::load — config.json missing in '$dir'.");
+        }
+        $config = json_decode($raw, true, 512, \JSON_THROW_ON_ERROR);
+
+        $instance = new self((int) $config['nComponents']);
+
+        $stPath = $dir . \DIRECTORY_SEPARATOR . 'model.safetensors';
+        if (is_file($stPath)) {
+            $tensors = SafeTensorsIO::load($stPath);
+            $instance->components = $tensors['components'] ?? null;
+            $instance->means      = $tensors['means']      ?? null;
+        }
+
+        return $instance;
     }
 }

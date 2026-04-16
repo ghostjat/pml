@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Pml\Estimators\Regression;
 
 use Pml\Interfaces\Learner;
+use Pml\Interfaces\Persistable;
+use Pml\Lib\SafeTensorsIO;
 use Pml\Tensor;
 use Pml\Dataset;
 
@@ -15,7 +17,7 @@ use Pml\Dataset;
  * - 100% Closed-form C execution.
  * - Zero PHP iteration overhead.
  */
-final class LinearRegression implements Learner
+final class LinearRegression implements Learner, Persistable
 {
     private ?Tensor $weights = null;
 
@@ -54,5 +56,35 @@ final class LinearRegression implements Learner
     public function trained(): bool
     {
         return $this->weights !== null;
+    }
+
+    public function save(string $dir): void
+    {
+        if (!is_dir($dir)) { mkdir($dir, 0755, true); }
+
+        file_put_contents(
+            $dir . \DIRECTORY_SEPARATOR . 'config.json',
+            json_encode(['class' => self::class], \JSON_PRETTY_PRINT)
+        );
+
+        if ($this->weights !== null) {
+            SafeTensorsIO::save(
+                $dir . \DIRECTORY_SEPARATOR . 'model.safetensors',
+                ['weights' => $this->weights]
+            );
+        }
+    }
+
+    public static function load(string $dir): self
+    {
+        $instance = new self();
+
+        $stPath = $dir . \DIRECTORY_SEPARATOR . 'model.safetensors';
+        if (is_file($stPath)) {
+            $tensors = SafeTensorsIO::load($stPath);
+            $instance->weights = $tensors['weights'] ?? null;
+        }
+
+        return $instance;
     }
 }

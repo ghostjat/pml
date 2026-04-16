@@ -5,8 +5,10 @@ declare(strict_types=1);
 namespace Pml;
 
 use Pml\Interfaces\Learner;
-use Pml\Interfaces\Transformer;
 use Pml\Interfaces\Persistable;
+use Pml\Interfaces\Stateful;
+use Pml\Interfaces\Transformer;
+use Pml\Lib\SafeTensorsIO;
 use Pml\Tensor;
 use Pml\Dataset;
 
@@ -69,44 +71,137 @@ final class Pipeline implements Learner, Persistable
     }
 
     // ========================================================================
-    // PERSISTENCE
+    // PERSISTENCE — SafeTensors + JSON bundle
+    //
+    // Saved layout:
+    //   $dir/config.json                — class names, no C-data
+    //   $dir/transformers.safetensors  — Stateful transformer tensors (if any)
+    //   $dir/estimator/                — estimator sub-directory (Persistable)
+    //
+    // Transformers are overwhelmingly pure-PHP (scalers, encoders, etc.).
+    // Their PHP object shells are serialised directly; any that implement
+    // Stateful have their Tensor state extracted to SafeTensors first.
     // ========================================================================
 
-    public function save(string $filepath): void
+    public function save(string $dir): void
     {
-        if (!is_dir($filepath)) {
-            mkdir($filepath, 0777, true);
+        if (!is_dir($dir)) {
+            mkdir($dir, 0755, true);
         }
 
-        // Delegate estimator saving if it supports persistence
+        $transformerCfg = [];
+        $tensorDict     = [];
+
+        foreach ($this->transformers as $i => $transformer) {
+            $prefix = "transformer_{$i}.";
+
+            if ($transformer instanceof Stateful) {
+                foreach ($transformer->getStateDict($prefix) as $key => $tensor) {
+                    $tensorDict[$key] = $tensor;
+                }
+                $transformerCfg[] = [
+                    'stateful' => true,
+                    'prefix'   => $prefix,
+                    'shell'    => base64_encode(serialize(self::stripTensors($transformer))),
+                ];
+            } else {
+                // Strip any Tensor properties (e.g. fitted scalers hold live C-buffers)
+                // before serialising — FFI\CData must never reach serialize().
+                $transformerCfg[] = [
+                    'stateful' => false,
+                    'shell'    => base64_encode(serialize(self::stripTensors($transformer))),
+                ];
+            }
+        }
+
+        if (!empty($tensorDict)) {
+            SafeTensorsIO::save(
+                $dir . \DIRECTORY_SEPARATOR . 'transformers.safetensors',
+                $tensorDict
+            );
+        }
+
         if ($this->estimator instanceof Persistable) {
-            $this->estimator->save($filepath . DIRECTORY_SEPARATOR . 'estimator');
+            $this->estimator->save($dir . \DIRECTORY_SEPARATOR . 'estimator');
         }
 
-        // Strip C-Pointers and Serialize the Pipeline wrapper
-        // Note: Production implementation would safely detach $this->min, $this->categories etc.
-        $manifest = [
-            'transformers' => serialize($this->transformers),
-            'estimator_class' => get_class($this->estimator)
+        $config = [
+            'class'           => self::class,
+            'estimator_class' => \get_class($this->estimator),
+            'transformers'    => $transformerCfg,
         ];
 
-        file_put_contents($filepath . DIRECTORY_SEPARATOR . 'pipeline.json', json_encode($manifest));
+        file_put_contents(
+            $dir . \DIRECTORY_SEPARATOR . 'config.json',
+            json_encode($config, \JSON_PRETTY_PRINT | \JSON_UNESCAPED_SLASHES)
+        );
     }
 
-    public static function load(string $filepath): self
+    public static function load(string $dir): self
     {
-        $manifestJson = file_get_contents($filepath . DIRECTORY_SEPARATOR . 'pipeline.json');
-        $manifest = json_decode($manifestJson, true);
-
-        $transformers = unserialize($manifest['transformers']);
-        
-        $estimatorClass = $manifest['estimator_class'];
-        if (is_subclass_of($estimatorClass, Persistable::class)) {
-            $estimator = $estimatorClass::load($filepath . DIRECTORY_SEPARATOR . 'estimator');
-        } else {
-            throw new \RuntimeException("Underlying estimator does not support loading.");
+        $raw = file_get_contents($dir . \DIRECTORY_SEPARATOR . 'config.json');
+        if ($raw === false) {
+            throw new \RuntimeException("Pipeline::load — config.json missing in '$dir'.");
         }
 
+        /** @var array<string,mixed> $config */
+        $config = json_decode($raw, true, 512, \JSON_THROW_ON_ERROR);
+
+        // Load Stateful transformer tensors once (zero-copy mmap).
+        $stPath  = $dir . \DIRECTORY_SEPARATOR . 'transformers.safetensors';
+        $weights = is_file($stPath) ? SafeTensorsIO::load($stPath) : [];
+
+        $transformers = [];
+        foreach ($config['transformers'] as $cfg) {
+            $transformer = unserialize(base64_decode($cfg['shell']));
+            if ($cfg['stateful'] && $transformer instanceof Stateful) {
+                $transformer->loadStateDict($weights, $cfg['prefix']);
+            }
+            $transformers[] = $transformer;
+        }
+
+        $estimatorClass = $config['estimator_class'];
+        if (!is_subclass_of($estimatorClass, Persistable::class)) {
+            throw new \RuntimeException(
+                "Pipeline::load — estimator '$estimatorClass' does not implement Persistable."
+            );
+        }
+        $estimator = $estimatorClass::load($dir . \DIRECTORY_SEPARATOR . 'estimator');
+
         return new self($transformers, $estimator);
+    }
+
+    // -------------------------------------------------------------------------
+
+    private static function stripTensors(object $obj): object
+    {
+        $clone = clone $obj;
+        $class = \get_class($clone);
+
+        foreach ((new \ReflectionClass($clone))->getProperties() as $prop) {
+            $type = $prop->getType();
+            if (!$type instanceof \ReflectionNamedType) {
+                continue;
+            }
+            $typeName = $type->getName();
+            if ($typeName !== Tensor::class && !is_subclass_of($typeName, Tensor::class)) {
+                continue;
+            }
+
+            $prop->setAccessible(true);
+
+            if ($type->allowsNull()) {
+                $prop->setValue($clone, null);
+            } else {
+                $name = $prop->getName();
+                \Closure::bind(
+                    static function (object $o) use ($name): void { unset($o->$name); },
+                    null,
+                    $class
+                )($clone);
+            }
+        }
+
+        return $clone;
     }
 }
