@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Pml\Estimators\Regression;
 
 use Pml\Interfaces\Learner;
+use Pml\Interfaces\Persistable;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -17,7 +18,7 @@ use RuntimeException;
  * - Hardware Split Routing avoids N-sized PHP array evaluations.
  * - Scalar comparison kernels avoid temporary tensor allocations.
  */
-final class DecisionTreeRegressor implements Learner
+final class DecisionTreeRegressor implements Learner, Persistable
 {
     private int $maxDepth;
     private int $minSamplesSplit;
@@ -294,5 +295,16 @@ final class DecisionTreeRegressor implements Learner
         $instance->buildHardwareNodes();
 
         return $instance;
+    }
+
+    public function save(string $dir): void
+    {
+        is_dir($dir) || mkdir($dir, 0755, true);
+        file_put_contents($dir . '/tree.json', json_encode($this->exportPhpTree()));
+    }
+
+    public static function load(string $dir): self
+    {
+        return self::fromPhpTree(json_decode(file_get_contents($dir . '/tree.json'), true));
     }
 }

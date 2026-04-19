@@ -6,6 +6,8 @@ namespace Pml\Estimators\Clusterers;
 
 use Pml\Interfaces\Learner;
 use Pml\Interfaces\Probabilistic;
+use Pml\Interfaces\Persistable;
+use Pml\Lib\SafeTensorsIO;
 use Pml\Tensor;
 use Pml\Dataset;
 use Pml\Estimators\Clusterers\Seeders\PlusPlus;
@@ -18,7 +20,7 @@ use RuntimeException;
  * - Calculates probabilities safely without floating-point overflow via the `Log-Sum-Exp` hardware trick.
  * - Covariances and Means update concurrently via zero-copy subset slicing and OpenBLAS matrix broadcasting.
  */
-final class GaussianMixture implements Learner, Probabilistic
+final class GaussianMixture implements Learner, Probabilistic, Persistable
 {
     private int $k;
     private int $maxIter;
@@ -154,5 +156,24 @@ final class GaussianMixture implements Learner, Probabilistic
     public function trained(): bool
     {
         return $this->means !== null;
+    }
+
+    public function save(string $dir): void
+    {
+        is_dir($dir) || mkdir($dir, 0755, true);
+        file_put_contents($dir . '/config.json', json_encode(['k'=>$this->k,'maxIter'=>$this->maxIter,'tolerance'=>$this->tolerance,'priors'=>$this->priors]));
+        $tensors = [];
+        if ($this->means !== null) $tensors['means'] = $this->means;
+        if ($this->vars  !== null) $tensors['vars']  = $this->vars;
+        if ($tensors) SafeTensorsIO::save($dir . '/model.safetensors', $tensors);
+    }
+    public static function load(string $dir): self
+    {
+        $c = json_decode(file_get_contents($dir . '/config.json'), true);
+        $i = new self((int)$c['k'], (int)$c['maxIter'], (float)$c['tolerance']);
+        $i->priors = $c['priors'] ?? [];
+        $stPath = $dir . '/model.safetensors';
+        if (is_file($stPath)) { $t = SafeTensorsIO::load($stPath); $i->means = $t['means'] ?? null; $i->vars = $t['vars'] ?? null; }
+        return $i;
     }
 }

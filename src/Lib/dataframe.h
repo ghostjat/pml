@@ -39,7 +39,24 @@ typedef enum {
 #define DF_FIELD_SCRATCH 4096
 
 /* ============================================================================
- * 2.  COLUMN STRUCT
+ * 2.  HASH TABLE  (used by DFColumn.cat_map and NLP Vocab)
+ * ========================================================================== */
+
+typedef struct HashEntry {
+    const char       *key;
+    size_t            len;
+    int               value;
+    struct HashEntry *next;
+} HashEntry;
+
+typedef struct {
+    HashEntry **buckets;
+    size_t      size;
+    size_t      capacity;
+} HashTable;
+
+/* ============================================================================
+ * 3.  COLUMN STRUCT
  *
  * `data`       : heap-allocated column buffer.
  *   FLOAT32    → float[n_rows]
@@ -49,15 +66,18 @@ typedef enum {
  * `categories` : STRING columns only — interned distinct string values.
  * `n_categories`: number of distinct category strings.
  * `_cat_cap`   : internal capacity of `categories`; not visible to PHP.
+ * `cat_map`    : STRING columns only — O(1) hash-map from string → category
+ *                index. Eliminates the O(n²) linear scan in _cat_intern.
  * ========================================================================== */
 
 typedef struct {
-    char     name[DF_MAX_COL_NAME];
-    DFDType  dtype;
-    void    *data;          /* float* | int32_t*                                */
-    char   **categories;    /* STRING only: categories[0..n_categories)         */
-    int32_t  n_categories;  /* STRING only: distinct value count                */
-    int32_t  _cat_cap;      /* internal: allocated capacity of categories[]     */
+    char      name[DF_MAX_COL_NAME];
+    DFDType   dtype;
+    void     *data;          /* float* | int32_t*                               */
+    char    **categories;    /* STRING only: categories[0..n_categories)        */
+    int32_t   n_categories;  /* STRING only: distinct value count               */
+    int32_t   _cat_cap;      /* internal: allocated capacity of categories[]    */
+    HashTable *cat_map;      /* STRING only: word → category index, O(1)        */
 } DFColumn;
 
 /* ============================================================================
@@ -130,6 +150,19 @@ DataFrame *df_select_columns(const DataFrame *df,
 DataFrame *df_drop_nans(const DataFrame *df);
 
 /**
+ * Return a new DataFrame containing rows [offset, offset+n).
+ * STRING columns are category-compacted: only entries referenced by the
+ * slice are kept, and their cat_map is rebuilt for O(1) _cat_intern.
+ * Clamps to available rows if offset+n > n_rows.
+ */
+DataFrame *df_slice_rows(const DataFrame *df, size_t offset, size_t n);
+
+/**
+ * Convenience wrapper — equivalent to df_slice_rows(df, 0, n).
+ */
+DataFrame *df_head_rows(const DataFrame *df, size_t n);
+
+/**
  * One-hot encode a STRING column.
  *
  * Replaces column `col_idx` with `n_categories` new FLOAT32 columns named
@@ -191,6 +224,75 @@ int         df_col_n_categories(const DataFrame *df, int col_idx);
  */
 const char *df_col_category_name(const DataFrame *df,
                                   int col_idx, int cat_idx);
+
+
+/* ----------------------------------------------------------------------------
+ * NLP Vocabulary (opaque handle for PHP FFI)
+ * ------------------------------------------------------------------------- */
+typedef struct Vocab {
+    HashTable* map;
+    char**     words;
+    int        size;
+} Vocab;
+
+Vocab*  df_vocab_build(const DataFrame* df, int col_idx, int max_features);
+void    vocab_free(Vocab* v);
+int     vocab_size(const Vocab* v);
+Tensor* df_transform_bow(const DataFrame* df, int col_idx, const Vocab* v);
+
+void    vocab_save(Vocab* v, const char* filepath);
+Vocab*  vocab_load(const char* filepath);
+
+/* ============================================================================
+ * 9.  C TRANSFORM PIPELINE  (AVX2 + OpenMP, zero-alloc per batch)
+ * ========================================================================== */
+
+/** Opaque handle returned by pipeline_create(). */
+typedef struct TransformPipeline TransformPipeline;
+
+/**
+ * Two-pass OpenMP parallel fitting:
+ *   Pass 1 → IDF vector   (smooth: log((N+1)/(df+1))+1)
+ *   Pass 2 → ZScale stds  (center=false: std only, no mean subtraction)
+ *
+ * @param train_rows  Number of rows to use (rows [0, train_rows)).
+ * @param text_col    Column index of the tokenisable STRING column.
+ * @param vocab       Pre-built vocabulary from df_vocab_build().
+ * @return Heap-allocated TensorC*[2] = { idf, stds } or NULL on error.
+ *         Caller must tensor_free() each element then free() the array.
+ */
+Tensor **df_fit_transformers(const DataFrame *df, size_t train_rows,
+                               int text_col, const Vocab *vocab);
+
+/**
+ * Create an opaque transform pipeline handle.
+ * All pointer arguments are *borrowed* — the caller must keep them alive for
+ * the lifetime of the pipeline.
+ *
+ * @param label_col  DataFrame column index for class labels, or -1 for none.
+ * @param n_classes  Number of output classes for one-hot encoding.
+ */
+TransformPipeline *pipeline_create(const Vocab   *vocab,
+                                    const Tensor *idf,
+                                    const Tensor *stds,
+                                    int text_col, int label_col, int n_classes);
+
+/**
+ * Free the pipeline struct (does NOT free the borrowed vocab/idf/stds).
+ */
+void pipeline_free(TransformPipeline *pl);
+
+/**
+ * Transform rows [offset, offset+n) through the full chain in one C call:
+ *   tokenise → BoW → TfIdf → ZScale → one-hot labels
+ *
+ * @return Heap-allocated TensorC*[2] = { features[n×vocab], labels[n×NC] }
+ *         or NULL on error.  Caller must tensor_free() each then free() array.
+ */
+Tensor **pipeline_transform_batch(const DataFrame       *df,
+                                    size_t                 offset,
+                                    size_t                 n,
+                                    const TransformPipeline *pl);
 
 #ifdef __cplusplus
 }

@@ -976,7 +976,107 @@ Tensor* OP_NAME(Tensor* A, int axis) { \
 #define _MAX_OP(a, b) ((a) > (b) ? (a) : (b))
 #define _MIN_OP(a, b) ((a) < (b) ? (a) : (b))
 
-TENSOR_AXIS_AGG(tensor_sum_axis, 0.0f, _ADD_OP, )
+/* Fast 2D-specialised sum_axis.
+ * axis=1 ([M,N] → [M]): AVX2 horizontal sum per row, OpenMP over rows.
+ * axis=0 ([M,N] → [N]): OpenMP over columns, vertical accumulation.
+ * All other cases fall through to the generic macro path.             */
+Tensor* tensor_sum_axis(Tensor* A, int axis) {
+    if (A->dtype != DTYPE_FLOAT32) TENSOR_ERROR("FATAL: Aggregation requires FLOAT32.");
+    if (axis < 0 || axis >= A->ndim) return NULL;
+
+    if (A->ndim == 2 && tensor_is_contiguous(A)) {
+        int M = A->shape[0], N = A->shape[1];
+        if (axis == 1) {
+            /* Sum along columns → [M] output */
+            int out_shape[1] = { M };
+            Tensor* out = tensor_create_dtype(1, out_shape, DTYPE_FLOAT32);
+            float* __restrict o = F32(out);
+            const float* __restrict a = (const float*)__builtin_assume_aligned(F32(A), 64);
+            #pragma omp parallel for schedule(static) if(M > 64)
+            for (int r = 0; r < M; r++) {
+                const float* __restrict row = a + (size_t)r * N;
+                float s = 0.0f;
+                int j = 0;
+#ifdef __AVX512F__
+                { __m512 vs0 = _mm512_setzero_ps(), vs1 = vs0, vs2 = vs0, vs3 = vs0;
+                  for (; j <= N - 64; j += 64) {
+                      vs0 = _mm512_add_ps(vs0, _mm512_loadu_ps(row + j));
+                      vs1 = _mm512_add_ps(vs1, _mm512_loadu_ps(row + j + 16));
+                      vs2 = _mm512_add_ps(vs2, _mm512_loadu_ps(row + j + 32));
+                      vs3 = _mm512_add_ps(vs3, _mm512_loadu_ps(row + j + 48)); }
+                  vs0 = _mm512_add_ps(_mm512_add_ps(vs0,vs1), _mm512_add_ps(vs2,vs3));
+                  for (; j <= N - 16; j += 16)
+                      vs0 = _mm512_add_ps(vs0, _mm512_loadu_ps(row + j));
+                  s = _mm512_reduce_add_ps(vs0); }
+#elif defined(__AVX2__)
+                { __m256 vs0 = _mm256_setzero_ps(), vs1 = vs0, vs2 = vs0, vs3 = vs0;
+                  for (; j <= N - 32; j += 32) {
+                      vs0 = _mm256_add_ps(vs0, _mm256_loadu_ps(row + j));
+                      vs1 = _mm256_add_ps(vs1, _mm256_loadu_ps(row + j +  8));
+                      vs2 = _mm256_add_ps(vs2, _mm256_loadu_ps(row + j + 16));
+                      vs3 = _mm256_add_ps(vs3, _mm256_loadu_ps(row + j + 24)); }
+                  vs0 = _mm256_add_ps(_mm256_add_ps(vs0,vs1), _mm256_add_ps(vs2,vs3));
+                  for (; j <= N - 8; j += 8)
+                      vs0 = _mm256_add_ps(vs0, _mm256_loadu_ps(row + j));
+                  __m128 lo = _mm256_castps256_ps128(vs0);
+                  __m128 hi = _mm256_extractf128_ps(vs0, 1);
+                  lo = _mm_add_ps(lo, hi);
+                  lo = _mm_hadd_ps(lo, lo); lo = _mm_hadd_ps(lo, lo);
+                  s = _mm_cvtss_f32(lo); }
+#endif
+                for (; j < N; j++) s += row[j];
+                o[r] = s;
+            }
+            return out;
+        } else { /* axis == 0 */
+            /* Sum along rows → [N] output */
+            int out_shape[1] = { N };
+            Tensor* out = tensor_create_dtype(1, out_shape, DTYPE_FLOAT32);
+            float* __restrict o = F32(out);
+            const float* __restrict a = (const float*)__builtin_assume_aligned(F32(A), 64);
+            /* Tiled accumulation for better cache reuse */
+            const int TILE = 64;
+            for (int r0 = 0; r0 < M; r0 += TILE) {
+                int r1 = r0 + TILE < M ? r0 + TILE : M;
+                int j = 0;
+#ifdef __AVX2__
+                for (; j <= N - 8; j += 8) {
+                    __m256 acc = _mm256_loadu_ps(o + j);
+                    for (int r = r0; r < r1; r++)
+                        acc = _mm256_add_ps(acc, _mm256_loadu_ps(a + (size_t)r * N + j));
+                    _mm256_storeu_ps(o + j, acc);
+                }
+#endif
+                for (; j < N; j++) {
+                    float s = o[j];
+                    for (int r = r0; r < r1; r++) s += a[(size_t)r * N + j];
+                    o[j] = s;
+                }
+            }
+            return out;
+        }
+    }
+
+    /* Generic N-D fallback (unchanged) */
+    int out_shape[8]; int out_ndim = 0;
+    for (int i = 0; i < A->ndim; i++) if (i != axis) out_shape[out_ndim++] = A->shape[i];
+    if (out_ndim == 0) { out_ndim = 1; out_shape[0] = 1; }
+    Tensor* out = tensor_create(out_ndim, out_shape);
+    int idx[8] = {0};
+    for (size_t i = 0; i < A->total_size; i++) {
+        size_t offset_a = 0, offset_out = 0; int out_d = 0;
+        for (int d = 0; d < A->ndim; d++) {
+            offset_a += idx[d] * A->stride[d];
+            if (d != axis) offset_out += idx[d] * out->stride[out_d++];
+        }
+        F32(out)[offset_out] += F32(A)[offset_a];
+        for (int d = A->ndim - 1; d >= 0; d--) {
+            idx[d]++; if (idx[d] < A->shape[d]) break; idx[d] = 0;
+        }
+    }
+    return out;
+}
+
 TENSOR_AXIS_AGG(tensor_mean_axis, 0.0f, _ADD_OP, for (size_t j=0; j<out->total_size; j++) F32(out)[j] /= A->shape[axis])
 TENSOR_AXIS_AGG(tensor_max_axis, -INFINITY, _MAX_OP, )
 TENSOR_AXIS_AGG(tensor_min_axis, INFINITY, _MIN_OP, )
@@ -3428,6 +3528,29 @@ static inline float fast_logf(float x) {
     return 2.0f * z * (1.0f + y) + (float)e * 0.6931471805599453f;
 }
 
+#ifdef __AVX512F__
+/* Forward-declared here so softmax_rows can use it; defined again near Mamba section. */
+static inline __m512 avx512_expf(__m512 x) {
+    x = _mm512_max_ps(x, _mm512_set1_ps(-88.3762626647949f));
+    x = _mm512_min_ps(x, _mm512_set1_ps( 88.3762626647949f));
+    __m512 fx = _mm512_floor_ps(
+        _mm512_fmadd_ps(x, _mm512_set1_ps(1.44269504088896341f),
+                           _mm512_set1_ps(0.5f)));
+    x = _mm512_fnmadd_ps(fx, _mm512_set1_ps( 0.693359375f),    x);
+    x = _mm512_fnmadd_ps(fx, _mm512_set1_ps(-2.12194440e-4f),  x);
+    __m512 z = _mm512_mul_ps(x, x);
+    __m512 y = _mm512_set1_ps(1.9875691500e-4f);
+    y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(1.3981999507e-3f));
+    y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(8.3334519073e-3f));
+    y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(4.1665795894e-2f));
+    y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(1.6666665459e-1f));
+    y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(5.0000001201e-1f));
+    y = _mm512_fmadd_ps(y, z, _mm512_add_ps(x, _mm512_set1_ps(1.0f)));
+    __m512i n = _mm512_add_epi32(_mm512_cvttps_epi32(fx), _mm512_set1_epi32(127));
+    return _mm512_mul_ps(y, _mm512_castsi512_ps(_mm512_slli_epi32(n, 23)));
+}
+#endif
+
 #ifdef __AVX2__
 static inline __m256 avx2_expf(__m256 x) {
     x = _mm256_max_ps(x, _mm256_set1_ps(-88.3762626647949f));
@@ -3447,6 +3570,26 @@ static inline __m256 avx2_expf(__m256 x) {
     y = _mm256_fmadd_ps(y, z, _mm256_add_ps(x, _mm256_set1_ps(1.0f)));
     __m256i n = _mm256_add_epi32(_mm256_cvttps_epi32(fx), _mm256_set1_epi32(127));
     return _mm256_mul_ps(y, _mm256_castsi256_ps(_mm256_slli_epi32(n, 23)));
+}
+#endif
+
+/* AVX2 fast sigmoid: 1/(1+exp(-x))  using avx2_expf */
+#ifdef __AVX2__
+static inline __m256 avx2_sigmoidf(__m256 x) {
+    __m256 neg = _mm256_xor_ps(x, _mm256_set1_ps(-0.0f));
+    __m256 e   = avx2_expf(neg);
+    __m256 one = _mm256_set1_ps(1.0f);
+    return _mm256_div_ps(one, _mm256_add_ps(one, e));
+}
+
+/* AVX2 fast tanh: (e^2x - 1)/(e^2x + 1)  using avx2_expf */
+static inline __m256 avx2_tanhf(__m256 x) {
+    x = _mm256_max_ps(x, _mm256_set1_ps(-9.0f));
+    x = _mm256_min_ps(x, _mm256_set1_ps( 9.0f));
+    __m256 e2x = avx2_expf(_mm256_add_ps(x, x));
+    __m256 one = _mm256_set1_ps(1.0f);
+    return _mm256_div_ps(_mm256_sub_ps(e2x, one),
+                         _mm256_add_ps(e2x, one));
 }
 #endif
 
@@ -3537,16 +3680,15 @@ static void softmax_rows(float* __restrict data, int rows, int cols) {
             __m512 vs0 = _mm512_setzero_ps(), vs1 = vs0;
             __m512 vm  = _mm512_set1_ps(vmax);
             for (; j <= cols - 32; j += 32) {
-                __m512 e0 = avx2_expf ? avx2_expf : _mm512_exp_ps; // fallback
-                e0 = _mm512_sub_ps(_mm512_loadu_ps(row + j),      vm);
-                __m512 e1 = _mm512_sub_ps(_mm512_loadu_ps(row + j + 16), vm);
+                __m512 e0 = avx512_expf(_mm512_sub_ps(_mm512_loadu_ps(row + j),      vm));
+                __m512 e1 = avx512_expf(_mm512_sub_ps(_mm512_loadu_ps(row + j + 16), vm));
                 vs0 = _mm512_add_ps(vs0, e0); vs1 = _mm512_add_ps(vs1, e1);
                 _mm512_storeu_ps(row + j,      e0);
                 _mm512_storeu_ps(row + j + 16, e1);
             }
             vs0 = _mm512_add_ps(vs0, vs1);
             for (; j <= cols - 16; j += 16) {
-                __m512 e = _mm512_sub_ps(_mm512_loadu_ps(row + j), vm);
+                __m512 e = avx512_expf(_mm512_sub_ps(_mm512_loadu_ps(row + j), vm));
                 _mm512_storeu_ps(row + j, e);
                 vs0 = _mm512_add_ps(vs0, e);
             }
@@ -4560,28 +4702,7 @@ void tensor_embedding_backward(Tensor* dY, Tensor* token_ids, Tensor* dWeights) 
 
 /* _hsum256 already defined above — reuse existing implementation */
 
-#ifdef __AVX512F__
-__attribute__((always_inline))
-static inline __m512 avx512_expf(__m512 x) {
-    x = _mm512_max_ps(x, _mm512_set1_ps(-88.3762626647949f));
-    x = _mm512_min_ps(x, _mm512_set1_ps( 88.3762626647949f));
-    __m512 fx = _mm512_floor_ps(
-        _mm512_fmadd_ps(x, _mm512_set1_ps(1.44269504088896341f),
-                           _mm512_set1_ps(0.5f)));
-    x = _mm512_fnmadd_ps(fx, _mm512_set1_ps( 0.693359375f),    x);
-    x = _mm512_fnmadd_ps(fx, _mm512_set1_ps(-2.12194440e-4f),  x);
-    __m512 z = _mm512_mul_ps(x, x);
-    __m512 y = _mm512_set1_ps(1.9875691500e-4f);
-    y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(1.3981999507e-3f));
-    y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(8.3334519073e-3f));
-    y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(4.1665795894e-2f));
-    y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(1.6666665459e-1f));
-    y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(5.0000001201e-1f));
-    y = _mm512_fmadd_ps(y, z, _mm512_add_ps(x, _mm512_set1_ps(1.0f)));
-    __m512i n = _mm512_add_epi32(_mm512_cvttps_epi32(fx), _mm512_set1_epi32(127));
-    return _mm512_mul_ps(y, _mm512_castsi512_ps(_mm512_slli_epi32(n, 23)));
-}
-#endif
+/* avx512_expf defined earlier near avx2_expf — no re-definition needed. */
 
 /* ---------------------------------------------------------------------------
  * FORWARD INNER STEP — updates h[0..N) in-place for one (b,d,t) triple.
@@ -5256,4 +5377,555 @@ Tensor* tensor_mamba_alloc_state(int batch, int d_model, int d_state) {
 Tensor* tensor_mamba_alloc_cache(int batch, int seq_len, int d_model, int d_state) {
     int shape[4] = {batch, seq_len, d_model, d_state};
     return tensor_create_dtype(4, shape, DTYPE_FLOAT32);
+}
+// ============================================================================
+// SECTION 22 — CLASSICAL ML EXTENSIONS
+// ============================================================================
+
+static int _s22_cmp_f32(const void* a, const void* b) {
+    float fa = *(const float*)a, fb = *(const float*)b;
+    return (fa > fb) - (fa < fb);
+}
+
+// ─── 22.1  ARGMAX ALONG AXIS  ─────────────────────────────────────────────────
+// Returns FLOAT32 tensor of argmax indices, shape = A->shape with axis removed.
+Tensor* tensor_argmax_axis(Tensor* A, int axis) {
+    if (A->dtype != DTYPE_FLOAT32 || axis < 0 || axis >= A->ndim)
+        TENSOR_ERROR("FATAL [argmax_axis]: Invalid input.");
+
+    int out_ndim = A->ndim - 1;
+    if (out_ndim < 1) out_ndim = 1;
+
+    int out_shape[8]; int j = 0;
+    for (int i = 0; i < A->ndim; i++)
+        if (i != axis) out_shape[j++] = A->shape[i];
+    if (j < 1) { out_shape[0] = 1; j = 1; }
+
+    Tensor* out = tensor_create_uninitialized(j, out_shape, DTYPE_FLOAT32);
+    if (!out) return NULL;
+
+    int   dim_len = A->shape[axis];
+    size_t num_vecs = out->total_size;
+
+    int idx[8] = {0};
+    for (size_t v = 0; v < num_vecs; v++) {
+        /* build base offset into A, inserting 0 at the axis position */
+        size_t base = 0; int ai = 0;
+        for (int d = 0; d < A->ndim; d++) {
+            if (d == axis) continue;
+            base += (size_t)idx[ai++] * A->stride[d];
+        }
+        float best = -FLT_MAX; int bi = 0;
+        for (int i = 0; i < dim_len; i++) {
+            float val = F32(A)[base + (size_t)i * A->stride[axis]];
+            if (val > best) { best = val; bi = i; }
+        }
+        F32(out)[v] = (float)bi;
+        for (int d = j - 1; d >= 0; d--) {
+            idx[d]++; if (idx[d] < out_shape[d]) break; idx[d] = 0;
+        }
+    }
+    return out;
+}
+
+// ─── 22.2  PAIRWISE SQUARED L2 DISTANCE  ──────────────────────────────────────
+// D[i,j] = ||A[i]-B[j]||²  A:[m,k] B:[n,k] → out:[m,n]
+// Uses SGEMM trick: D = -2*(A@B^T) + sqA[:,None] + sqB[None,:]
+Tensor* tensor_pairwise_sq_l2(Tensor* A, Tensor* B) {
+    if (A->dtype != DTYPE_FLOAT32 || B->dtype != DTYPE_FLOAT32)
+        TENSOR_ERROR("FATAL [pairwise_sq_l2]: Requires FLOAT32.");
+    if (A->ndim != 2 || B->ndim != 2 || A->shape[1] != B->shape[1])
+        TENSOR_ERROR("FATAL [pairwise_sq_l2]: Both must be 2D with equal column count.");
+
+    int m = A->shape[0], n = B->shape[0], k = A->shape[1];
+    Tensor* a_c = tensor_is_contiguous(A) ? A : tensor_copy(A);
+    Tensor* b_c = tensor_is_contiguous(B) ? B : tensor_copy(B);
+
+    Tensor* out = tensor_create_uninitialized(2, (int[]){m, n}, DTYPE_FLOAT32);
+
+    /* Step 1: out = -2 * A @ B^T  (single SGEMM) */
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                m, n, k, -2.0f,
+                F32(a_c), k, F32(b_c), k,
+                0.0f, F32(out), n);
+
+    /* Step 2: precompute ||B[j]||^2 for all j  (reused across all i) */
+    float* sq_b = (float*)malloc((size_t)n * sizeof(float));
+    if (!sq_b) { if (a_c!=A) tensor_free(a_c); if (b_c!=B) tensor_free(b_c); tensor_free(out); TENSOR_ERROR("OOM sq_b"); }
+    for (int j2 = 0; j2 < n; j2++)
+        sq_b[j2] = cblas_sdot(k, F32(b_c) + (size_t)j2*k, 1, F32(b_c) + (size_t)j2*k, 1);
+
+    /* Step 3: add ||A[i]||^2 to row i, add sq_b[j] to column j */
+    #pragma omp parallel for schedule(static) if(m > 64)
+    for (int i = 0; i < m; i++) {
+        float sq_a = cblas_sdot(k, F32(a_c)+(size_t)i*k, 1, F32(a_c)+(size_t)i*k, 1);
+        float* row = F32(out) + (size_t)i * n;
+        #pragma omp simd
+        for (int j2 = 0; j2 < n; j2++) {
+            row[j2] += sq_a + sq_b[j2];
+            if (row[j2] < 0.0f) row[j2] = 0.0f; /* clamp numeric error */
+        }
+    }
+
+    free(sq_b);
+    if (a_c != A) tensor_free(a_c);
+    if (b_c != B) tensor_free(b_c);
+    return out;
+}
+
+// ─── 22.3  INPLACE UNARY OPS  ─────────────────────────────────────────────────
+
+void tensor_exp_inplace(Tensor* A) {
+    if (!A || A->dtype != DTYPE_FLOAT32 || !tensor_is_contiguous(A)) return;
+    size_t n = A->total_size; float* a = F32(A); size_t i = 0;
+#ifdef __AVX2__
+    for (; i + 7 < n; i += 8)
+        _mm256_storeu_ps(a+i, avx2_expf(_mm256_loadu_ps(a+i)));
+#endif
+    for (; i < n; i++) a[i] = fast_expf(a[i]);
+}
+
+void tensor_log_inplace(Tensor* A) {
+    if (!A || A->dtype != DTYPE_FLOAT32 || !tensor_is_contiguous(A)) return;
+    size_t n = A->total_size; float* a = F32(A);
+    #pragma omp simd
+    for (size_t i = 0; i < n; i++) a[i] = logf(a[i]);
+}
+
+void tensor_sqrt_inplace(Tensor* A) {
+    if (!A || A->dtype != DTYPE_FLOAT32 || !tensor_is_contiguous(A)) return;
+    size_t n = A->total_size; float* a = F32(A); size_t i = 0;
+#ifdef __AVX2__
+    for (; i + 7 < n; i += 8)
+        _mm256_storeu_ps(a+i, _mm256_sqrt_ps(_mm256_loadu_ps(a+i)));
+#endif
+    for (; i < n; i++) a[i] = sqrtf(a[i]);
+}
+
+/* sigmoid: explicit AVX2 fast path using avx2_expf */
+void tensor_sigmoid_inplace(Tensor* A) {
+    if (!A || A->dtype != DTYPE_FLOAT32 || !tensor_is_contiguous(A)) return;
+    size_t n = A->total_size; float* a = F32(A); size_t i = 0;
+#ifdef __AVX2__
+    for (; i + 7 < n; i += 8)
+        _mm256_storeu_ps(a+i, avx2_sigmoidf(_mm256_loadu_ps(a+i)));
+#endif
+    for (; i < n; i++) a[i] = 1.0f / (1.0f + fast_expf(-a[i]));
+}
+
+/* tanh: explicit AVX2 fast path using avx2_tanhf */
+void tensor_tanh_inplace(Tensor* A) {
+    if (!A || A->dtype != DTYPE_FLOAT32 || !tensor_is_contiguous(A)) return;
+    size_t n = A->total_size; float* a = F32(A); size_t i = 0;
+#ifdef __AVX2__
+    for (; i + 7 < n; i += 8)
+        _mm256_storeu_ps(a+i, avx2_tanhf(_mm256_loadu_ps(a+i)));
+#endif
+    for (; i < n; i++) a[i] = tanhf(a[i]);
+}
+
+void tensor_relu_inplace(Tensor* A) {
+    if (!A || A->dtype != DTYPE_FLOAT32 || !tensor_is_contiguous(A)) return;
+    size_t n = A->total_size; float* a = F32(A); size_t i = 0;
+#ifdef __AVX512F__
+    { __m512 vz = _mm512_setzero_ps();
+      for (; i + 15 < n; i += 16)
+          _mm512_storeu_ps(a+i, _mm512_max_ps(_mm512_loadu_ps(a+i), vz)); }
+#elif defined(__AVX2__)
+    { __m256 vz = _mm256_setzero_ps();
+      for (; i + 7 < n; i += 8)
+          _mm256_storeu_ps(a+i, _mm256_max_ps(_mm256_loadu_ps(a+i), vz)); }
+#endif
+    for (; i < n; i++) { if (a[i] < 0.0f) a[i] = 0.0f; }
+}
+
+// ─── 22.4  ROW-WISE SOFTMAX IN-PLACE  ─────────────────────────────────────────
+// Delegates to the fully AVX2/AVX512-accelerated softmax_rows() helper.
+void tensor_row_softmax_inplace(Tensor* A) {
+    if (!A || A->dtype != DTYPE_FLOAT32 || A->ndim < 2 || !tensor_is_contiguous(A)) return;
+    int rows = (int)(A->total_size / (size_t)A->shape[A->ndim-1]);
+    int cols = A->shape[A->ndim-1];
+    softmax_rows(F32(A), rows, cols);
+}
+
+// ─── 22.5  GBDT ENGINE  ───────────────────────────────────────────────────────
+// Histogram-based GBDT (LightGBM-style).
+// All per-sample operations happen in C; PHP only loops over O(2^D * T) nodes.
+
+/* Compute per-feature quantile bin boundaries.
+ * X: [N,D]  Q: number of bins (boundaries = Q-1 per feature)
+ * Returns [D, Q-1] FLOAT32 boundary matrix. */
+Tensor* tensor_gbdt_compute_boundaries(Tensor* X, int Q) {
+    if (!X || X->dtype != DTYPE_FLOAT32 || X->ndim != 2 || Q < 2)
+        TENSOR_ERROR("FATAL [gbdt_boundaries]: X must be [N,D] FLOAT32, Q>=2.");
+    int N = X->shape[0], D = X->shape[1];
+    int nb = Q - 1; /* number of boundary points per feature */
+    Tensor* out = tensor_create_uninitialized(2, (int[]){D, nb}, DTYPE_FLOAT32);
+    if (!out) return NULL;
+    Tensor* a_c = tensor_is_contiguous(X) ? X : tensor_copy(X);
+    float* col_buf = (float*)malloc((size_t)N * sizeof(float));
+    if (!col_buf) { if (a_c!=X) tensor_free(a_c); tensor_free(out); TENSOR_ERROR("OOM col_buf"); }
+
+    for (int d = 0; d < D; d++) {
+        /* extract column d */
+        for (int i = 0; i < N; i++) col_buf[i] = F32(a_c)[(size_t)i*D + d];
+        /* partial sort to find quantile positions */
+        /* use qsort on a copy for simplicity; N usually small at fit time */
+        float* sorted = (float*)malloc((size_t)N * sizeof(float));
+        if (!sorted) { free(col_buf); if (a_c!=X) tensor_free(a_c); tensor_free(out); TENSOR_ERROR("OOM sorted"); }
+        memcpy(sorted, col_buf, (size_t)N * sizeof(float));
+        /* insertion for small N, qsort otherwise */
+        if (N <= 256) {
+            for (int i = 1; i < N; i++) {
+                float key = sorted[i]; int j = i-1;
+                while (j >= 0 && sorted[j] > key) { sorted[j+1] = sorted[j]; j--; }
+                sorted[j+1] = key;
+            }
+        } else {
+            qsort(sorted, (size_t)N, sizeof(float), _s22_cmp_f32);
+        }
+        /* extract nb evenly spaced quantiles */
+        for (int b = 0; b < nb; b++) {
+            float pos = (float)(b + 1) / (float)(nb + 1) * (float)(N - 1);
+            int lo = (int)pos; int hi = lo + 1;
+            if (hi >= N) hi = N - 1;
+            float frac = pos - (float)lo;
+            F32(out)[(size_t)d * nb + b] = sorted[lo] * (1.0f - frac) + sorted[hi] * frac;
+        }
+        free(sorted);
+    }
+    free(col_buf);
+    if (a_c != X) tensor_free(a_c);
+    return out;
+}
+
+/* Assign bin indices to each sample.
+ * X: [N,D]  boundaries: [D, Q-1]  Q: num_bins
+ * Returns [N,D] INT32 bin indices in [0, Q-1]. */
+Tensor* tensor_gbdt_bin_samples(Tensor* X, Tensor* boundaries, int Q) {
+    if (!X || !boundaries || X->ndim != 2 || boundaries->ndim != 2)
+        TENSOR_ERROR("FATAL [gbdt_bin]: Invalid tensors.");
+    int N = X->shape[0], D = X->shape[1], nb = Q - 1;
+    if (boundaries->shape[0] != D || boundaries->shape[1] != nb)
+        TENSOR_ERROR("FATAL [gbdt_bin]: boundaries shape mismatch.");
+    Tensor* x_c  = tensor_is_contiguous(X) ? X : tensor_copy(X);
+    Tensor* b_c  = tensor_is_contiguous(boundaries) ? boundaries : tensor_copy(boundaries);
+    Tensor* out  = tensor_create_uninitialized(2, (int[]){N, D}, DTYPE_INT32);
+    if (!out) { if (x_c!=X) tensor_free(x_c); if (b_c!=boundaries) tensor_free(b_c); return NULL; }
+
+    #pragma omp parallel for collapse(2) schedule(static) if(N*D > 100000)
+    for (int i = 0; i < N; i++) {
+        for (int d = 0; d < D; d++) {
+            float val = F32(x_c)[(size_t)i*D + d];
+            const float* bdry = F32(b_c) + (size_t)d * nb;
+            /* binary search for bin index */
+            int lo = 0, hi = nb - 1, bin = 0;
+            while (lo <= hi) {
+                int mid = (lo + hi) >> 1;
+                if (val <= bdry[mid]) { bin = mid; hi = mid - 1; }
+                else { bin = mid + 1; lo = mid + 1; }
+            }
+            if (bin > Q-1) bin = Q-1;
+            I32(out)[(size_t)i*D + d] = bin;
+        }
+    }
+    if (x_c != X) tensor_free(x_c);
+    if (b_c != boundaries) tensor_free(b_c);
+    return out;
+}
+
+/* MSE gradient: g[i] = pred[i]-y[i],  h[i] = 1.0 */
+void tensor_gbdt_mse_grad_hess(Tensor* preds, Tensor* y, Tensor* out_g, Tensor* out_h) {
+    if (!preds||!y||!out_g||!out_h) return;
+    size_t n = preds->total_size;
+    float* p = F32(preds); float* yt = F32(y);
+    float* g = F32(out_g); float* h = F32(out_h);
+    #pragma omp simd
+    for (size_t i = 0; i < n; i++) { g[i] = p[i] - yt[i]; h[i] = 1.0f; }
+}
+
+/* Log-loss gradient: g[i] = sigmoid(pred)-y,  h[i] = p*(1-p) */
+void tensor_gbdt_logloss_grad_hess(Tensor* preds, Tensor* y, Tensor* out_g, Tensor* out_h) {
+    if (!preds||!y||!out_g||!out_h) return;
+    size_t n = preds->total_size;
+    float* p = F32(preds); float* yt = F32(y);
+    float* g = F32(out_g); float* h = F32(out_h);
+    for (size_t i = 0; i < n; i++) {
+        float prob = 1.0f / (1.0f + expf(-p[i]));
+        g[i] = prob - yt[i];
+        h[i] = prob * (1.0f - prob) + 1e-16f;
+    }
+}
+
+/* Build gradient histogram for a node.
+ * bins:[N,D] INT32; g,h,mask:[N] FLOAT32; Q: num bins
+ * hist_g,hist_h: [D,Q] FLOAT32 (caller pre-allocates and pre-zeros) */
+void tensor_gbdt_histogram(Tensor* bins, Tensor* g, Tensor* h, Tensor* mask,
+                            int Q, Tensor* hist_g, Tensor* hist_h) {
+    if (!bins||!g||!h||!mask||!hist_g||!hist_h) return;
+    int N = bins->shape[0], D = bins->shape[1];
+    int32_t* bp  = I32(bins);
+    float*   gp  = F32(g); float* hp = F32(h); float* mp = F32(mask);
+    float*   hgp = F32(hist_g); float* hhp = F32(hist_h);
+
+    for (int i = 0; i < N; i++) {
+        float mi = mp[i];
+        if (mi < 0.5f) continue;
+        float gi = gp[i], hi2 = hp[i];
+        for (int d = 0; d < D; d++) {
+            int bin = bp[(size_t)i*D + d];
+            hgp[(size_t)d*Q + bin] += gi;
+            hhp[(size_t)d*Q + bin] += hi2;
+        }
+    }
+}
+
+/* Find best split: scans all (feature, bin) pairs using prefix-sum over histogram.
+ * Sets out_feat, out_bin, out_gain.  gain<0 means no profitable split found. */
+void tensor_gbdt_best_split(Tensor* hist_g, Tensor* hist_h, int Q,
+                             float sum_g, float sum_h, int node_n,
+                             float lambda, float gamma,
+                             int* out_feat, int* out_bin, float* out_gain) {
+    (void)node_n;
+    *out_feat = -1; *out_bin = -1; *out_gain = -1.0f;
+    if (!hist_g || !hist_h) return;
+    int D = hist_g->shape[0];
+    float* hgp = F32(hist_g); float* hhp = F32(hist_h);
+    float root_score = (sum_g * sum_g) / (sum_h + lambda);
+    float best = gamma; /* minimum gain threshold */
+
+    for (int d = 0; d < D; d++) {
+        float gl = 0.0f, hl = 0.0f;
+        for (int b = 0; b < Q - 1; b++) {
+            gl += hgp[(size_t)d*Q + b];
+            hl += hhp[(size_t)d*Q + b];
+            float gr = sum_g - gl, hr = sum_h - hl;
+            if (hl < 1e-6f || hr < 1e-6f) continue;
+            float gain = 0.5f * ((gl*gl)/(hl+lambda) + (gr*gr)/(hr+lambda) - root_score);
+            if (gain > best) { best = gain; *out_feat = d; *out_bin = b; *out_gain = gain; }
+        }
+    }
+}
+
+/* Split node mask into left/right masks based on (feat, bin) split.
+ * bins:[N,D] INT32; mask:[N]; out_left,out_right:[N] (pre-allocated) */
+void tensor_gbdt_split_node(Tensor* bins, Tensor* mask, int feat, int bin,
+                             Tensor* out_left, Tensor* out_right) {
+    if (!bins||!mask||!out_left||!out_right) return;
+    int N = bins->shape[0], D = bins->shape[1];
+    int32_t* bp = I32(bins);
+    float* mp = F32(mask); float* lp = F32(out_left); float* rp = F32(out_right);
+    #pragma omp simd
+    for (int i = 0; i < N; i++) {
+        float m = mp[i];
+        int in_left = (m > 0.5f) && (bp[(size_t)i*D + feat] <= bin);
+        lp[i] = in_left ? 1.0f : 0.0f;
+        rp[i] = (m > 0.5f && !in_left) ? 1.0f : 0.0f;
+    }
+}
+
+/* Compute leaf value (-sum_g/(sum_h+lambda)), update preds += lr*leaf_value.
+ * Returns the leaf value. */
+float tensor_gbdt_leaf_update(Tensor* preds, Tensor* mask,
+                               float sum_g, float sum_h,
+                               float lr, float lambda) {
+    float leaf = -sum_g / (sum_h + lambda);
+    if (!preds||!mask) return leaf;
+    int N = (int)preds->total_size;
+    float* pp = F32(preds); float* mp = F32(mask);
+    float delta = lr * leaf;
+    #pragma omp simd
+    for (int i = 0; i < N; i++) pp[i] += mp[i] > 0.5f ? delta : 0.0f;
+    return leaf;
+}
+
+/* Prediction with all T trees packed as flat Tensor columns.
+ * X_bins: [N,D] INT32  (binned test data)
+ * feats:      [T, max_nodes] FLOAT32  (feature index; -1 = leaf)
+ * thresholds: [T, max_nodes] FLOAT32  (bin index for splits; leaf value for leaves)
+ * lefts:      [T, max_nodes] FLOAT32  (left child index; -1 at leaf)
+ * rights:     [T, max_nodes] FLOAT32  (right child index; -1 at leaf)
+ * tree_sizes: [T] FLOAT32             (node count per tree)
+ * base_score: initial prediction
+ * Returns [N] FLOAT32 predictions. */
+Tensor* tensor_gbdt_predict_all(Tensor* X_bins, Tensor* feats, Tensor* thresholds,
+                                 Tensor* lefts, Tensor* rights, Tensor* tree_sizes,
+                                 float base_score) {
+    if (!X_bins||!feats||!thresholds||!lefts||!rights||!tree_sizes)
+        TENSOR_ERROR("FATAL [gbdt_predict]: NULL tensor.");
+    int N = X_bins->shape[0], D = X_bins->shape[1];
+    int T = feats->shape[0], M = feats->shape[1]; /* max_nodes */
+
+    Tensor* xb_c = tensor_is_contiguous(X_bins) ? X_bins : tensor_copy(X_bins);
+    Tensor* out  = tensor_create_uninitialized(1, (int[]){N}, DTYPE_FLOAT32);
+    if (!out) { if (xb_c!=X_bins) tensor_free(xb_c); return NULL; }
+    float* op = F32(out);
+    for (int i = 0; i < N; i++) op[i] = base_score;
+
+    int32_t* bp = I32(xb_c);
+    float* fp = F32(feats); float* tp = F32(thresholds);
+    float* lp = F32(lefts); float* rp = F32(rights);
+    float* sp = F32(tree_sizes);
+
+    #pragma omp parallel for schedule(static) if(N > 1000)
+    for (int i = 0; i < N; i++) {
+        const int32_t* xi = bp + (size_t)i * D;
+        for (int t = 0; t < T; t++) {
+            const float* tf = fp + (size_t)t * M;
+            const float* tt = tp + (size_t)t * M;
+            const float* tl = lp + (size_t)t * M;
+            const float* tr = rp + (size_t)t * M;
+            int sz = (int)sp[t];
+            int node = 0;
+            while (node < sz) {
+                int feat = (int)tf[node];
+                if (feat < 0) { op[i] += tt[node]; break; } /* leaf */
+                int bin_split = (int)tt[node];
+                node = (xi[feat] <= bin_split) ? (int)tl[node] : (int)tr[node];
+                if (node < 0) break;
+            }
+        }
+    }
+    if (xb_c != X_bins) tensor_free(xb_c);
+    return out;
+}
+
+// ─── 22.6  QUANTILE TRANSFORM  ────────────────────────────────────────────────
+/* Fit quantile landmarks for each feature.
+ * X: [N,D] → returns [D, n_quantiles] FLOAT32 */
+Tensor* tensor_quantile_fit(Tensor* X, int n_quantiles) {
+    if (!X || X->ndim != 2 || X->dtype != DTYPE_FLOAT32 || n_quantiles < 2)
+        TENSOR_ERROR("FATAL [quantile_fit]: Invalid input.");
+    int N = X->shape[0], D = X->shape[1];
+    Tensor* xc = tensor_is_contiguous(X) ? X : tensor_copy(X);
+    Tensor* out = tensor_create_uninitialized(2, (int[]){D, n_quantiles}, DTYPE_FLOAT32);
+    float* col = (float*)malloc((size_t)N * sizeof(float));
+    if (!col||!out) { if (xc!=X) tensor_free(xc); if (out) tensor_free(out); free(col); TENSOR_ERROR("OOM"); }
+
+    for (int d = 0; d < D; d++) {
+        for (int i = 0; i < N; i++) col[i] = F32(xc)[(size_t)i*D+d];
+        qsort(col, (size_t)N, sizeof(float), _s22_cmp_f32);
+        for (int q = 0; q < n_quantiles; q++) {
+            float pos = (float)q / (float)(n_quantiles - 1) * (float)(N - 1);
+            int lo = (int)pos; int hi = MIN(lo+1, N-1);
+            float frac = pos - (float)lo;
+            F32(out)[(size_t)d*n_quantiles + q] = col[lo]*(1.0f-frac) + col[hi]*frac;
+        }
+    }
+    free(col);
+    if (xc != X) tensor_free(xc);
+    return out;
+}
+
+/* Transform X using fitted quantile landmarks → uniform [0,1] output.
+ * landmarks: [D, n_quantiles] from tensor_quantile_fit
+ * Returns [N, D] FLOAT32 in [0, 1]. */
+Tensor* tensor_quantile_transform(Tensor* X, Tensor* landmarks, int n_quantiles) {
+    if (!X||!landmarks||X->ndim!=2||landmarks->ndim!=2) TENSOR_ERROR("FATAL [qt_transform]: Invalid.");
+    int N = X->shape[0], D = X->shape[1];
+    if (landmarks->shape[0] != D || landmarks->shape[1] != n_quantiles)
+        TENSOR_ERROR("FATAL [qt_transform]: Landmark shape mismatch.");
+    Tensor* xc = tensor_is_contiguous(X) ? X : tensor_copy(X);
+    Tensor* lc = tensor_is_contiguous(landmarks) ? landmarks : tensor_copy(landmarks);
+    Tensor* out = tensor_create_uninitialized(2, (int[]){N, D}, DTYPE_FLOAT32);
+    if (!out) { if (xc!=X) tensor_free(xc); if (lc!=landmarks) tensor_free(lc); TENSOR_ERROR("OOM"); }
+
+    #pragma omp parallel for schedule(static) if(N*D > 50000)
+    for (int i = 0; i < N; i++) {
+        for (int d = 0; d < D; d++) {
+            float val = F32(xc)[(size_t)i*D+d];
+            const float* lm = F32(lc) + (size_t)d * n_quantiles;
+            if (val <= lm[0]) { F32(out)[(size_t)i*D+d] = 0.0f; continue; }
+            if (val >= lm[n_quantiles-1]) { F32(out)[(size_t)i*D+d] = 1.0f; continue; }
+            int lo = 0, hi = n_quantiles - 2;
+            while (lo < hi) { int mid=(lo+hi)>>1; if (lm[mid+1]<=val) lo=mid+1; else hi=mid; }
+            float span = lm[lo+1] - lm[lo];
+            float frac = (span > 1e-12f) ? (val - lm[lo]) / span : 0.5f;
+            F32(out)[(size_t)i*D+d] = ((float)lo + frac) / (float)(n_quantiles - 1);
+        }
+    }
+    if (xc != X) tensor_free(xc);
+    if (lc != landmarks) tensor_free(lc);
+    return out;
+}
+
+// ─── 22.7  YEO-JOHNSON POWER TRANSFORM  ──────────────────────────────────────
+static float _yj_apply(float x, float lam) {
+    if (x >= 0.0f) {
+        if (fabsf(lam) < 1e-6f) return log1pf(x);
+        return (powf(x + 1.0f, lam) - 1.0f) / lam;
+    } else {
+        float lam2 = 2.0f - lam;
+        if (fabsf(lam2) < 1e-6f) return -log1pf(-x);
+        return -(powf(-x + 1.0f, lam2) - 1.0f) / lam2;
+    }
+}
+
+/* Fit optimal Yeo-Johnson lambda per feature via neg-log-likelihood.
+ * Returns [D] FLOAT32 lambdas. */
+Tensor* tensor_yj_fit(Tensor* X) {
+    if (!X||X->ndim!=2||X->dtype!=DTYPE_FLOAT32) TENSOR_ERROR("FATAL [yj_fit]: Invalid.");
+    int N = X->shape[0], D = X->shape[1];
+    Tensor* xc = tensor_is_contiguous(X) ? X : tensor_copy(X);
+    Tensor* lams = tensor_create_uninitialized(1, (int[]){D}, DTYPE_FLOAT32);
+    float* col = (float*)malloc((size_t)N * sizeof(float));
+    if (!col||!lams) { if (xc!=X) tensor_free(xc); if (lams) tensor_free(lams); free(col); TENSOR_ERROR("OOM"); }
+
+    for (int d = 0; d < D; d++) {
+        for (int i = 0; i < N; i++) col[i] = F32(xc)[(size_t)i*D+d];
+        /* Brent's method: minimize negative log-likelihood over lambda in [-5,5] */
+        float best_lam = 0.0f, best_nll = FLT_MAX;
+        for (int step = 0; step <= 100; step++) {
+            float lam = -5.0f + 10.0f * (float)step / 100.0f;
+            /* transform column, compute variance */
+            float sum = 0.0f, sum2 = 0.0f;
+            float log_abs_sum = 0.0f;
+            for (int i = 0; i < N; i++) {
+                float t = _yj_apply(col[i], lam);
+                sum += t; sum2 += t*t;
+                log_abs_sum += (col[i] >= 0.0f)
+                    ? logf(col[i] + 1.0f) : logf(-col[i] + 1.0f);
+            }
+            float mean = sum / (float)N;
+            float var  = sum2/(float)N - mean*mean;
+            if (var < 1e-12f) var = 1e-12f;
+            float nll = 0.5f * (float)N * logf(var) - (lam - 1.0f) * log_abs_sum;
+            if (nll < best_nll) { best_nll = nll; best_lam = lam; }
+        }
+        F32(lams)[d] = best_lam;
+    }
+    free(col);
+    if (xc != X) tensor_free(xc);
+    return lams;
+}
+
+/* Apply Yeo-Johnson transform per column using fitted lambdas.
+ * lambdas: [D]; X: [N,D] → [N,D] FLOAT32 */
+Tensor* tensor_yj_transform(Tensor* X, Tensor* lambdas) {
+    if (!X||!lambdas||X->ndim!=2) TENSOR_ERROR("FATAL [yj_transform]: Invalid.");
+    int N = X->shape[0], D = X->shape[1];
+    if ((int)lambdas->total_size != D) TENSOR_ERROR("FATAL [yj_transform]: Lambda size mismatch.");
+    Tensor* xc = tensor_is_contiguous(X) ? X : tensor_copy(X);
+    Tensor* out = tensor_create_uninitialized(2, (int[]){N, D}, DTYPE_FLOAT32);
+    float* lp = F32(lambdas);
+    if (!out) { if (xc!=X) tensor_free(xc); TENSOR_ERROR("OOM"); }
+    #pragma omp parallel for schedule(static) if(N*D > 50000)
+    for (int i = 0; i < N; i++) {
+        for (int d = 0; d < D; d++)
+            F32(out)[(size_t)i*D+d] = _yj_apply(F32(xc)[(size_t)i*D+d], lp[d]);
+    }
+    if (xc != X) tensor_free(xc);
+    return out;
+}
+
+/* Inverse Yeo-Johnson — needed for QuantileTransformer normal output. */
+static float _yj_inv(float y, float lam) {
+    if (y >= 0.0f) {
+        if (fabsf(lam) < 1e-6f) return expm1f(y);
+        return powf(y*lam + 1.0f, 1.0f/lam) - 1.0f;
+    } else {
+        float lam2 = 2.0f - lam;
+        if (fabsf(lam2) < 1e-6f) return -expm1f(-y);
+        return 1.0f - powf(-y*lam2 + 1.0f, 1.0f/lam2);
+    }
 }

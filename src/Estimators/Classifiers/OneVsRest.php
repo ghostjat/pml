@@ -5,6 +5,7 @@ namespace Pml\Estimators\Classifiers;
 
 use Pml\Interfaces\Learner;
 use Pml\Interfaces\Probabilistic;
+use Pml\Interfaces\Persistable;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -19,7 +20,7 @@ use RuntimeException;
  *
  * @template T of (Learner&Probabilistic)
  */
-final class OneVsRest implements Learner, Probabilistic
+final class OneVsRest implements Learner, Probabilistic, Persistable
 {
     /** @var array<int, Learner&Probabilistic> */
     private array $classifiers = [];
@@ -95,5 +96,34 @@ final class OneVsRest implements Learner, Probabilistic
     public function trained(): bool
     {
         return !empty($this->classifiers);
+    }
+
+    public function save(string $dir): void
+    {
+        is_dir($dir) || mkdir($dir, 0755, true);
+        $manifest = [];
+        foreach ($this->classifiers as $idx => $clf) {
+            if (!($clf instanceof Persistable)) {
+                throw new RuntimeException("OneVsRest::save() requires all classifiers to implement Persistable.");
+            }
+            $clf->save($dir . '/clf_' . $idx);
+            $manifest[] = get_class($clf);
+        }
+        file_put_contents($dir . '/config.json', json_encode(['classes' => $this->classes, 'clfClasses' => $manifest]));
+    }
+
+    public static function load(string $dir): self
+    {
+        $c = json_decode(file_get_contents($dir . '/config.json'), true);
+        // Reconstruct using the first classifier as prototype (already trained; clone not needed)
+        $clfs = [];
+        foreach ($c['clfClasses'] as $idx => $class) {
+            $clfs[] = $class::load($dir . '/clf_' . $idx);
+        }
+        // prototype is only used at train time; pass first clf as a stand-in
+        $i = new self($clfs[0]);
+        $i->classifiers = $clfs;
+        $i->classes = $c['classes'] ?? [];
+        return $i;
     }
 }

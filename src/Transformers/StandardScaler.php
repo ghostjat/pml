@@ -11,11 +11,14 @@ use Pml\Dataset;
 use RuntimeException;
 
 /**
- * Standard Scaler (Z-Score Normalization).
- * Standardizes features by removing the mean and scaling to unit variance.
- * * JIT & Memory Optimized:
- * - Computes Variance natively in C using the formula: Var = E[X^2] - E[X]^2.
- * - Applies scaling via zero-allocation In-Place broadcasting.
+ * @deprecated Use ZScaleStandardizer instead — it adds Bessel correction (N-1
+ *             denominator for unbiased variance) and a center=false option.
+ *             This class is kept for backward-compatibility only and will be
+ *             removed in a future major release.
+ *
+ *             Migration:
+ *               - Replace `new StandardScaler()` with `new ZScaleStandardizer()`
+ *               - Saved state keys are identical; no re-training required.
  */
 final class StandardScaler implements Transformer, Stateful
 {

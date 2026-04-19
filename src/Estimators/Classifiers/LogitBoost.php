@@ -5,8 +5,10 @@ namespace Pml\Estimators\Classifiers;
 
 use Pml\Interfaces\Learner;
 use Pml\Interfaces\Probabilistic;
+use Pml\Interfaces\Persistable;
 use Pml\Tensor;
 use Pml\Dataset;
+use Pml\Estimators\Classifiers\DecisionTreeClassifier;
 use RuntimeException;
 
 /**
@@ -18,7 +20,7 @@ use RuntimeException;
  * - Tree predictions are collected as Tensors; summation uses in-place addInplace.
  * - Only one toFlatArray() at the very end to materialise integer predictions.
  */
-final class LogitBoost implements Learner, Probabilistic
+final class LogitBoost implements Learner, Probabilistic, Persistable
 {
     /** @var DecisionTreeClassifier[] */
     private array $trees          = [];
@@ -90,5 +92,25 @@ final class LogitBoost implements Learner, Probabilistic
     public function trained(): bool
     {
         return !empty($this->trees);
+    }
+
+    public function save(string $dir): void
+    {
+        is_dir($dir) || mkdir($dir, 0755, true);
+        file_put_contents($dir . '/config.json', json_encode(['estimators' => $this->estimators, 'learningRate' => $this->learningRate, 'maxDepth' => $this->maxDepth, 'minSamples' => $this->minSamples, 'learningRates' => $this->learningRates]));
+        $treeData = [];
+        foreach ($this->trees as $tree) { $treeData[] = $tree->exportPhpTree(); }
+        file_put_contents($dir . '/trees.json', json_encode($treeData));
+    }
+
+    public static function load(string $dir): self
+    {
+        $c = json_decode(file_get_contents($dir . '/config.json'), true);
+        $i = new self((int) $c['estimators'], (float) $c['learningRate'], (int) $c['maxDepth'], (int) $c['minSamples']);
+        $i->learningRates = $c['learningRates'] ?? [];
+        foreach (json_decode(file_get_contents($dir . '/trees.json'), true) as $treeData) {
+            $i->trees[] = DecisionTreeClassifier::fromPhpTree($treeData);
+        }
+        return $i;
     }
 }

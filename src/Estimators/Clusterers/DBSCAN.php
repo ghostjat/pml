@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Pml\Estimators\Clusterers;
 
 use Pml\Interfaces\Learner;
+use Pml\Interfaces\Persistable;
+use Pml\Lib\SafeTensorsIO;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -17,7 +19,7 @@ use RuntimeException;
  * - Extracts neighborhood masks via C-level boolean indexing (`booleanIndex`).
  * - Transductive inference maps new samples to cached core points efficiently.
  */
-final class DBSCAN implements Learner
+final class DBSCAN implements Learner, Persistable
 {
     private float $epsilon;
     private int $minSamples;
@@ -196,5 +198,29 @@ final class DBSCAN implements Learner
     public function labels(): ?Tensor
     {
         return $this->clusterLabels;
+    }
+
+    public function save(string $dir): void
+    {
+        is_dir($dir) || mkdir($dir, 0755, true);
+        file_put_contents($dir . '/config.json', json_encode(['epsilon'=>$this->epsilon,'minSamples'=>$this->minSamples]));
+        $tensors = [];
+        if ($this->clusterLabels !== null) $tensors['cluster_labels'] = $this->clusterLabels;
+        if ($this->coreSamples  !== null) $tensors['core_samples']   = $this->coreSamples;
+        if ($this->coreLabels   !== null) $tensors['core_labels']    = $this->coreLabels;
+        if ($tensors) SafeTensorsIO::save($dir . '/model.safetensors', $tensors);
+    }
+    public static function load(string $dir): self
+    {
+        $c = json_decode(file_get_contents($dir . '/config.json'), true);
+        $i = new self((float)$c['epsilon'], (int)$c['minSamples']);
+        $stPath = $dir . '/model.safetensors';
+        if (is_file($stPath)) {
+            $t = SafeTensorsIO::load($stPath);
+            $i->clusterLabels = $t['cluster_labels'] ?? null;
+            $i->coreSamples   = $t['core_samples']   ?? null;
+            $i->coreLabels    = $t['core_labels']     ?? null;
+        }
+        return $i;
     }
 }

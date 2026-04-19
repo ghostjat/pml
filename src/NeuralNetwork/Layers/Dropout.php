@@ -33,25 +33,16 @@ final class Dropout implements Layer, HasTrainingMode
 
     public function forward(Tensor $input): Tensor
     {
-        // During inference, Dropout acts as an identity function.
         if (!$this->training || $this->rate === 0.0) {
-            return $input->copy(); 
+            return $input->copy();
         }
 
-        // 1. Generate a boolean mask in C-memory (1.0 to keep, 0.0 to drop)
-        $rand = Tensor::randomUniform($input->shape(), 0.0, 1.0);
-        
-        // Threshold tensor for the keep probability: (1.0 - rate)
-        $threshold = Tensor::ones(...$input->shape())->mulScalarInplace($this->rate);
-        
-        $this->mask = $rand->greaterEqual($threshold);
-        
-        // 2. Inverted Dropout Scaling
-        // Scale the kept weights up during training by 1 / (1 - rate)
-        // This ensures the expected sum remains consistent, avoiding scaling during inference.
-        $this->mask->mulScalarInplace(1.0 / (1.0 - $this->rate));
+        // greaterScalar(keepProb) replaces: ones() + mulScalar(rate) + greaterEqual()
+        // Saves 2 allocations (ones tensor + threshold tensor) per forward call.
+        $this->mask = Tensor::randomUniform($input->shape(), 0.0, 1.0)
+            ->greaterScalar(1.0 - $this->rate)
+            ->mulScalarInplace(1.0 / (1.0 - $this->rate));
 
-        // 3. Apply the mask natively
         return $input->mul($this->mask);
     }
 

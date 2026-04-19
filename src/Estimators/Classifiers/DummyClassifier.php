@@ -5,14 +5,11 @@ declare(strict_types=1);
 namespace Pml\Estimators\Classifiers;
 
 use Pml\Interfaces\Learner;
+use Pml\Interfaces\Persistable;
 use Pml\Tensor;
 use Pml\Dataset;
 
-/**
- * Dummy Classifier.
- * Acts as a baseline sanity-check by always predicting the most frequent class.
- */
-final class DummyClassifier implements Learner
+final class DummyClassifier implements Learner, Persistable
 {
     private ?float $mode = null;
 
@@ -32,8 +29,17 @@ final class DummyClassifier implements Learner
         return Tensor::zeros($dataset->numRows())->addScalarInplace($this->mode);
     }
 
-    public function trained(): bool
+    public function trained(): bool { return $this->mode !== null; }
+
+    public function save(string $dir): void
     {
-        return $this->mode !== null;
+        if (!is_dir($dir)) mkdir($dir, 0755, true);
+        file_put_contents($dir . '/config.json', json_encode(['class' => self::class, 'mode' => $this->mode]));
+    }
+
+    public static function load(string $dir): self
+    {
+        $c = json_decode(file_get_contents($dir . '/config.json'), true);
+        $i = new self(); $i->mode = (float) $c['mode']; return $i;
     }
 }

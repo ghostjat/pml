@@ -46,6 +46,24 @@ final class Dataset
     private int $numRows        = 0;
     private int $numColumns     = 0;
 
+    // ── Reproducibility ─────────────────────────────────────────────────────
+    /** Process-wide seed for randomize(). null = non-deterministic (default). */
+    private static ?int $globalSeed = null;
+
+    /**
+     * Set a global seed so that all subsequent randomize() calls produce the
+     * same shuffle order.  Enables fully reproducible training runs.
+     *
+     * Pass null to revert to non-deterministic behaviour.
+     */
+    public static function seed(?int $seed): void
+    {
+        self::$globalSeed = $seed;
+        if ($seed !== null) {
+            \mt_srand($seed);
+        }
+    }
+
     // ── ETL mode ─────────────────────────────────────────────────────────
     /** Opaque C DataFrame* pointer; null when in Tensor mode. */
     private ?\FFI\CData $dfPtr      = null;
@@ -167,6 +185,50 @@ final class Dataset
     // =========================================================================
 
     /**
+     * Declare which column index is the label column for this ETL-mode Dataset.
+     *
+     * Dataset::load() sets dfLabelCol = -1 (no label).  Call this to tell the
+     * ETL pipeline (and WordCountVectorizer) which column holds the targets so
+     * that label extraction works in transform().
+     *
+     * @param int $col  0-based column index (-1 to clear).
+     * @return $this    Fluent; mutates in-place (same ETL object).
+     */
+    public function withLabelColumn(int $col): self
+    {
+        $this->_requireEtlMode(__METHOD__);
+        $this->dfLabelCol = $col;
+        return $this;
+    }
+
+    /**
+     * Extract ONLY the label column from the C DataFrame as a 1-D Tensor.
+     *
+     * Unlike materialize(), this does NOT touch feature columns — so it works
+     * even when the DataFrame contains non-numeric columns (e.g. text) that
+     * df_to_tensor cannot pack.
+     *
+     * Returns null if no label column has been set (dfLabelCol < 0).
+     */
+    public function extractLabelTensor(): ?Tensor
+    {
+        $this->_requireEtlMode(__METHOD__);
+        if ($this->dfLabelCol < 0) {
+            return null;
+        }
+        $ffi  = TensorEngine::get();
+        $n    = (int) $ffi->df_num_cols($this->dfPtr);
+        if ($this->dfLabelCol >= $n) {
+            return null;
+        }
+        $lIdx    = $ffi->new('int[1]');
+        $lIdx[0] = $this->dfLabelCol;
+        $lPtr    = $ffi->df_to_tensor($this->dfPtr, $ffi->cast('int*', $lIdx), 1);
+        self::_checkCError();
+        return Tensor::wrap($lPtr)->flatten(); // [N×1] → [N]
+    }
+
+    /**
      * Remove every row that contains at least one missing value.
      * Sentinels: NaN (FLOAT32), INT32_MIN (INT32), category index < 0 (STRING).
      * Requires ETL mode — call on the result of Dataset::load().
@@ -178,6 +240,28 @@ final class Dataset
         $newPtr = $ffi->df_drop_nans($this->dfPtr);
         self::_checkCError();
         return self::_fromDfPtr($newPtr, $this->dfLabelCol);
+    }
+
+    /**
+     * Return a new ETL-mode Dataset containing rows [$offset, $offset+$n).
+     * STRING columns are category-compacted to only used entries.
+     * Clamps to available rows; preserves dfLabelCol.
+     */
+    public function sliceRowsEtl(int $offset, int $n): self
+    {
+        $this->_requireEtlMode(__METHOD__);
+        $ffi    = TensorEngine::get();
+        $newPtr = $ffi->df_slice_rows($this->dfPtr, $offset, $n);
+        self::_checkCError();
+        return self::_fromDfPtr($newPtr, $this->dfLabelCol);
+    }
+
+    /**
+     * Convenience — equivalent to sliceRowsEtl(0, $n).
+     */
+    public function headRows(int $n): self
+    {
+        return $this->sliceRowsEtl(0, $n);
     }
 
     /**
@@ -280,39 +364,35 @@ final class Dataset
      * @return array<int, array{name: string, dtype: int, n_categories: int}>
      */
     public function schema(): array
-    {
-        if ($this->dfPtr === null) return [];
-        $ffi  = TensorEngine::get();
-        $n    = (int) $ffi->df_num_cols($this->dfPtr);
-        $cols = [];
-        for ($c = 0; $c < $n; $c++) {
-            $raw    = $ffi->df_col_name($this->dfPtr, $c);
-            $cols[] = [
-                'name'         => $raw !== null ? \FFI::string($raw) : "col_{$c}",
-                'dtype'        => (int) $ffi->df_col_dtype($this->dfPtr, $c),
-                'n_categories' => (int) $ffi->df_col_n_categories($this->dfPtr, $c),
-            ];
-        }
-        return $cols;
-    }
+	{
+		if ($this->dfPtr === null) return [];
+		$ffi  = TensorEngine::get();
+		$n    = (int) $ffi->df_num_cols($this->dfPtr);
+		$cols = [];
+		for ($c = 0; $c < $n; $c++) {
+			$raw = $ffi->df_col_name($this->dfPtr, $c);
+			$name = ($raw instanceof \FFI\CData) ? \FFI::string($raw) : (string)$raw;
+			$cols[] = [
+				'name'         => $name ?: "col_{$c}",
+				'dtype'        => (int) $ffi->df_col_dtype($this->dfPtr, $c),
+				'n_categories' => (int) $ffi->df_col_n_categories($this->dfPtr, $c),
+			];
+		}
+		return $cols;
+	}
 
-    /**
-     * Return all category strings for a STRING column (ETL mode only).
-     *
-     * @return string[]
-     */
-    public function categories(int $colIdx): array
-    {
-        $this->_requireEtlMode(__METHOD__);
-        $ffi  = TensorEngine::get();
-        $n    = (int) $ffi->df_col_n_categories($this->dfPtr, $colIdx);
-        $cats = [];
-        for ($i = 0; $i < $n; $i++) {
-            $raw    = $ffi->df_col_category_name($this->dfPtr, $colIdx, $i);
-            $cats[] = $raw !== null ? \FFI::string($raw) : '';
-        }
-        return $cats;
-    }
+	public function categories(int $colIdx): array
+	{
+		$this->_requireEtlMode(__METHOD__);
+		$ffi  = TensorEngine::get();
+		$n    = (int) $ffi->df_col_n_categories($this->dfPtr, $colIdx);
+		$cats = [];
+		for ($i = 0; $i < $n; $i++) {
+			$raw = $ffi->df_col_category_name($this->dfPtr, $colIdx, $i);
+			$cats[] = ($raw instanceof \FFI\CData) ? \FFI::string($raw) : (string)$raw;
+		}
+		return $cats;
+	}
 
     // =========================================================================
     // Properties  (Tensor mode; auto-materialises if needed)
@@ -320,6 +400,9 @@ final class Dataset
 
     public function samples(): Tensor  { $this->_ensureTensorMode(); return $this->samples; }
     public function labels(): ?Tensor  { $this->_ensureTensorMode(); return $this->labels;  }
+
+    /** Return the raw C DataFrame* pointer (ETL mode only). */
+    public function rawDfPtr(): ?\FFI\CData { return $this->dfPtr; }
 
     public function numRows(): int {
         /* Avoid materialising just to count — ask C directly in ETL mode */
@@ -495,6 +578,9 @@ final class Dataset
     public function randomize(): self
     {
         $this->_ensureTensorMode();
+        if (self::$globalSeed !== null) {
+            \mt_srand(self::$globalSeed);
+        }
         $idx           = Tensor::randomUniform([$this->numRows], 0, 1)->argsort();
         $this->samples = $this->samples->take($idx, 0);
         if ($this->labels) $this->labels = $this->labels->take($idx, 0);
@@ -685,12 +771,70 @@ final class Dataset
 
     /** Propagate C-engine errors as PHP RuntimeExceptions. */
     private static function _checkCError(): void
+	{
+		$ffi = TensorEngine::get();
+		if ($ffi->tensor_check_error()) {
+			$errPtr = $ffi->tensor_get_last_error();
+			// FFI may return const char* as either FFI\CData or plain PHP string
+			$err = ($errPtr instanceof \FFI\CData) ? \FFI::string($errPtr) : (string)$errPtr;
+			$ffi->tensor_clear_error();
+			throw new RuntimeException($err);
+		}
+	}
+    
+	/**
+	 * Check if the Dataset is in ETL mode (has a C DataFrame pointer).
+	 */
+	public function isEtlMode(): bool
+	{
+		return $this->dfPtr !== null;
+	}
+
+	/**
+	 * Get the opaque C DataFrame pointer.
+	 * For internal use by transformers that operate directly on the DataFrame.
+	 *
+	 * @internal
+	 * @return \FFI\CData|null
+	 */
+	public function getDataFramePointer(): ?\FFI\CData
+	{
+		return $this->dfPtr;
+	}
+    
+    /**
+     * Get the index of a column by name (ETL mode only).
+     */
+    public function columnIndex(string $name): int
     {
-        $ffi = TensorEngine::get();
-        if ($ffi->tensor_check_error()) {
-            $msg = \FFI::string($ffi->tensor_get_last_error());
-            $ffi->tensor_clear_error();
-            throw new RuntimeException($msg);
+        $schema = $this->schema();
+        foreach ($schema as $idx => $col) {
+            if ($col['name'] === $name) {
+                return $idx;
+            }
         }
+        throw new RuntimeException("Column '{$name}' not found.");
+    }
+
+    /**
+     * Check if a column is of STRING type (ETL mode only).
+     */
+    public function isTextColumn($column): bool
+    {
+        $idx = is_int($column) ? $column : $this->columnIndex($column);
+        $schema = $this->schema();
+        return isset($schema[$idx]) && $schema[$idx]['dtype'] === 2;
+    }
+
+    /**
+     * Apply Bag‑of‑Words transformation to a text column.
+     *
+     * Convenience wrapper around WordCountVectorizer.
+     */
+    public function bagOfWords($column, ?int $maxFeatures = null): self
+    {
+        $colName = \is_int($column) ? $this->schema()[$column]['name'] : $column;
+        $vec = new \Pml\Transformers\WordCountVectorizer($maxFeatures, $colName);
+        return $vec->fitTransform($this);
     }
 }

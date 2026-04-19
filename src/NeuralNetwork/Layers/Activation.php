@@ -35,11 +35,9 @@ final class Activation implements Layer
             throw new RuntimeException("Backward pass called before forward pass.");
         }
 
-        // 1. Compute derivative of the activation function: f'(z)
-        $dz = $this->fn->differentiate($this->z);
-
-        // 2. Chain rule: dY * f'(z) (Element-wise multiplication in C)
-        return $dY->mul($dz);
+        // dY is a fresh throw-away tensor from the layer above — safe to mutate.
+        // mulInplace eliminates one output-buffer allocation vs mul().
+        return $dY->mulInplace($this->fn->differentiate($this->z));
     }
 
     public function getParameters(): array

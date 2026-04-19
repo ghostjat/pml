@@ -57,48 +57,27 @@ final class KNNClassifier implements Learner, Persistable
             throw new RuntimeException("K-Nearest Neighbors is not trained.");
         }
 
-        $testX = $dataset->samples();
-        $nTest = $testX->shape()[0];
+        $testX  = $dataset->samples();
         $nTrain = $this->fitSamples->shape()[0];
-        
-        // Ensure K doesn't exceed the number of training samples
-        $k = min($this->k, $nTrain);
-        
-        $preds = [];
+        $k      = min($this->k, $nTrain);
 
-        // JIT Loop: Iterates over test samples, but offloads ALL heavy math to OpenBLAS C-Memory
+        // Single BLAS call: [nTest, nTrain] pairwise squared L2 distances
+        $distMat    = Tensor::pairwiseSqL2($testX, $this->fitSamples);   // [nTest, nTrain]
+        $sortedIdx  = $distMat->argsort(1);                               // [nTest, nTrain] ascending
+        $kNeighbors = $sortedIdx->slice(1, 0, $k);                       // [nTest, k]
+
+        // Majority vote per row: gather labels, bincount, argmax — all in C
+        $flat    = $kNeighbors->reshape($testX->shape()[0] * $k);           // [nTest*k]
+        $kLabels = $this->fitLabels->take($flat, 0)
+                                   ->reshape($testX->shape()[0], $k);     // [nTest, k]
+
+        // Per-row bincount + argmax — zero-copy row views, 2 C calls per row
+        $nTest = $testX->shape()[0];
+        $votes = [];
         for ($i = 0; $i < $nTest; $i++) {
-            
-            // 1. Extract the single test instance (Zero-copy view) -> Shape: [D]
-            $x = $testX->row($i);
-
-            // 2. Broadcast Subtraction: [N_train, D] - [D]
-            // This computes the difference between the test point and EVERY training point simultaneously.
-            $diff = $this->fitSamples->sub($x);
-
-            // 3. Squared Euclidean Distance: sum( (X_train - x)^2, axis=1 )
-            // We use Squared distance because sqrt() is monotonically increasing and unnecessary for sorting.
-            $sqDist = $diff->square()->sumAxis(1);
-
-            // 4. Sort distances and extract the Top K indices
-            // argsort() executes natively via C QuickSort and returns the integer indices ascending
-            $sortedIndices = $sqDist->argsort();
-            $kIndices = $sortedIndices->slice(0, 0, $k);
-
-            // 5. Gather the ground-truth labels of the K nearest neighbors
-            $kLabels = $this->fitLabels->take($kIndices, 0);
-
-            // 6. Majority Vote
-            // tensor_bincount tallies the frequencies, argmax() safely returns the highest integer class.
-            $vote = (float) $kLabels->bincount()->argmax();
-            $preds[] = $vote;
-
-            // Memory Lifecycle Note:
-            // $x, $diff, $sqDist, $sortedIndices, $kIndices, and $kLabels fall out of scope here.
-            // PHP cleanly calls their __destruct() methods, safely freeing the massive C-buffers instantly!
+            $votes[] = (float)$kLabels->row($i)->bincount()->argmax();
         }
-
-        return Tensor::fromArray($preds);
+        return Tensor::fromArray($votes);
     }
 
     public function trained(): bool

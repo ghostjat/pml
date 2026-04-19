@@ -4,6 +4,8 @@ declare(strict_types=1);
 namespace Pml\Estimators\Regression;
 
 use Pml\Interfaces\Learner;
+use Pml\Lib\SafeTensorsIO;
+use Pml\Interfaces\Persistable;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -16,7 +18,7 @@ use RuntimeException;
  * - All arithmetic is pure in-place BLAS (matmul + scalar ops).
  * - No intermediate arrays cross the FFI boundary during training.
  */
-final class Adaline implements Learner
+final class Adaline implements Learner, Persistable
 {
     private ?Tensor $weights = null;
     private float   $bias    = 0.0;
@@ -69,5 +71,21 @@ final class Adaline implements Learner
     public function trained(): bool
     {
         return $this->weights !== null;
+    }
+
+    public function save(string $dir): void
+    {
+        is_dir($dir) || mkdir($dir, 0755, true);
+        file_put_contents($dir . '/config.json', json_encode(['epochs'=>$this->epochs,'learningRate'=>$this->learningRate,'batchSize'=>$this->batchSize,'bias'=>$this->bias]));
+        if ($this->weights !== null) SafeTensorsIO::save($dir . '/model.safetensors', ['weights' => $this->weights]);
+    }
+    public static function load(string $dir): self
+    {
+        $c = json_decode(file_get_contents($dir . '/config.json'), true);
+        $i = new self((int)$c['epochs'], (float)$c['learningRate'], (int)$c['batchSize']);
+        $i->bias = (float)$c['bias'];
+        $stPath = $dir . '/model.safetensors';
+        if (is_file($stPath)) { $t = SafeTensorsIO::load($stPath); $i->weights = $t['weights'] ?? null; }
+        return $i;
     }
 }

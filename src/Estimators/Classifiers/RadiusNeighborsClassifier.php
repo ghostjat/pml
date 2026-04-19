@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Pml\Estimators\Classifiers;
 
 use Pml\Interfaces\Learner;
+use Pml\Lib\SafeTensorsIO;
+use Pml\Interfaces\Persistable;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -16,7 +18,7 @@ use RuntimeException;
  * * JIT & Memory Optimized:
  * - Uses AVX2 Boolean Masking (`less()`) to extract points within the radius natively in C.
  */
-final class RadiusNeighborsClassifier implements Learner
+final class RadiusNeighborsClassifier implements Learner, Persistable
 {
     private float $radius;
     private ?Tensor $fitSamples = null;
@@ -69,5 +71,20 @@ final class RadiusNeighborsClassifier implements Learner
     public function trained(): bool
     {
         return $this->fitSamples !== null;
+    }
+
+    public function save(string $dir): void
+    {
+        is_dir($dir) || mkdir($dir, 0755, true);
+        file_put_contents($dir . '/config.json', json_encode(['radius' => $this->radius]));
+        if ($this->fitSamples !== null) SafeTensorsIO::save($dir . '/model.safetensors', ['fit_samples' => $this->fitSamples, 'fit_labels' => $this->fitLabels]);
+    }
+    public static function load(string $dir): self
+    {
+        $c = json_decode(file_get_contents($dir . '/config.json'), true);
+        $i = new self((float)$c['radius']);
+        $stPath = $dir . '/model.safetensors';
+        if (is_file($stPath)) { $t = SafeTensorsIO::load($stPath); $i->fitSamples = $t['fit_samples'] ?? null; $i->fitLabels = $t['fit_labels'] ?? null; }
+        return $i;
     }
 }

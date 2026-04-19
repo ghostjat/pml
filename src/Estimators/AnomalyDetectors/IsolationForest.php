@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Pml\Estimators\AnomalyDetectors;
 
 use Pml\Interfaces\Learner;
+use Pml\Interfaces\Persistable;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -17,7 +18,7 @@ use RuntimeException;
  * - Extracts split masks locally to route data instantly without FFI bottlenecks.
  * - Caches anomaly scores for zero-copy decision thresholding.
  */
-final class IsolationForest implements Learner
+final class IsolationForest implements Learner, Persistable
 {
     private int $nEstimators;
     private int $sampleSize;
@@ -231,5 +232,22 @@ final class IsolationForest implements Learner
     public function trained(): bool
     {
         return !empty($this->trees);
+    }
+
+    public function save(string $dir): void
+    {
+        is_dir($dir) || mkdir($dir, 0755, true);
+        file_put_contents($dir . '/config.json', json_encode(['nEstimators' => $this->nEstimators, 'sampleSize' => $this->sampleSize, 'contamination' => $this->contamination, 'threshold' => $this->threshold, 'nFeatures' => $this->nFeatures]));
+        file_put_contents($dir . '/trees.json', json_encode($this->trees));
+    }
+
+    public static function load(string $dir): self
+    {
+        $c = json_decode(file_get_contents($dir . '/config.json'), true);
+        $i = new self((int) $c['nEstimators'], (int) $c['sampleSize'], (float) $c['contamination']);
+        $i->threshold = (float) $c['threshold'];
+        $i->nFeatures = (int) $c['nFeatures'];
+        $i->trees = json_decode(file_get_contents($dir . '/trees.json'), true);
+        return $i;
     }
 }

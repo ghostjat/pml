@@ -4,10 +4,12 @@ declare(strict_types=1);
 
 namespace Pml;
 
+use Pml\Interfaces\FitTransformable;
 use Pml\Interfaces\Learner;
 use Pml\Interfaces\Persistable;
-use Pml\Interfaces\Stateful;
+use Pml\Interfaces\TrainableWithOptions;
 use Pml\Interfaces\Transformer;
+use Pml\Lib\ModelStore;
 use Pml\Lib\SafeTensorsIO;
 use Pml\Tensor;
 use Pml\Dataset;
@@ -33,22 +35,33 @@ final class Pipeline implements Learner, Persistable
      * Passes the dataset through all transformers, fitting them if necessary, 
      * before passing the final data to the underlying estimator's train method.
      */
-    public function train(Dataset $dataset, ...$args): void
+    public function train(Dataset $dataset, mixed ...$args): void
     {
         $currentDataset = $dataset;
 
         foreach ($this->transformers as $transformer) {
-            $transformer->fit($currentDataset);
-            $currentDataset = $transformer->transform($currentDataset);
+            // FitTransformable fuses fit+transform into one dataset scan (O(n) vs 2×O(n)).
+            if ($transformer instanceof FitTransformable) {
+                $currentDataset = $transformer->fitTransform($currentDataset);
+            } else {
+                $transformer->fit($currentDataset);
+                $currentDataset = $transformer->transform($currentDataset);
+            }
         }
 
-        // Dynamically invoke the underlying estimator's train method to pass through 
-        // complex arguments (like epochs, validation sets) required by Sequential networks.
-        $this->estimator->train($currentDataset, ...$args);
+        // Forward variadic training options (epochs, validation, patience …) only when
+        // the estimator explicitly declares support via TrainableWithOptions.
+        if ($this->estimator instanceof TrainableWithOptions) {
+            $this->estimator->train($currentDataset, ...$args);
+        } else {
+            $this->estimator->train($currentDataset);
+        }
     }
 
     /**
      * Transforms the inference dataset and delegates the prediction to the estimator.
+     * Guards each transformer with a fitted() check so a stale or mis-loaded
+     * pipeline fails loudly rather than producing silently corrupted predictions.
      */
     public function predict(Dataset $dataset): Tensor
     {
@@ -58,7 +71,16 @@ final class Pipeline implements Learner, Persistable
 
         $currentDataset = $dataset;
 
-        foreach ($this->transformers as $transformer) {
+        foreach ($this->transformers as $i => $transformer) {
+            if (!$transformer->fitted()) {
+                throw new \RuntimeException(
+                    \sprintf(
+                        "Transformer %d (%s) is not fitted. Call train() or load a saved pipeline first.",
+                        $i,
+                        \get_class($transformer)
+                    )
+                );
+            }
             $currentDataset = $transformer->transform($currentDataset);
         }
 
@@ -71,16 +93,16 @@ final class Pipeline implements Learner, Persistable
     }
 
     // ========================================================================
-    // PERSISTENCE — SafeTensors + JSON bundle
+    // PERSISTENCE — ModelStore-based, zero serialize(), zero FFI\CData
     //
     // Saved layout:
-    //   $dir/config.json                — class names, no C-data
-    //   $dir/transformers.safetensors  — Stateful transformer tensors (if any)
-    //   $dir/estimator/                — estimator sub-directory (Persistable)
+    //   $dir/config.json               — transformer + estimator metadata
+    //   $dir/transformers.safetensors  — Tensor state for all transformers
+    //   $dir/estimator/                — estimator directory (ModelStore or Persistable)
     //
-    // Transformers are overwhelmingly pure-PHP (scalers, encoders, etc.).
-    // Their PHP object shells are serialised directly; any that implement
-    // Stateful have their Tensor state extracted to SafeTensors first.
+    // Every transformer is encoded via ModelStore::toArray() (Reflection or
+    // Saveable — never serialize()).  Tensor weights are collected with a
+    // per-transformer prefix and written to a single SafeTensors file.
     // ========================================================================
 
     public function save(string $dir): void
@@ -95,23 +117,15 @@ final class Pipeline implements Learner, Persistable
         foreach ($this->transformers as $i => $transformer) {
             $prefix = "transformer_{$i}.";
 
-            if ($transformer instanceof Stateful) {
-                foreach ($transformer->getStateDict($prefix) as $key => $tensor) {
-                    $tensorDict[$key] = $tensor;
-                }
-                $transformerCfg[] = [
-                    'stateful' => true,
-                    'prefix'   => $prefix,
-                    'shell'    => base64_encode(serialize(self::stripTensors($transformer))),
-                ];
-            } else {
-                // Strip any Tensor properties (e.g. fitted scalers hold live C-buffers)
-                // before serialising — FFI\CData must never reach serialize().
-                $transformerCfg[] = [
-                    'stateful' => false,
-                    'shell'    => base64_encode(serialize(self::stripTensors($transformer))),
-                ];
+            // Collect Tensor state with prefix (Stateful or Reflection scan).
+            foreach (ModelStore::extractTensors($transformer) as $key => $tensor) {
+                $tensorDict[$prefix . $key] = $tensor;
             }
+
+            $transformerCfg[] = [
+                'prefix' => $prefix,
+                'data'   => ModelStore::toArray($transformer),
+            ];
         }
 
         if (!empty($tensorDict)) {
@@ -121,19 +135,21 @@ final class Pipeline implements Learner, Persistable
             );
         }
 
+        // Estimator: prefer its own Persistable::save() if available, else ModelStore.
         if ($this->estimator instanceof Persistable) {
             $this->estimator->save($dir . \DIRECTORY_SEPARATOR . 'estimator');
+        } else {
+            ModelStore::save($this->estimator, $dir . \DIRECTORY_SEPARATOR . 'estimator');
         }
-
-        $config = [
-            'class'           => self::class,
-            'estimator_class' => \get_class($this->estimator),
-            'transformers'    => $transformerCfg,
-        ];
 
         file_put_contents(
             $dir . \DIRECTORY_SEPARATOR . 'config.json',
-            json_encode($config, \JSON_PRETTY_PRINT | \JSON_UNESCAPED_SLASHES)
+            json_encode([
+                'class'           => self::class,
+                'estimator_class' => \get_class($this->estimator),
+                'estimator_mode'  => $this->estimator instanceof Persistable ? 'persistable' : 'modelstore',
+                'transformers'    => $transformerCfg,
+            ], \JSON_PRETTY_PRINT | \JSON_UNESCAPED_SLASHES)
         );
     }
 
@@ -147,61 +163,40 @@ final class Pipeline implements Learner, Persistable
         /** @var array<string,mixed> $config */
         $config = json_decode($raw, true, 512, \JSON_THROW_ON_ERROR);
 
-        // Load Stateful transformer tensors once (zero-copy mmap).
+        // Load all transformer Tensor weights once (zero-copy mmap).
         $stPath  = $dir . \DIRECTORY_SEPARATOR . 'transformers.safetensors';
         $weights = is_file($stPath) ? SafeTensorsIO::load($stPath) : [];
 
         $transformers = [];
         foreach ($config['transformers'] as $cfg) {
-            $transformer = unserialize(base64_decode($cfg['shell']));
-            if ($cfg['stateful'] && $transformer instanceof Stateful) {
-                $transformer->loadStateDict($weights, $cfg['prefix']);
+            $transformer = ModelStore::fromArray($cfg['data']);
+
+            // Filter the weight dict to this transformer's prefix, strip prefix before inject.
+            $prefix      = $cfg['prefix'];
+            $localTensors = [];
+            foreach ($weights as $k => $tensor) {
+                if (\str_starts_with($k, $prefix)) {
+                    $localTensors[\substr($k, \strlen($prefix))] = $tensor;
+                }
             }
+            if (!empty($localTensors)) {
+                ModelStore::injectTensors($transformer, $localTensors);
+            }
+
             $transformers[] = $transformer;
         }
 
+        // Estimator: use Persistable::load() or ModelStore::load() to match save().
         $estimatorClass = $config['estimator_class'];
-        if (!is_subclass_of($estimatorClass, Persistable::class)) {
-            throw new \RuntimeException(
-                "Pipeline::load — estimator '$estimatorClass' does not implement Persistable."
-            );
+        $estimatorDir   = $dir . \DIRECTORY_SEPARATOR . 'estimator';
+        $mode           = $config['estimator_mode'] ?? 'persistable';
+
+        if ($mode === 'persistable' && \is_subclass_of($estimatorClass, Persistable::class)) {
+            $estimator = $estimatorClass::load($estimatorDir);
+        } else {
+            $estimator = ModelStore::load($estimatorDir);
         }
-        $estimator = $estimatorClass::load($dir . \DIRECTORY_SEPARATOR . 'estimator');
 
         return new self($transformers, $estimator);
-    }
-
-    // -------------------------------------------------------------------------
-
-    private static function stripTensors(object $obj): object
-    {
-        $clone = clone $obj;
-        $class = \get_class($clone);
-
-        foreach ((new \ReflectionClass($clone))->getProperties() as $prop) {
-            $type = $prop->getType();
-            if (!$type instanceof \ReflectionNamedType) {
-                continue;
-            }
-            $typeName = $type->getName();
-            if ($typeName !== Tensor::class && !is_subclass_of($typeName, Tensor::class)) {
-                continue;
-            }
-
-            $prop->setAccessible(true);
-
-            if ($type->allowsNull()) {
-                $prop->setValue($clone, null);
-            } else {
-                $name = $prop->getName();
-                \Closure::bind(
-                    static function (object $o) use ($name): void { unset($o->$name); },
-                    null,
-                    $class
-                )($clone);
-            }
-        }
-
-        return $clone;
     }
 }

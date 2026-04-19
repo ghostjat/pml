@@ -19,6 +19,14 @@ final class OneHotLabelEncoder implements Transformer
 {
     private ?Tensor $categories = null;
 
+    /**
+     * Plain-PHP field that survives Pipeline::save()'s stripTensors() pass.
+     * Stores [cat0, cat1, ...] as float[] so __serialize/__unserialize can
+     * reconstruct $categories without needing the live Tensor.
+     * @var float[]
+     */
+    private array $categoryValues = [];
+
     public function fit(Dataset $dataset): void
     {
         $y = $dataset->labels();
@@ -29,7 +37,10 @@ final class OneHotLabelEncoder implements Transformer
         // 1. Extract unique categories and sort them: Output is 1D Tensor [K]
         $unique = $y->unique()->sort(0);
 
-        // 2. Expand to [1, K] to prepare for Hardware Broadcasting
+        // 2. Cache as plain PHP array (survives stripTensors Tensor-nulling)
+        $this->categoryValues = array_map('floatval', $unique->toFlatArray());
+
+        // 3. Expand to [1, K] to prepare for Hardware Broadcasting
         $this->categories = $unique->expandDims(0);
     }
 
@@ -67,5 +78,28 @@ final class OneHotLabelEncoder implements Transformer
     public function numCategories(): int
     {
         return $this->fitted() ? $this->categories->size() : 0;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Serialization — persist category count so fitted() stays true after load.
+    //
+    // Pipeline::save() calls stripTensors() which nulls $categories (Tensor),
+    // making fitted() return false on reload.  We instead store the category
+    // values as a plain PHP float[] and reconstruct the Tensor on unserialize.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    public function __serialize(): array
+    {
+        // $categoryValues is a plain float[] — always set by fit(), NOT nulled
+        // by Pipeline::save()'s stripTensors() (which only strips Tensor props).
+        return ['categoryValues' => $this->categoryValues];
+    }
+
+    public function __unserialize(array $data): void
+    {
+        $this->categoryValues = $data['categoryValues'] ?? [];
+        if (!empty($this->categoryValues)) {
+            $this->categories = Tensor::fromArray([$this->categoryValues]); // [1, K]
+        }
     }
 }

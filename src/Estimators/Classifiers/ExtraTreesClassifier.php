@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Pml\Estimators\Classifiers;
 
 use Pml\Interfaces\Learner;
+use Pml\Interfaces\Persistable;
 use Pml\Tensor;
 use Pml\Dataset;
 use Pml\Estimators\Trees\ExtraTreeClassifier;
@@ -16,7 +17,7 @@ use RuntimeException;
  * - Trades exhaustive optimization for extreme speed and higher variance.
  * - Bypasses bootstrap sampling to feed the whole dataset instantly to each weak learner.
  */
-final class ExtraTreesClassifier implements Learner
+final class ExtraTreesClassifier implements Learner, Persistable
 {
     private int $nEstimators;
     private int $maxDepth;
@@ -80,5 +81,24 @@ final class ExtraTreesClassifier implements Learner
     public function trained(): bool
     {
         return !empty($this->trees);
+    }
+
+    public function save(string $dir): void
+    {
+        is_dir($dir) || mkdir($dir, 0755, true);
+        file_put_contents($dir . '/config.json', json_encode(['nEstimators' => $this->nEstimators, 'maxDepth' => $this->maxDepth, 'minSamplesSplit' => $this->minSamplesSplit]));
+        $treeData = [];
+        foreach ($this->trees as $tree) { $treeData[] = $tree->exportPhpTree(); }
+        file_put_contents($dir . '/trees.json', json_encode($treeData));
+    }
+
+    public static function load(string $dir): self
+    {
+        $c = json_decode(file_get_contents($dir . '/config.json'), true);
+        $i = new self((int) $c['nEstimators'], (int) $c['maxDepth'], (int) $c['minSamplesSplit']);
+        foreach (json_decode(file_get_contents($dir . '/trees.json'), true) as $treeData) {
+            $i->trees[] = ExtraTreeClassifier::fromPhpTree($treeData);
+        }
+        return $i;
     }
 }

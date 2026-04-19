@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Pml\Estimators\Clusterers;
 
 use Pml\Interfaces\Learner;
+use Pml\Lib\SafeTensorsIO;
+use Pml\Interfaces\Persistable;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -16,7 +18,7 @@ use RuntimeException;
  * * JIT & Memory Optimized:
  * - Operates fully via C-Level masking and vector accumulation.
  */
-final class MeanShift implements Learner
+final class MeanShift implements Learner, Persistable
 {
     private float $bandwidth;
     private int $maxIter;
@@ -110,5 +112,20 @@ final class MeanShift implements Learner
     public function trained(): bool
     {
         return $this->centroids !== null;
+    }
+
+    public function save(string $dir): void
+    {
+        is_dir($dir) || mkdir($dir, 0755, true);
+        file_put_contents($dir . '/config.json', json_encode(['bandwidth'=>$this->bandwidth,'maxIter'=>$this->maxIter,'tolerance'=>$this->tolerance]));
+        if ($this->centroids !== null) SafeTensorsIO::save($dir . '/model.safetensors', ['centroids' => $this->centroids]);
+    }
+    public static function load(string $dir): self
+    {
+        $c = json_decode(file_get_contents($dir . '/config.json'), true);
+        $i = new self((float)$c['bandwidth'], (int)$c['maxIter'], (float)$c['tolerance']);
+        $stPath = $dir . '/model.safetensors';
+        if (is_file($stPath)) { $t = SafeTensorsIO::load($stPath); $i->centroids = $t['centroids'] ?? null; }
+        return $i;
     }
 }

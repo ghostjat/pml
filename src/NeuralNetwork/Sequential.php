@@ -6,10 +6,11 @@ namespace Pml\NeuralNetwork;
 
 use Pml\Tensor;
 use Pml\Dataset;
-use Pml\Interfaces\Learner;
 use Pml\Interfaces\Persistable;
 use Pml\Interfaces\Stateful;
+use Pml\Interfaces\TrainableWithOptions;
 use Pml\Interfaces\Verbose;
+use Pml\Lib\ModelStore;
 use Pml\Lib\SafeTensorsIO;
 use Pml\Losses\Loss;
 use Pml\NeuralNetwork\Optimizers\Optimizer;
@@ -17,10 +18,10 @@ use Psr\Log\LoggerInterface;
 
 /**
  * A Sequential Neural Network Model Container.
- * * Upgraded with Zero-Copy Validation & Early Stopping.
- * * Auto-toggles layer training states for Dropout and Batch Normalization.
+ * Implements TrainableWithOptions so Pipeline can forward epochs, validation,
+ * patience, and other deep-learning-specific args without widening Learner.
  */
-final class Sequential implements Learner, Persistable, Verbose
+final class Sequential implements TrainableWithOptions, Persistable, Verbose
 {
     /** @var \Pml\NeuralNetwork\Layers\Layer[] */
     private array $layers = [];
@@ -48,6 +49,17 @@ final class Sequential implements Learner, Persistable, Verbose
     {
         $this->layers[] = $layer;
     }
+
+    // ---- Read-only accessors used by Trainer / LRScheduler ---------------
+
+    /** @return Layers\Layer[] */
+    public function getLayers(): array { return $this->layers; }
+
+    public function getOptimizer(): Optimizer { return $this->optimizer; }
+
+    public function getLoss(): Loss { return $this->lossFn; }
+
+    // ----------------------------------------------------------------------
 
     public function forward(Tensor $input): Tensor
     {
@@ -79,22 +91,63 @@ final class Sequential implements Learner, Persistable, Verbose
     }
 
     /**
-     * Train the model with optional Early Stopping and Validation monitoring.
-     * * @param Dataset $dataset Training dataset.
-     * @param int $epochs Maximum epochs to train.
-     * @param int $batchSize Size of the zero-copy mini-batches.
-     * @param Dataset|null $validation Validation dataset to monitor for overfitting.
-     * @param int $patience Number of epochs to wait for improvement before early stopping (0 = disabled).
-     * @param float $minDelta Minimum change in validation loss to qualify as an improvement.
+     * Global gradient-norm clipping (L2).
+     * Computes the total norm across all gradients, then scales every gradient
+     * tensor in-place so the global norm equals $maxNorm.
+     * Single pass: O(P) where P = total parameters. No extra allocations.
      */
-    public function train(
-        Dataset $dataset, 
-        int $epochs = 10, 
-        int $batchSize = 32,
-        ?Dataset $validation = null,
-        int $patience = 0,
-        float $minDelta = 1e-4
-    ): void {
+    private function clipGradients(float $maxNorm): void
+    {
+        // Pass 1: accumulate sum of squared gradient elements across all layers
+        $totalSqNorm = 0.0;
+        foreach ($this->layers as $layer) {
+            foreach ($layer->getGradients() as $grad) {
+                $totalSqNorm += $grad->square()->sum();
+            }
+        }
+
+        $globalNorm = \sqrt($totalSqNorm);
+        if ($globalNorm <= $maxNorm || $globalNorm === 0.0) {
+            return;
+        }
+
+        // Pass 2: scale all gradients in-place by (maxNorm / globalNorm)
+        $scale = $maxNorm / $globalNorm;
+        foreach ($this->layers as $layer) {
+            foreach ($layer->getGradients() as $grad) {
+                $grad->mulScalarInplace($scale);
+            }
+        }
+    }
+
+    /**
+     * Train the model with optional Early Stopping and Validation monitoring.
+     *
+     * Accepts options as named variadic args (PHP 8 named-arg spread) so the
+     * signature satisfies TrainableWithOptions while still being callable with
+     * named parameters: $model->train($ds, epochs: 20, batchSize: 64).
+     *
+     * @param Dataset $dataset    Training dataset.
+     * @param mixed   ...$options Supported keys (all optional):
+     *   int        epochs      (default 10)
+     *   int        batchSize   (default 32)
+     *   Dataset    validation  (default null)
+     *   int        patience    (default 0 — disabled)
+     *   float      minDelta    (default 1e-4)
+     *   float      clipGradNorm Global gradient-norm clip threshold (default 0.0 = disabled).
+     *                           Clips all parameter gradients so ||g||₂ ≤ clipGradNorm.
+     *                           Recommended ≈ 1.0–5.0 for RNN/LSTM to prevent exploding gradients.
+     */
+    public function train(Dataset $dataset, mixed ...$options): void
+    {
+        $epochs       = (int)   ($options['epochs']       ?? 10);
+        $batchSize    = (int)   ($options['batchSize']    ?? 32);
+        $validation   = isset($options['validation']) && $options['validation'] instanceof Dataset
+            ? $options['validation'] : null;
+        $patience     = (int)   ($options['patience']     ?? 0);
+        $minDelta     = (float) ($options['minDelta']     ?? 1e-4);
+        $clipGradNorm = (float) ($options['clipGradNorm'] ?? 0.0);
+
         $es        = $patience > 0 ? new EarlyStopping($patience, 'min', $minDelta) : null;
         $bestState = [];
 
@@ -112,12 +165,17 @@ final class Sequential implements Learner, Persistable, Verbose
 
                 $predictions = $this->forward($x);
 
-                if ($this->logger !== null || $validation === null) {
+                if ($this->logger !== null) {
                     $trainLoss += $this->lossFn->compute($predictions, $y);
                 }
 
                 $lossGradient = $this->lossFn->differentiate($predictions, $y);
                 $this->backward($lossGradient);
+
+                if ($clipGradNorm > 0.0) {
+                    $this->clipGradients($clipGradNorm);
+                }
+
                 $this->optimizer->step($this->layers);
                 $trainSteps++;
             }
@@ -166,6 +224,31 @@ final class Sequential implements Learner, Persistable, Verbose
             }
         }
         
+        $this->isTrained = true;
+    }
+
+    /**
+     * Single forward+backward+optimizer step on one pre-transformed batch.
+     * Returns the scalar cross-entropy loss for that batch.
+     * Used by streaming training loops that manage their own epoch logic.
+     */
+    public function stepOnBatch(Dataset $batch, float $clipGradNorm = 0.0): float
+    {
+        $this->setTrainingMode(true);
+        $pred = $this->forward($batch->samples());
+        $loss = $this->lossFn->compute($pred, $batch->labels());
+        $this->backward($this->lossFn->differentiate($pred, $batch->labels()));
+        if ($clipGradNorm > 0.0) $this->clipGradients($clipGradNorm);
+        $this->optimizer->step($this->layers);
+        return $loss;
+    }
+
+    /**
+     * Mark the model as trained without going through train().
+     * Call after a streaming training loop finishes.
+     */
+    public function markTrained(): void
+    {
         $this->isTrained = true;
     }
 
@@ -227,15 +310,16 @@ final class Sequential implements Learner, Persistable, Verbose
     }
 
     // ========================================================================
-    // PERSISTENCE — SafeTensors + JSON bundle (zero Tensor serialisation)
+    // PERSISTENCE — ModelStore + SafeTensors bundle (zero serialize())
     //
     // Saved layout:
-    //   $dir/config.json          — PHP class names, hyperparams, no C-data
-    //   $dir/model.safetensors   — all Stateful tensor weights (HF-compatible)
+    //   $dir/config.json         — layers, loss, optimizer as JSON (ModelStore)
+    //   $dir/model.safetensors  — all Stateful Tensor weights (HF-compatible)
     //
-    // PHP serialize() is used ONLY for pure-PHP objects (Loss, Optimizer,
-    // and layer shells that have had every Tensor property stripped out).
-    // C-memory is never passed through PHP serialize().
+    // serialize() is NEVER called.  All PHP objects (Loss, Optimizer, layers)
+    // are encoded via ModelStore::toArray() which uses Saveable or Reflection
+    // and skips Tensor / FFI\CData values entirely.
+    // Tensor C-memory travels exclusively through SafeTensors (zero-copy).
     // ========================================================================
 
     public function save(string $dir): void
@@ -247,50 +331,33 @@ final class Sequential implements Learner, Persistable, Verbose
         $config = [
             'class'     => self::class,
             'isTrained' => $this->isTrained,
-            // Loss / Optimizer are pure PHP — no C-pointers, safe to serialize.
-            'lossFn'    => base64_encode(serialize($this->lossFn)),
-            'optimizer' => base64_encode(serialize($this->optimizer)),
+            'lossFn'    => ModelStore::toArray($this->lossFn),
+            'optimizer' => ModelStore::toArray($this->optimizer),
             'layers'    => [],
         ];
 
-        $tensorDict = [];   // name → Tensor, fed to SafeTensorsIO::save()
+        $tensorDict = [];
 
         foreach ($this->layers as $i => $layer) {
             $prefix = "layer_{$i}.";
 
             if ($layer instanceof Stateful) {
-                // Collect live C-memory tensors — zero-copy, just PHP references.
                 foreach ($layer->getStateDict($prefix) as $key => $tensor) {
                     $tensorDict[$key] = $tensor;
                 }
-
-                if (method_exists($layer, 'getConfig')) {
-                    // Clean path: pure-JSON descriptor, no object serialisation.
-                    $config['layers'][] = [
-                        'type'   => 'stateful_config',
-                        'class'  => \get_class($layer),
-                        'prefix' => $prefix,
-                        'config' => $layer->getConfig(),
-                    ];
-                } else {
-                    // Fallback: serialise a Tensor-stripped shell.
-                    $config['layers'][] = [
-                        'type'   => 'stateful_shell',
-                        'prefix' => $prefix,
-                        'shell'  => base64_encode(serialize(self::stripTensors($layer))),
-                    ];
-                }
-            } else {
-                // Activation / dropout / etc. — only nullable ?Tensor caches,
-                // all reset to null before serialisation by stripTensors().
                 $config['layers'][] = [
-                    'type'  => 'plain',
-                    'shell' => base64_encode(serialize(self::stripTensors($layer))),
+                    'type'   => 'stateful',
+                    'prefix' => $prefix,
+                    'data'   => ModelStore::toArray($layer),
+                ];
+            } else {
+                $config['layers'][] = [
+                    'type' => 'plain',
+                    'data' => ModelStore::toArray($layer),
                 ];
             }
         }
 
-        // Write tensor weights as a single HF-compatible file.
         if (!empty($tensorDict)) {
             SafeTensorsIO::save($dir . \DIRECTORY_SEPARATOR . 'model.safetensors', $tensorDict);
         }
@@ -307,8 +374,7 @@ final class Sequential implements Learner, Persistable, Verbose
             throw new \RuntimeException("Sequential::load — directory not found: '$dir'.");
         }
 
-        $configPath = $dir . \DIRECTORY_SEPARATOR . 'config.json';
-        $raw = file_get_contents($configPath);
+        $raw = file_get_contents($dir . \DIRECTORY_SEPARATOR . 'config.json');
         if ($raw === false) {
             throw new \RuntimeException("Sequential::load — config.json missing in '$dir'.");
         }
@@ -316,35 +382,21 @@ final class Sequential implements Learner, Persistable, Verbose
         /** @var array<string,mixed> $config */
         $config = json_decode($raw, true, 512, \JSON_THROW_ON_ERROR);
 
-        $lossFn    = unserialize(base64_decode($config['lossFn']));
-        $optimizer = unserialize(base64_decode($config['optimizer']));
+        $lossFn    = ModelStore::fromArray($config['lossFn']);
+        $optimizer = ModelStore::fromArray($config['optimizer']);
 
-        // Load SafeTensors once — all tensor weights are mmap'd (zero-copy).
+        // All Tensor weights mmap'd in one call (zero-copy).
         $stPath  = $dir . \DIRECTORY_SEPARATOR . 'model.safetensors';
         $weights = is_file($stPath) ? SafeTensorsIO::load($stPath) : [];
 
         $layers = [];
         foreach ($config['layers'] as $layerCfg) {
-            switch ($layerCfg['type']) {
-                case 'stateful_config':
-                    // Reconstruct from pure-JSON descriptor; no unserialize of C-data.
-                    $class = $layerCfg['class'];
-                    /** @var \Pml\NeuralNetwork\Layers\Layer&Stateful $layer */
-                    $layer = $class::fromConfig($layerCfg['config']);
-                    $layer->loadStateDict($weights, $layerCfg['prefix']);
-                    break;
+            $layer = ModelStore::fromArray($layerCfg['data']);
 
-                case 'stateful_shell':
-                    $layer = unserialize(base64_decode($layerCfg['shell']));
-                    if ($layer instanceof Stateful) {
-                        $layer->loadStateDict($weights, $layerCfg['prefix']);
-                    }
-                    break;
-
-                default: // 'plain'
-                    $layer = unserialize(base64_decode($layerCfg['shell']));
-                    break;
+            if ($layerCfg['type'] === 'stateful' && $layer instanceof Stateful) {
+                $layer->loadStateDict($weights, $layerCfg['prefix']);
             }
+
             $layers[] = $layer;
         }
 
@@ -352,53 +404,5 @@ final class Sequential implements Learner, Persistable, Verbose
         $model->isTrained = (bool) $config['isTrained'];
 
         return $model;
-    }
-
-    // -------------------------------------------------------------------------
-    // Helper: produce a clone with all Tensor properties nulled/zeroed so that
-    // PHP serialize() never touches a C-pointer.
-    // -------------------------------------------------------------------------
-
-    /**
-     * Clone $obj and neutralise every Tensor-typed property so that PHP's
-     * serialize() never encounters an \FFI\CData value.
-     *
-     * - Nullable ?Tensor props → set to null via ReflectionProperty::setValue().
-     * - Non-nullable Tensor props → unset() via Closure::bind(), leaving the
-     *   property "uninitialized" (PHP serialises these cleanly; unserialize
-     *   restores them as uninitialized, ready for loadStateDict() to fill in).
-     */
-    private static function stripTensors(object $obj): object
-    {
-        $clone = clone $obj;
-        $class = \get_class($clone);
-
-        foreach ((new \ReflectionClass($clone))->getProperties() as $prop) {
-            $type = $prop->getType();
-            if (!$type instanceof \ReflectionNamedType) {
-                continue;
-            }
-            $typeName = $type->getName();
-            if ($typeName !== Tensor::class && !is_subclass_of($typeName, Tensor::class)) {
-                continue;
-            }
-
-            $prop->setAccessible(true);
-
-            if ($type->allowsNull()) {
-                $prop->setValue($clone, null);
-            } else {
-                // Non-nullable: bypass type enforcement by unsetting via a
-                // closure bound to the object's private scope.
-                $name = $prop->getName();
-                \Closure::bind(
-                    static function (object $o) use ($name): void { unset($o->$name); },
-                    null,
-                    $class
-                )($clone);
-            }
-        }
-
-        return $clone;
     }
 }

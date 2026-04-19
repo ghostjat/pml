@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Pml\Estimators\AnomalyDetectors;
 
 use Pml\Interfaces\Learner;
+use Pml\Interfaces\Persistable;
+use Pml\Lib\SafeTensorsIO;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -14,7 +16,7 @@ use RuntimeException;
  * Detects anomalies by measuring standard deviations from the median (using Median Absolute Deviation).
  * Much less sensitive to extreme outliers than standard Gaussian MLE.
  */
-final class RobustZScore implements Learner
+final class RobustZScore implements Learner, Persistable
 {
     private float $threshold;
     
@@ -75,5 +77,27 @@ final class RobustZScore implements Learner
     public function trained(): bool
     {
         return $this->medians !== null;
+    }
+
+    public function save(string $dir): void
+    {
+        if (!is_dir($dir)) { mkdir($dir, 0755, true); }
+        file_put_contents($dir . '/config.json', json_encode(['threshold' => $this->threshold], JSON_PRETTY_PRINT));
+        if ($this->medians !== null && $this->mads !== null) {
+            SafeTensorsIO::save($dir . '/model.safetensors', ['medians' => $this->medians, 'mads' => $this->mads]);
+        }
+    }
+
+    public static function load(string $dir): self
+    {
+        $cfg = json_decode(file_get_contents($dir . '/config.json'), true);
+        $instance = new self((float) $cfg['threshold']);
+        $stPath = $dir . '/model.safetensors';
+        if (is_file($stPath)) {
+            $tensors = SafeTensorsIO::load($stPath);
+            $instance->medians = $tensors['medians'] ?? null;
+            $instance->mads = $tensors['mads'] ?? null;
+        }
+        return $instance;
     }
 }

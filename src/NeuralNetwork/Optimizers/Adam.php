@@ -15,7 +15,7 @@ use Pml\Tensor;
  * - Extensive use of In-Place Tensor mutations to prevent PHP Heap fragmentation.
  * - Safely detaches FFI pointers during serialization to prevent memory leaks/crashes.
  */
-final class Adam implements Optimizer
+final class Adam implements Optimizer, LearningRateAware
 {
     private float $learningRate;
     private float $beta1;
@@ -45,59 +45,53 @@ final class Adam implements Optimizer
     public function step(array $layers): void
     {
         $this->t++;
-        
-        // Calculate bias corrections once globally per step
-        $beta1_t = 1.0 - pow($this->beta1, $this->t);
-        $beta2_t = 1.0 - pow($this->beta2, $this->t);
-        
-        // Pre-calculate scaling factors to prevent multiple division operations in C
-        $step_size = $this->learningRate / $beta1_t;
-        $v_hat_scale = 1.0 / $beta2_t;
 
         foreach ($layers as $layer) {
             $params = $layer->getParameters();
-            $grads = $layer->getGradients();
+            $grads  = $layer->getGradients();
 
             foreach ($params as $name => $paramTensor) {
-                if (isset($grads[$name])) {
-                    
-                    // O(1) Cache-friendly lookup linking the parameter to its momentum state
-                    $oid = spl_object_id($paramTensor);
-                    $g = $grads[$name];
-
-                    // Initialize momentum tensors (zeros) if first time seeing this parameter
-                    if (!isset($this->m[$oid])) {
-                        $shape = $paramTensor->shape();
-                        $this->m[$oid] = Tensor::zeros(...$shape);
-                        $this->v[$oid] = Tensor::zeros(...$shape);
-                    }
-
-                    $m = $this->m[$oid];
-                    $v = $this->v[$oid];
-
-                    // 1. Update biased first moment estimate: m = beta1 * m + (1 - beta1) * g
-                    $tempG1 = $g->mulScalar(1.0 - $this->beta1);
-                    $m->mulScalarInplace($this->beta1)->addInplace($tempG1);
-
-                    // 2. Update biased second raw moment estimate: v = beta2 * v + (1 - beta2) * g^2
-                    $tempG2 = $g->square()->mulScalarInplace(1.0 - $this->beta2);
-                    $v->mulScalarInplace($this->beta2)->addInplace($tempG2);
-
-                    // 3. Compute the Denominator: sqrt(v_hat) + eps
-                    // Scaled dynamically natively in C without duplicating the $v tensor
-                    $denom = $v->mulScalar($v_hat_scale)->sqrt()->addScalarInplace($this->epsilon);
-
-                    // 4. Compute the Update: (m_hat / denom) * lr
-                    // $m already holds the un-corrected momentum, step_size applies the beta1 correction.
-                    $update = $m->div($denom)->mulScalarInplace($step_size);
-
-                    // 5. Apply the final gradient descent step IN-PLACE
-                    // Guarantees zero memory allocation crossing the FFI boundary
-                    $paramTensor->subInplace($update);
+                if (!isset($grads[$name])) {
+                    continue;
                 }
+
+                $oid = spl_object_id($paramTensor);
+
+                if (!isset($this->m[$oid])) {
+                    $shape           = $paramTensor->shape();
+                    $this->m[$oid]   = Tensor::zeros(...$shape);
+                    $this->v[$oid]   = Tensor::zeros(...$shape);
+                }
+
+                // Single C kernel: m/v update + bias correction + param update — zero PHP allocs.
+                Tensor::fusedAdamStep(
+                    $paramTensor,
+                    $grads[$name],
+                    $this->m[$oid],
+                    $this->v[$oid],
+                    $this->learningRate,
+                    $this->beta1,
+                    $this->beta2,
+                    $this->epsilon,
+                    $this->t
+                );
             }
         }
     }
+
+    // ---- LearningRateAware ------------------------------------------------
+
+    public function getLearningRate(): float { return $this->learningRate; }
+
+    /**
+     * Replace the learning rate mid-training (used by LRScheduler / Trainer).
+     * Safe to call between steps; takes effect on the very next step().
+     * Momentum buffers and the step counter are preserved so Adam's adaptive
+     * correction continues from where it left off.
+     */
+    public function setLearningRate(float $lr): void { $this->learningRate = $lr; }
+
+    // -----------------------------------------------------------------------
 
     /**
      * Called automatically by PHP when Sequential::save() is triggered.

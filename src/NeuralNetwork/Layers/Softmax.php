@@ -19,21 +19,10 @@ final class Softmax implements Layer
 
     public function forward(Tensor $input): Tensor
     {
-        // Numerical Stability: Subtract the maximum logit from the row before taking exp()
-        // This prevents floating-point overflow (INF) when logits are large.
-        // maxAxis(1) gets max per row, expandDims(1) makes it [Batch, 1] for broadcasting.
-        $max = $input->maxAxis(1)->expandDims(1);
-        $shifted = $input->sub($max);
-        
-        $exp = $shifted->exp();
-        
-        // Sum the exponentials along the row: [Batch, 1]
-        $sum = $exp->sumAxis(1)->expandDims(1);
-        
-        // output = exp(x) / sum(exp(x))
-        // Divides inplace to conserve memory during the forward pass
-        $this->output = $exp->divInplace($sum);
-        
+        // One copy + one in-place C kernel (max-shift + exp + rowsum + divide).
+        // Replaces 6 intermediate tensors with 1 memcpy.
+        $this->output = $input->copy();
+        $this->output->softmaxInplace();
         return $this->output;
     }
 

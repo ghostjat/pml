@@ -4,6 +4,8 @@ declare(strict_types=1);
 namespace Pml\Estimators\Regression;
 
 use Pml\Interfaces\Learner;
+use Pml\Lib\SafeTensorsIO;
+use Pml\Interfaces\Persistable;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -17,7 +19,7 @@ use RuntimeException;
  * - top-K selection uses C-level partial sort; only K indices cross FFI per row.
  * - Mean of K labels is a single C reduction per query.
  */
-final class KDNeighborsRegressor implements Learner
+final class KDNeighborsRegressor implements Learner, Persistable
 {
     private ?Tensor $trainX = null;
     private ?Tensor $trainY = null;
@@ -69,5 +71,20 @@ final class KDNeighborsRegressor implements Learner
     public function trained(): bool
     {
         return $this->trainX !== null;
+    }
+
+    public function save(string $dir): void
+    {
+        is_dir($dir) || mkdir($dir, 0755, true);
+        file_put_contents($dir . '/config.json', json_encode(['k' => $this->k]));
+        if ($this->trainX !== null) SafeTensorsIO::save($dir . '/model.safetensors', ['train_x' => $this->trainX, 'train_y' => $this->trainY]);
+    }
+    public static function load(string $dir): self
+    {
+        $c = json_decode(file_get_contents($dir . '/config.json'), true);
+        $i = new self((int)$c['k']);
+        $stPath = $dir . '/model.safetensors';
+        if (is_file($stPath)) { $t = SafeTensorsIO::load($stPath); $i->trainX = $t['train_x'] ?? null; $i->trainY = $t['train_y'] ?? null; }
+        return $i;
     }
 }

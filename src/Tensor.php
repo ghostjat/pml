@@ -64,14 +64,19 @@ class Tensor {
         }
     }
 
+    /** @var \ReflectionClass<self>|null Cached once — avoids one object alloc per tensor output. */
+    private static ?\ReflectionClass $_reflector = null;
+
     public static function wrap(?\FFI\CData $ptr, ?self $parent = null): self {
         if ($ptr === null) {
             self::checkError();
             throw new \RuntimeException("C-Engine returned NULL without setting error.");
         }
 
-        $ref = new \ReflectionClass(self::class);
-        $t = $ref->newInstanceWithoutConstructor();
+        if (self::$_reflector === null) {
+            self::$_reflector = new \ReflectionClass(self::class);
+        }
+        $t = self::$_reflector->newInstanceWithoutConstructor();
         $t->ptr = $ptr;
         
         $ffi = TensorEngine::get();
@@ -965,6 +970,160 @@ class Tensor {
         $ffi->tensor_copy_from($this->ptr, $src->ptr);
     }
     
+    // ── Section 22: Classical ML Extensions ──────────────────────────────────
+
+    public function argmaxAxis(int $axis): self {
+        $res = self::wrap(TensorEngine::get()->tensor_argmax_axis($this->ptr, $axis));
+        self::checkError(); return $res;
+    }
+
+    public static function pairwiseSqL2(self $A, self $B): self {
+        $res = self::wrap(TensorEngine::get()->tensor_pairwise_sq_l2($A->ptr, $B->ptr));
+        self::checkError(); return $res;
+    }
+
+    public function expInplace(): self {
+        TensorEngine::get()->tensor_exp_inplace($this->ptr);
+        self::checkError(); return $this;
+    }
+
+    public function logInplace(): self {
+        TensorEngine::get()->tensor_log_inplace($this->ptr);
+        self::checkError(); return $this;
+    }
+
+    public function sqrtInplace(): self {
+        TensorEngine::get()->tensor_sqrt_inplace($this->ptr);
+        self::checkError(); return $this;
+    }
+
+    public function sigmoidInplace(): self {
+        TensorEngine::get()->tensor_sigmoid_inplace($this->ptr);
+        self::checkError(); return $this;
+    }
+
+    public function tanhInplace(): self {
+        TensorEngine::get()->tensor_tanh_inplace($this->ptr);
+        self::checkError(); return $this;
+    }
+
+    public function reluInplace(): self {
+        TensorEngine::get()->tensor_relu_inplace($this->ptr);
+        self::checkError(); return $this;
+    }
+
+    public function rowSoftmaxInplace(): self {
+        TensorEngine::get()->tensor_row_softmax_inplace($this->ptr);
+        self::checkError(); return $this;
+    }
+
+    public static function gbdtComputeBoundaries(self $X, int $Q): self {
+        $res = self::wrap(TensorEngine::get()->tensor_gbdt_compute_boundaries($X->ptr, $Q));
+        self::checkError(); return $res;
+    }
+
+    public static function gbdtBinSamples(self $X, self $boundaries, int $Q): self {
+        $res = self::wrap(TensorEngine::get()->tensor_gbdt_bin_samples($X->ptr, $boundaries->ptr, $Q));
+        self::checkError(); return $res;
+    }
+
+    /** @return array{Tensor, Tensor} [gradients, hessians] */
+    public static function gbdtMseGradHess(self $preds, self $y): array {
+        $n = (int)$preds->size();
+        $g = new self([$n]); $h = new self([$n]);
+        TensorEngine::get()->tensor_gbdt_mse_grad_hess($preds->ptr, $y->ptr, $g->ptr, $h->ptr);
+        self::checkError();
+        return [$g, $h];
+    }
+
+    /** @return array{Tensor, Tensor} [gradients, hessians] */
+    public static function gbdtLogLossGradHess(self $preds, self $y): array {
+        $n = (int)$preds->size();
+        $g = new self([$n]); $h = new self([$n]);
+        TensorEngine::get()->tensor_gbdt_logloss_grad_hess($preds->ptr, $y->ptr, $g->ptr, $h->ptr);
+        self::checkError();
+        return [$g, $h];
+    }
+
+    public static function gbdtHistogram(self $bins, self $g, self $h, self $mask, int $Q): array {
+        $D = $bins->shape()[1];
+        $histG = new self([$D, $Q]); $histG->fill(0.0);
+        $histH = new self([$D, $Q]); $histH->fill(0.0);
+        TensorEngine::get()->tensor_gbdt_histogram(
+            $bins->ptr, $g->ptr, $h->ptr, $mask->ptr, $Q, $histG->ptr, $histH->ptr
+        );
+        self::checkError();
+        return [$histG, $histH];
+    }
+
+    /** @return array{int, int, float} [feat, bin, gain]; feat=-1 means no split */
+    public static function gbdtBestSplit(
+        self $histG, self $histH, int $Q,
+        float $sumG, float $sumH, int $nodeN,
+        float $lambda, float $gamma
+    ): array {
+        $ffi = TensorEngine::get();
+        $feat = $ffi->new('int'); $bin = $ffi->new('int'); $gain = $ffi->new('float');
+        $ffi->tensor_gbdt_best_split(
+            $histG->ptr, $histH->ptr, $Q,
+            $sumG, $sumH, $nodeN, $lambda, $gamma,
+            \FFI::addr($feat), \FFI::addr($bin), \FFI::addr($gain)
+        );
+        self::checkError();
+        return [(int)$feat->cdata, (int)$bin->cdata, (float)$gain->cdata];
+    }
+
+    /** @return array{Tensor, Tensor} [left_mask, right_mask] (pre-allocated, same size as mask) */
+    public static function gbdtSplitNode(self $bins, self $mask, int $feat, int $bin): array {
+        $n = (int)$mask->size();
+        $left = new self([$n]); $right = new self([$n]);
+        TensorEngine::get()->tensor_gbdt_split_node($bins->ptr, $mask->ptr, $feat, $bin, $left->ptr, $right->ptr);
+        self::checkError();
+        return [$left, $right];
+    }
+
+    public static function gbdtLeafUpdate(
+        self $preds, self $mask, float $sumG, float $sumH, float $lr, float $lambda
+    ): float {
+        $leaf = TensorEngine::get()->tensor_gbdt_leaf_update(
+            $preds->ptr, $mask->ptr, $sumG, $sumH, $lr, $lambda
+        );
+        self::checkError();
+        return (float)$leaf;
+    }
+
+    public static function gbdtPredictAll(
+        self $bins, self $feats, self $thresholds,
+        self $lefts, self $rights, self $treeSizes, float $baseScore
+    ): self {
+        $res = self::wrap(TensorEngine::get()->tensor_gbdt_predict_all(
+            $bins->ptr, $feats->ptr, $thresholds->ptr,
+            $lefts->ptr, $rights->ptr, $treeSizes->ptr, $baseScore
+        ));
+        self::checkError(); return $res;
+    }
+
+    public static function quantileFit(self $X, int $nQuantiles = 1000): self {
+        $res = self::wrap(TensorEngine::get()->tensor_quantile_fit($X->ptr, $nQuantiles));
+        self::checkError(); return $res;
+    }
+
+    public static function quantileTransform(self $X, self $landmarks): self {
+        $nq = $landmarks->shape()[1];
+        $res = self::wrap(TensorEngine::get()->tensor_quantile_transform($X->ptr, $landmarks->ptr, $nq));
+        self::checkError(); return $res;
+    }
+
+    public static function yjFit(self $X): self {
+        $res = self::wrap(TensorEngine::get()->tensor_yj_fit($X->ptr));
+        self::checkError(); return $res;
+    }
+
+    public static function yjTransform(self $X, self $lambdas): self {
+        $res = self::wrap(TensorEngine::get()->tensor_yj_transform($X->ptr, $lambdas->ptr));
+        self::checkError(); return $res;
+    }
+
     public function __destruct()
     {
         if ($this->owned && $this->ptr !== null) {

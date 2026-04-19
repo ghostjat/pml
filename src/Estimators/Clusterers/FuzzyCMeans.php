@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Pml\Estimators\Clusterers;
 
 use Pml\Interfaces\Learner;
+use Pml\Lib\SafeTensorsIO;
+use Pml\Interfaces\Persistable;
 use Pml\Interfaces\Probabilistic;
 use Pml\Tensor;
 use Pml\Dataset;
@@ -18,7 +20,7 @@ use RuntimeException;
  * single massive matrix multiplication (U^m_T * X).
  * - Distances and memberships update instantly in native C memory.
  */
-final class FuzzyCMeans implements Learner, Probabilistic
+final class FuzzyCMeans implements Learner, Probabilistic, Persistable
 {
     private int $k;
     private float $fuzziness;
@@ -115,5 +117,20 @@ final class FuzzyCMeans implements Learner, Probabilistic
     public function trained(): bool
     {
         return $this->centroids !== null;
+    }
+
+    public function save(string $dir): void
+    {
+        is_dir($dir) || mkdir($dir, 0755, true);
+        file_put_contents($dir . '/config.json', json_encode(['k'=>$this->k,'fuzziness'=>$this->fuzziness,'maxIter'=>$this->maxIter,'tolerance'=>$this->tolerance]));
+        if ($this->centroids !== null) SafeTensorsIO::save($dir . '/model.safetensors', ['centroids' => $this->centroids]);
+    }
+    public static function load(string $dir): self
+    {
+        $c = json_decode(file_get_contents($dir . '/config.json'), true);
+        $i = new self((int)$c['k'], (float)$c['fuzziness'], (int)$c['maxIter'], (float)$c['tolerance']);
+        $stPath = $dir . '/model.safetensors';
+        if (is_file($stPath)) { $t = SafeTensorsIO::load($stPath); $i->centroids = $t['centroids'] ?? null; }
+        return $i;
     }
 }

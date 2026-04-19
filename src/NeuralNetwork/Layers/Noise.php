@@ -30,4 +30,14 @@ final class Noise implements Layer
     }
 
     public function params(): array { return []; }
+
+    #[\Override]
+    public function getGradients(): array {
+        
+    }
+
+    #[\Override]
+    public function getParameters(): array {
+        
+    }
 }

@@ -13,6 +13,9 @@ use Pml\Tensor;
  */
 final class LeakyReLU implements ActivationFunction
 {
+    /** @var array<string, array{Tensor, Tensor}> shape-key → [ones, leak] constant tensors */
+    private array $constCache = [];
+
     public function __construct(private readonly float $leakage = 0.1) {}
 
     public function activate(Tensor $z): Tensor
@@ -22,8 +25,15 @@ final class LeakyReLU implements ActivationFunction
 
     public function differentiate(Tensor $z): Tensor
     {
-        $ones = Tensor::ones(...$z->shape());
-        $leak = Tensor::zeros(...$z->shape())->addScalarInplace($this->leakage);
+        $key = implode(',', $z->shape());
+        if (!isset($this->constCache[$key])) {
+            // Allocated once per unique input shape, reused every backward call.
+            $this->constCache[$key] = [
+                Tensor::ones(...$z->shape()),
+                Tensor::zeros(...$z->shape())->addScalarInplace($this->leakage),
+            ];
+        }
+        [$ones, $leak] = $this->constCache[$key];
         return $z->greaterScalar(0.0)->where($ones, $leak);
     }
 }

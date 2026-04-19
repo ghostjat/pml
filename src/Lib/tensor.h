@@ -439,4 +439,63 @@ void tensor_mamba_backward(Tensor* dout,   Tensor* x,
 Tensor* tensor_mamba_alloc_state(int batch, int d_model, int d_state);
 Tensor* tensor_mamba_alloc_cache(int batch, int seq_len, int d_model, int d_state);
 
+/* ── Section 22: Classical ML Extensions ────────────────────────────────────── */
+
+/* 22.1  Argmax along axis — returns FLOAT32 tensor of indices */
+Tensor* tensor_argmax_axis(Tensor* A, int axis);
+
+/* 22.2  Pairwise squared L2: A[m,D], B[n,D] → [m,n] */
+Tensor* tensor_pairwise_sq_l2(Tensor* A, Tensor* B);
+
+/* 22.3  In-place element-wise unary ops (return void; modify A in-place) */
+void tensor_exp_inplace(Tensor* A);
+void tensor_log_inplace(Tensor* A);
+void tensor_sqrt_inplace(Tensor* A);
+void tensor_sigmoid_inplace(Tensor* A);
+void tensor_tanh_inplace(Tensor* A);
+void tensor_relu_inplace(Tensor* A);
+
+/* 22.4  Numerically stable row-wise softmax in-place */
+void tensor_row_softmax_inplace(Tensor* A);
+
+/* 22.5  GBDT engine */
+/* Compute [D, Q-1] quantile bin boundaries from [N,D] X */
+Tensor* tensor_gbdt_compute_boundaries(Tensor* X, int Q);
+/* Bin [N,D] X into INT32 [N,D] bin indices using [D, Q-1] boundaries */
+Tensor* tensor_gbdt_bin_samples(Tensor* X, Tensor* boundaries, int Q);
+/* MSE gradients/hessians: preds [N], y [N]; writes into pre-allocated out_g/out_h */
+void    tensor_gbdt_mse_grad_hess(Tensor* preds, Tensor* y, Tensor* out_g, Tensor* out_h);
+/* Log-loss gradients/hessians for binary classification */
+void    tensor_gbdt_logloss_grad_hess(Tensor* preds, Tensor* y, Tensor* out_g, Tensor* out_h);
+/* Build [D,Q] gradient histograms into pre-allocated hist_g, hist_h (caller zeros them) */
+void    tensor_gbdt_histogram(Tensor* bins, Tensor* g, Tensor* h, Tensor* mask,
+                              int Q, Tensor* hist_g, Tensor* hist_h);
+/* Find best split scanning histograms; outputs via pointer args */
+void    tensor_gbdt_best_split(Tensor* hist_g, Tensor* hist_h, int Q,
+                               float sum_g, float sum_h, int node_n,
+                               float lambda, float gamma,
+                               int* out_feat, int* out_bin, float* out_gain);
+/* Split node mask into left/right masks (caller pre-allocates out_left, out_right) */
+void    tensor_gbdt_split_node(Tensor* bins, Tensor* mask, int feat, int bin,
+                               Tensor* out_left, Tensor* out_right);
+/* Update preds in-place with leaf delta; returns leaf value */
+float   tensor_gbdt_leaf_update(Tensor* preds, Tensor* mask,
+                                float sum_g, float sum_h, float lr, float lambda);
+/* Multi-tree inference: bins [N,D] INT32 + packed tree arrays → [N] float predictions */
+Tensor* tensor_gbdt_predict_all(Tensor* X_bins, Tensor* feats, Tensor* thresholds,
+                                Tensor* lefts, Tensor* rights,
+                                Tensor* tree_sizes, float base_score);
+
+/* 22.6  Quantile transform */
+/* Fit [D, n_quantiles] landmark matrix from [N,D] X */
+Tensor* tensor_quantile_fit(Tensor* X, int n_quantiles);
+/* Apply quantile transform [N,D] → [N,D] uniform [0,1]; n_quantiles must match landmarks shape[1] */
+Tensor* tensor_quantile_transform(Tensor* X, Tensor* landmarks, int n_quantiles);
+
+/* 22.7  Yeo-Johnson power transform */
+/* Fit [D] optimal lambda vector from [N,D] X */
+Tensor* tensor_yj_fit(Tensor* X);
+/* Apply Yeo-Johnson column-wise [N,D] → [N,D] */
+Tensor* tensor_yj_transform(Tensor* X, Tensor* lambdas);
+
 #endif // TENSOR_H

@@ -312,6 +312,8 @@ final class TensorEngine {
                 DataFrame*  df_select_columns(const DataFrame* df,
                                               const int* col_indices, int n);
                 DataFrame*  df_drop_nans(const DataFrame* df);
+                DataFrame*  df_slice_rows(const DataFrame* df, size_t offset, size_t n);
+                DataFrame*  df_head_rows(const DataFrame* df, size_t n);
                 DataFrame*  df_one_hot_encode(const DataFrame* df, int col_idx);
 
                 TensorC*    df_to_tensor(const DataFrame* df,
@@ -324,6 +326,72 @@ final class TensorEngine {
                 int         df_col_n_categories(const DataFrame* df, int col_idx);
                 const char* df_col_category_name(const DataFrame* df,
                                                   int col_idx, int cat_idx);
+                typedef struct Vocab Vocab;
+                Vocab*  df_vocab_build(void* df, int col_idx, int max_features);
+                void    vocab_free(Vocab* v);
+                int     vocab_size(Vocab* v);
+                TensorC* df_transform_bow(void* df, int col_idx, Vocab* v);
+                void vocab_save(Vocab* v, const char* filepath);
+                Vocab* vocab_load(const char* filepath);
+
+                // ── Section 9: C Transform Pipeline ──────────────────────────
+                typedef struct TransformPipeline TransformPipeline;
+
+                TensorC** df_fit_transformers(const DataFrame* df,
+                                              size_t train_rows,
+                                              int text_col,
+                                              const Vocab* vocab);
+
+                TransformPipeline* pipeline_create(const Vocab*   vocab,
+                                                    const TensorC* idf,
+                                                    const TensorC* stds,
+                                                    int text_col,
+                                                    int label_col,
+                                                    int n_classes);
+
+                void pipeline_free(TransformPipeline* pl);
+
+                TensorC** pipeline_transform_batch(const DataFrame*         df,
+                                                    size_t                   offset,
+                                                    size_t                   n,
+                                                    const TransformPipeline* pl);
+
+                // ── Section 22: Classical ML Extensions ──────────────────────
+                TensorC* tensor_argmax_axis(TensorC* A, int axis);
+                TensorC* tensor_pairwise_sq_l2(TensorC* A, TensorC* B);
+
+                void tensor_exp_inplace(TensorC* A);
+                void tensor_log_inplace(TensorC* A);
+                void tensor_sqrt_inplace(TensorC* A);
+                void tensor_sigmoid_inplace(TensorC* A);
+                void tensor_tanh_inplace(TensorC* A);
+                void tensor_relu_inplace(TensorC* A);
+
+                void tensor_row_softmax_inplace(TensorC* A);
+
+                TensorC* tensor_gbdt_compute_boundaries(TensorC* X, int Q);
+                TensorC* tensor_gbdt_bin_samples(TensorC* X, TensorC* boundaries, int Q);
+                void     tensor_gbdt_mse_grad_hess(TensorC* preds, TensorC* y, TensorC* out_g, TensorC* out_h);
+                void     tensor_gbdt_logloss_grad_hess(TensorC* preds, TensorC* y, TensorC* out_g, TensorC* out_h);
+                void     tensor_gbdt_histogram(TensorC* bins, TensorC* g, TensorC* h, TensorC* mask,
+                                               int Q, TensorC* hist_g, TensorC* hist_h);
+                void     tensor_gbdt_best_split(TensorC* hist_g, TensorC* hist_h, int Q,
+                                               float sum_g, float sum_h, int node_n,
+                                               float lambda, float gamma,
+                                               int* out_feat, int* out_bin, float* out_gain);
+                void     tensor_gbdt_split_node(TensorC* bins, TensorC* mask, int feat, int bin,
+                                               TensorC* out_left, TensorC* out_right);
+                float    tensor_gbdt_leaf_update(TensorC* preds, TensorC* mask,
+                                                float sum_g, float sum_h, float lr, float lambda);
+                TensorC* tensor_gbdt_predict_all(TensorC* X_bins, TensorC* feats, TensorC* thresholds,
+                                                 TensorC* lefts, TensorC* rights,
+                                                 TensorC* tree_sizes, float base_score);
+
+                TensorC* tensor_quantile_fit(TensorC* X, int n_quantiles);
+                TensorC* tensor_quantile_transform(TensorC* X, TensorC* landmarks, int n_quantiles);
+
+                TensorC* tensor_yj_fit(TensorC* X);
+                TensorC* tensor_yj_transform(TensorC* X, TensorC* lambdas);
             ", $libPath);
         }
         return self::$ffi;

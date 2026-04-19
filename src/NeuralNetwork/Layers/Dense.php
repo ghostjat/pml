@@ -15,12 +15,13 @@ use Pml\Interfaces\Stateful;
  *   "weight" — [outputDim, inputDim] FLOAT32
  *   "bias"   — [outputDim]           FLOAT32  (omitted when useBias=false)
  */
-final class Dense implements Layer, Stateful
+final class Dense implements Layer, Stateful, HasTrainingMode
 {
     private Tensor $weights;
     private ?Tensor $bias;
 
     private ?Tensor $input = null;
+    private bool $training = true;   // false during inference — skips input cache
 
     // Reusable buffers
     private Tensor $dW;
@@ -30,6 +31,12 @@ final class Dense implements Layer, Stateful
     private bool $hasMatmulInto;
     private bool $hasSumInto;
 
+    /**
+     * 
+     * @param int $inputDim
+     * @param int $outputDim
+     * @param bool $useBias
+     */
     public function __construct(int $inputDim, int $outputDim, bool $useBias = true)
     {
         $stddev = \sqrt(2.0 / $inputDim);
@@ -58,7 +65,8 @@ final class Dense implements Layer, Stateful
             $input = $input->contiguous();
         }
 
-        $this->input = $input;
+        // Only cache during training — avoids pinning large tensors in inference mode.
+        $this->input = $this->training ? $input : null;
 
         return $input->linear($this->weights, $this->bias);
     }
@@ -112,6 +120,14 @@ final class Dense implements Layer, Stateful
         }
 
         return $dX;
+    }
+
+    public function setTraining(bool $mode): void
+    {
+        $this->training = $mode;
+        if (!$mode) {
+            $this->input = null;  // Release any cached input immediately
+        }
     }
 
     public function getParameters(): array

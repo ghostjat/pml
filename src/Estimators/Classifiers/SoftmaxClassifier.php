@@ -5,6 +5,8 @@ namespace Pml\Estimators\Classifiers;
 
 use Pml\Interfaces\Learner;
 use Pml\Interfaces\Probabilistic;
+use Pml\Interfaces\Persistable;
+use Pml\Lib\SafeTensorsIO;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -18,7 +20,7 @@ use RuntimeException;
  * - Class probabilities stay in C memory; PHP only reads the argmax scalar.
  * - Weight matrix is [features × K]; one matmul covers all classes in parallel.
  */
-final class SoftmaxClassifier implements Learner, Probabilistic
+final class SoftmaxClassifier implements Learner, Probabilistic, Persistable
 {
     private ?Tensor $weights   = null;
     private ?Tensor $bias      = null;
@@ -42,7 +44,7 @@ final class SoftmaxClassifier implements Learner, Probabilistic
         }
 
         // Build class index maps from integer labels (single C read)
-        $flat = $labels->toFlatArray();
+        $flat = array_map('intval', $labels->toFlatArray());
         $unique = array_values(array_unique($flat));
         sort($unique);
         $this->classMap = array_flip($unique);
@@ -61,23 +63,19 @@ final class SoftmaxClassifier implements Learner, Probabilistic
                 $x    = $batch->samples();                          // [N × D]
                 $n    = (float) $x->shape()[0];
 
-                // One-hot encode labels into [N × K] target matrix
-                $yInts  = $batch->labels()->toFlatArray();
-                $yData  = array_fill(0, (int) $n * $k, 0.0);
-                foreach ($yInts as $i => $lbl) {
-                    $yData[$i * $k + ($this->classMap[$lbl] ?? 0)] = 1.0;
-                }
-                $yOH = Tensor::fromArray(
-                    array_chunk($yData, $k)
-                );                                                   // [N × K]
+                // Map label values → class indices (pure PHP map, no FFI)
+                $rawLabels = $batch->labels()->toFlatArray();
+                $idxArr    = array_map(fn($lbl) => (float)($this->classMap[(int)$lbl] ?? 0), $rawLabels);
+                // One-hot via broadcast equal: classIdx[N,1] == arange[1,K] → [N,K]
+                $classIdx = Tensor::fromArray($idxArr)->expandDims(1);          // [N,1]
+                $arange   = Tensor::linspace(0.0, (float)($k - 1), $k);        // [K]
+                $yOH      = $classIdx->equal($arange);                          // [N,K]
 
                 // Forward: logits = X*W + b  [N × K]
                 $logits = $x->matmul($this->weights)->addInplace($this->bias);
 
-                // Softmax in C: exp(x_i) / sum(exp(x_j))
-                $expL   = $logits->exp();
-                $sumExp = $expL->sumAxis(1)->expandDims(1);         // [N × 1]
-                $proba  = $expL->div($sumExp);                      // [N × K]
+                // Numerically stable softmax in-place
+                $proba  = $logits->copy()->rowSoftmaxInplace();                  // [N × K]
 
                 // dL/dLogits = (P - Y) / N
                 $dLogits = $proba->sub($yOH)->mulScalarInplace(1.0 / $n);
@@ -104,30 +102,35 @@ final class SoftmaxClassifier implements Learner, Probabilistic
             throw new RuntimeException("SoftmaxClassifier is not trained.");
         }
         $logits = $dataset->samples()->matmul($this->weights)->addInplace($this->bias);
-        $expL   = $logits->exp();
-        $sumExp = $expL->sumAxis(1)->expandDims(1);
-        return $expL->divInplace($sumExp);                          // [N × K]
+        return $logits->rowSoftmaxInplace();                        // [N × K] in-place
     }
 
     public function predict(Dataset $dataset): Tensor
     {
-        $proba   = $this->proba($dataset);                          // [N × K]
-        $indices = $proba->argsort(1);                              // sort along K axis
-        $n       = $dataset->numRows();
-        // argmax per row: take last column after argsort ascending
-        $k       = count($this->indexMap);
-        $argmaxT = $indices->col($k - 1);                          // [N] — index of max class
-        $intIdx  = $argmaxT->toFlatArray();
-
-        $preds = [];
-        foreach ($intIdx as $idx) {
-            $preds[] = $this->indexMap[(int) $idx] ?? 0;
-        }
+        // argmaxAxis(1) → [N] class indices; map through indexMap (O(N) pure PHP)
+        $classIdx = $this->proba($dataset)->argmaxAxis(1)->toFlatArray();
+        $preds    = array_map(fn($i) => (float)($this->indexMap[(int)$i] ?? 0), $classIdx);
         return Tensor::fromArray($preds);
     }
 
     public function trained(): bool
     {
         return $this->weights !== null;
+    }
+
+    public function save(string $dir): void
+    {
+        is_dir($dir) || mkdir($dir, 0755, true);
+        file_put_contents($dir . '/config.json', json_encode(['epochs'=>$this->epochs,'learningRate'=>$this->learningRate,'l2'=>$this->l2,'batchSize'=>$this->batchSize,'classMap'=>$this->classMap,'indexMap'=>$this->indexMap]));
+        if ($this->weights !== null) SafeTensorsIO::save($dir . '/model.safetensors', ['weights' => $this->weights, 'bias' => $this->bias]);
+    }
+    public static function load(string $dir): self
+    {
+        $c = json_decode(file_get_contents($dir . '/config.json'), true);
+        $i = new self((int)$c['epochs'], (float)$c['learningRate'], (float)$c['l2'], (int)$c['batchSize']);
+        $i->classMap = $c['classMap'] ?? []; $i->indexMap = $c['indexMap'] ?? [];
+        $stPath = $dir . '/model.safetensors';
+        if (is_file($stPath)) { $t = SafeTensorsIO::load($stPath); $i->weights = $t['weights'] ?? null; $i->bias = $t['bias'] ?? null; }
+        return $i;
     }
 }

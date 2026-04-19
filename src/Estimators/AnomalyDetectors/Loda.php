@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Pml\Estimators\AnomalyDetectors;
 
 use Pml\Interfaces\Learner;
+use Pml\Interfaces\Persistable;
+use Pml\Lib\SafeTensorsIO;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -16,7 +18,7 @@ use RuntimeException;
  * - Extremely lightweight C-Level execution. Uses OpenBLAS `matmul` to project the entire dataset
  * onto random hyperplanes instantly.
  */
-final class Loda implements Learner
+final class Loda implements Learner, Persistable
 {
     private int $nProjections;
     private int $bins;
@@ -115,5 +117,28 @@ final class Loda implements Learner
     public function trained(): bool
     {
         return $this->projections !== null;
+    }
+
+    public function save(string $dir): void
+    {
+        is_dir($dir) || mkdir($dir, 0755, true);
+        file_put_contents($dir . '/config.json', json_encode(['nProjections' => $this->nProjections, 'bins' => $this->bins, 'histograms' => $this->histograms, 'binEdges' => $this->binEdges]));
+        if ($this->projections !== null) {
+            SafeTensorsIO::save($dir . '/model.safetensors', ['projections' => $this->projections]);
+        }
+    }
+
+    public static function load(string $dir): self
+    {
+        $c = json_decode(file_get_contents($dir . '/config.json'), true);
+        $i = new self((int) $c['nProjections'], (int) $c['bins']);
+        $i->histograms = $c['histograms'] ?? [];
+        $i->binEdges   = $c['binEdges']   ?? [];
+        $stPath = $dir . '/model.safetensors';
+        if (is_file($stPath)) {
+            $t = SafeTensorsIO::load($stPath);
+            $i->projections = $t['projections'] ?? null;
+        }
+        return $i;
     }
 }

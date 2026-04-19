@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Pml\Estimators\Trees;
 
 use Pml\Interfaces\Learner;
+use Pml\Interfaces\Persistable;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -15,7 +16,7 @@ use RuntimeException;
  * - Skips exhaustive threshold searching. Evaluates exactly ONE random threshold per feature.
  * - Builds tree topologies exponentially faster than standard CART algorithms.
  */
-final class ExtraTreeClassifier implements Learner
+final class ExtraTreeClassifier implements Learner, Persistable
 {
     private int $maxDepth;
     private int $minSamplesSplit;
@@ -183,5 +184,29 @@ final class ExtraTreeClassifier implements Learner
     public function trained(): bool
     {
         return $this->tree !== null;
+    }
+
+    public function exportPhpTree(): array
+    {
+        return ['tree' => $this->tree, 'nFeatures' => $this->nFeatures, 'maxDepth' => $this->maxDepth, 'minSamplesSplit' => $this->minSamplesSplit, 'maxFeatures' => $this->maxFeatures];
+    }
+
+    public static function fromPhpTree(array $data): self
+    {
+        $i = new self((int) $data['maxDepth'], (int) $data['minSamplesSplit'], isset($data['maxFeatures']) ? (int) $data['maxFeatures'] : null);
+        $i->nFeatures = (int) $data['nFeatures'];
+        $i->tree = $data['tree'];
+        return $i;
+    }
+
+    public function save(string $dir): void
+    {
+        is_dir($dir) || mkdir($dir, 0755, true);
+        file_put_contents($dir . '/tree.json', json_encode($this->exportPhpTree()));
+    }
+
+    public static function load(string $dir): self
+    {
+        return self::fromPhpTree(json_decode(file_get_contents($dir . '/tree.json'), true));
     }
 }

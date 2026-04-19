@@ -6,6 +6,7 @@ namespace Pml\Estimators\Classifiers;
 
 use Pml\Interfaces\Learner;
 use Pml\Interfaces\Probabilistic;
+use Pml\Interfaces\Persistable;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -16,7 +17,7 @@ use RuntimeException;
  * * JIT & Memory Optimized:
  * - Employs C-level feature-value extraction and tensor masking to compute probabilities instantly.
  */
-final class CategoricalNB implements Learner, Probabilistic
+final class CategoricalNB implements Learner, Probabilistic, Persistable
 {
     private float $alpha;
     
@@ -125,5 +126,21 @@ final class CategoricalNB implements Learner, Probabilistic
     public function trained(): bool
     {
         return !empty($this->classes);
+    }
+
+    public function save(string $dir): void
+    {
+        is_dir($dir) || mkdir($dir, 0755, true);
+        file_put_contents($dir . '/config.json', json_encode(['alpha' => $this->alpha, 'classes' => $this->classes, 'classPriors' => $this->classPriors, 'featureLogProbs' => $this->featureLogProbs]));
+    }
+
+    public static function load(string $dir): self
+    {
+        $c = json_decode(file_get_contents($dir . '/config.json'), true);
+        $i = new self((float) $c['alpha']);
+        $i->classes = $c['classes'] ?? [];
+        $i->classPriors = $c['classPriors'] ?? [];
+        $i->featureLogProbs = $c['featureLogProbs'] ?? [];
+        return $i;
     }
 }

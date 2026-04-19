@@ -5,10 +5,14 @@ declare(strict_types=1);
 namespace Pml\Estimators\AnomalyDetectors;
 
 use Pml\Interfaces\Learner;
+use Pml\Interfaces\Persistable;
+use Pml\Lib\SafeTensorsIO;
 use Pml\Tensor;
 use Pml\Dataset;
 use Pml\Kernels\SVM\Kernel;
 use Pml\Kernels\SVM\RBF;
+use Pml\Kernels\SVM\Linear;
+use Pml\Kernels\SVM\Polynomial;
 use RuntimeException;
 
 /**
@@ -16,7 +20,7 @@ use RuntimeException;
  * Unsupervised outlier detection that learns a boundary maximizing the margin from the origin 
  * mapped into a high-dimensional kernel space.
  */
-final class OneClassSVM implements Learner
+final class OneClassSVM implements Learner, Persistable
 {
     private float $nu;
     private Kernel $kernel;
@@ -88,5 +92,41 @@ final class OneClassSVM implements Learner
     public function trained(): bool
     {
         return $this->weights !== null;
+    }
+
+    public function save(string $dir): void
+    {
+        is_dir($dir) || mkdir($dir, 0755, true);
+        $kernelClass = get_class($this->kernel);
+        $kernelParams = [];
+        $ref = new \ReflectionObject($this->kernel);
+        foreach ($ref->getProperties() as $prop) {
+            $prop->setAccessible(true);
+            $kernelParams[$prop->getName()] = $prop->getValue($this->kernel);
+        }
+        file_put_contents($dir . '/config.json', json_encode(['nu' => $this->nu, 'epochs' => $this->epochs, 'learningRate' => $this->learningRate, 'rho' => $this->rho, 'kernelClass' => $kernelClass, 'kernelParams' => $kernelParams]));
+        if ($this->weights !== null) {
+            SafeTensorsIO::save($dir . '/model.safetensors', ['weights' => $this->weights, 'support_vectors' => $this->supportVectors]);
+        }
+    }
+
+    public static function load(string $dir): self
+    {
+        $c = json_decode(file_get_contents($dir . '/config.json'), true);
+        $p = $c['kernelParams'] ?? [];
+        $kernel = match ($c['kernelClass']) {
+            RBF::class        => new RBF((float) ($p['gamma'] ?? 0.1)),
+            Polynomial::class => new Polynomial((int) ($p['degree'] ?? 3), (float) ($p['gamma'] ?? 1.0), (float) ($p['c'] ?? 1.0)),
+            default           => new Linear(),
+        };
+        $i = new self((float) $c['nu'], $kernel, (int) $c['epochs'], (float) $c['learningRate']);
+        $i->rho = (float) $c['rho'];
+        $stPath = $dir . '/model.safetensors';
+        if (is_file($stPath)) {
+            $t = SafeTensorsIO::load($stPath);
+            $i->weights = $t['weights'] ?? null;
+            $i->supportVectors = $t['support_vectors'] ?? null;
+        }
+        return $i;
     }
 }

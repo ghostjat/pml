@@ -16,45 +16,25 @@ use Pml\Tensor;
  */
 final class BinaryCrossEntropy implements Loss
 {
+    /** Pre-allocated gradient buffer — reallocated only when batch size changes. */
+    private ?Tensor $gradBuffer = null;
+
     public function compute(Tensor $predictions, Tensor $labels): float
     {
-        // 1. Clip predictions to prevent log(0) explosions (-INF)
-        $clipped = $predictions->clip(1e-7, 1.0 - 1e-7);
-        
-        // 2. Term 1: y * log(y_pred)
-        $term1 = $labels->mul($clipped->log());
-        
-        // 3. Term 2: (1 - y) * log(1 - y_pred)
-        // OPTIMIZATION: log(1 - x) is mathematically identical to log1p(-x).
-        // This saves an entire AVX2 array traversal (addScalarInplace) and improves precision.
-        $minusClipped = $clipped->mulScalar(-1.0);
-        $logOneMinusPred = $minusClipped->log1p();
-        
-        // (1 - y)
-        $oneMinusY = $labels->mulScalar(-1.0)->addScalarInplace(1.0);
-        
-        // Combine into Term 2 natively in C-memory
-        $term2 = $oneMinusY->mulInplace($logOneMinusPred);
-        
-        // 4. Loss = -mean(term1 + term2)
-        // All aggregations happen in the CPU cache without allocating new Tensors
-        return $term1->addInplace($term2)->mean() * -1.0;
+        // Fused C kernel: clip + loss computation in one pass. No PHP allocs.
+        return Tensor::fusedBceLossAndGrad($predictions, $labels);
     }
 
     public function differentiate(Tensor $predictions, Tensor $labels): Tensor
     {
-        $clipped = $predictions->clip(1e-7, 1.0 - 1e-7);
-        $n = $predictions->size();
-        
-        // Formula: dY = (y_pred - y_true) / (y_pred * (1 - y_pred) * N)
-        
-        // 1. Calculate Denominator: [y_pred * (1 - y_pred) * N]
-        $oneMinusYPred = $clipped->mulScalar(-1.0)->addScalarInplace(1.0);
-        $denominator = $clipped->mul($oneMinusYPred)->mulScalarInplace((float) $n);
-        
-        // 2. Calculate Numerator & Final Gradient In-Place: [y_pred - y_true] / Denominator
-        $diff = $clipped->sub($labels);
-        
-        return $diff->divInplace($denominator);
+        // Reuse gradient buffer across steps — reallocate only on batch size change.
+        $size = $predictions->size();
+        if ($this->gradBuffer === null || $this->gradBuffer->size() !== $size) {
+            $this->gradBuffer = Tensor::zeros(...$predictions->shape());
+        }
+
+        // Single C kernel: clip + grad in one pass, writes into pre-allocated buffer.
+        Tensor::fusedBceLossAndGrad($predictions, $labels, $this->gradBuffer);
+        return $this->gradBuffer;
     }
 }

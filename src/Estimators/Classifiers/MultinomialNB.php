@@ -6,6 +6,8 @@ namespace Pml\Estimators\Classifiers;
 
 use Pml\Interfaces\Learner;
 use Pml\Interfaces\Probabilistic;
+use Pml\Interfaces\Persistable;
+use Pml\Lib\SafeTensorsIO;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -17,7 +19,7 @@ use RuntimeException;
  * - Uses OpenBLAS matrix accumulations to compute feature probabilities instantly.
  * - Applies Laplace (alpha) smoothing safely via inplace scalar addition.
  */
-final class MultinomialNB implements Learner, Probabilistic
+final class MultinomialNB implements Learner, Probabilistic, Persistable
 {
     private float $alpha;
     
@@ -109,5 +111,32 @@ final class MultinomialNB implements Learner, Probabilistic
     public function trained(): bool
     {
         return !empty($this->classes);
+    }
+
+    public function save(string $dir): void
+    {
+        is_dir($dir) || mkdir($dir, 0755, true);
+        file_put_contents($dir . '/config.json', json_encode(['alpha' => $this->alpha, 'classes' => $this->classes, 'classPriors' => $this->classPriors]));
+        if (!empty($this->featureLogProbs)) {
+            $tensors = [];
+            foreach ($this->featureLogProbs as $k => $t) { $tensors['flp.' . $k] = $t; }
+            SafeTensorsIO::save($dir . '/model.safetensors', $tensors);
+        }
+    }
+
+    public static function load(string $dir): self
+    {
+        $c = json_decode(file_get_contents($dir . '/config.json'), true);
+        $i = new self((float) $c['alpha']);
+        $i->classes = $c['classes'] ?? [];
+        $i->classPriors = $c['classPriors'] ?? [];
+        $stPath = $dir . '/model.safetensors';
+        if (is_file($stPath)) {
+            $t = SafeTensorsIO::load($stPath);
+            foreach ($t as $key => $tensor) {
+                if (str_starts_with($key, 'flp.')) { $i->featureLogProbs[substr($key, 4)] = $tensor; }
+            }
+        }
+        return $i;
     }
 }

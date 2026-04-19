@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Pml\Estimators\AnomalyDetectors;
 
 use Pml\Interfaces\Learner;
+use Pml\Interfaces\Persistable;
+use Pml\Lib\SafeTensorsIO;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -14,7 +16,7 @@ use RuntimeException;
  * Fits a multivariate Gaussian distribution to the dataset. Anomalies are data points
  * with extremely low Probability Density Function (PDF) evaluations.
  */
-final class GaussianMLE implements Learner
+final class GaussianMLE implements Learner, Persistable
 {
     private float $threshold; // Contamination threshold logic (e.g. log prob < threshold)
     
@@ -56,5 +58,27 @@ final class GaussianMLE implements Learner
     public function trained(): bool
     {
         return $this->mean !== null;
+    }
+
+    public function save(string $dir): void
+    {
+        if (!is_dir($dir)) { mkdir($dir, 0755, true); }
+        file_put_contents($dir . '/config.json', json_encode(['threshold' => $this->threshold], JSON_PRETTY_PRINT));
+        if ($this->mean !== null && $this->variance !== null) {
+            SafeTensorsIO::save($dir . '/model.safetensors', ['mean' => $this->mean, 'variance' => $this->variance]);
+        }
+    }
+
+    public static function load(string $dir): self
+    {
+        $cfg = json_decode(file_get_contents($dir . '/config.json'), true);
+        $instance = new self((float) $cfg['threshold']);
+        $stPath = $dir . '/model.safetensors';
+        if (is_file($stPath)) {
+            $tensors = SafeTensorsIO::load($stPath);
+            $instance->mean = $tensors['mean'] ?? null;
+            $instance->variance = $tensors['variance'] ?? null;
+        }
+        return $instance;
     }
 }

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Pml\Estimators\Classifiers;
 
 use Pml\Interfaces\Learner;
+use Pml\Interfaces\Persistable;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -16,7 +17,7 @@ use RuntimeException;
  * - Extracts 1D boolean masks to PHP to rapidly route tree topology via JIT.
  * - Employs Randomized Split searching to bypass exhaustive O(N^2) loops.
  */
-final class DecisionTreeClassifier implements Learner
+final class DecisionTreeClassifier implements Learner, Persistable
 {
     private int $maxDepth;
     private int $minSamplesSplit;
@@ -328,5 +329,16 @@ private function findBestSplit(Tensor $x, Tensor $y): ?array
         $instance->buildHardwareNodes();
 
         return $instance;
+    }
+
+    public function save(string $dir): void
+    {
+        is_dir($dir) || mkdir($dir, 0755, true);
+        file_put_contents($dir . '/tree.json', json_encode($this->exportPhpTree()));
+    }
+
+    public static function load(string $dir): self
+    {
+        return self::fromPhpTree(json_decode(file_get_contents($dir . '/tree.json'), true));
     }
 }

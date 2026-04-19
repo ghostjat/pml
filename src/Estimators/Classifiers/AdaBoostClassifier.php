@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Pml\Estimators\Classifiers;
 
 use Pml\Interfaces\Learner;
+use Pml\Interfaces\Persistable;
 use Pml\Tensor;
 use Pml\Dataset;
 use Pml\Estimators\Classifiers\DecisionTreeClassifier;
@@ -17,7 +18,7 @@ use RuntimeException;
  * - Executes SAMME algorithm updates natively via OpenBLAS broadcasting.
  * - Extracts `weightedSample` subsets via an O(log N) binary search routing to `tensor_take()`.
  */
-final class AdaBoostClassifier implements Learner
+final class AdaBoostClassifier implements Learner, Persistable
 {
     private int $nEstimators;
     private float $learningRate;
@@ -182,5 +183,26 @@ final class AdaBoostClassifier implements Learner
     public function trained(): bool
     {
         return !empty($this->estimators);
+    }
+
+    public function save(string $dir): void
+    {
+        is_dir($dir) || mkdir($dir, 0755, true);
+        file_put_contents($dir . '/config.json', json_encode(['nEstimators' => $this->nEstimators, 'learningRate' => $this->learningRate, 'alphas' => $this->alphas, 'classes' => $this->classes]));
+        $treeData = [];
+        foreach ($this->estimators as $tree) { $treeData[] = $tree->exportPhpTree(); }
+        file_put_contents($dir . '/trees.json', json_encode($treeData));
+    }
+
+    public static function load(string $dir): self
+    {
+        $c = json_decode(file_get_contents($dir . '/config.json'), true);
+        $i = new self((int) $c['nEstimators'], (float) $c['learningRate']);
+        $i->alphas = $c['alphas'] ?? [];
+        $i->classes = $c['classes'] ?? [];
+        foreach (json_decode(file_get_contents($dir . '/trees.json'), true) as $treeData) {
+            $i->estimators[] = DecisionTreeClassifier::fromPhpTree($treeData);
+        }
+        return $i;
     }
 }

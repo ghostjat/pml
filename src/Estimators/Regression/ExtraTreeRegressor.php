@@ -4,6 +4,7 @@ declare(strict_types=1);
 namespace Pml\Estimators\Regression;
 
 use Pml\Interfaces\Learner;
+use Pml\Interfaces\Persistable;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -18,7 +19,7 @@ use RuntimeException;
  * - All label reductions (mean) are single C calls.
  * - Tree traversal at predict time uses JIT-compiled PHP array indexing.
  */
-final class ExtraTreeRegressor implements Learner
+final class ExtraTreeRegressor implements Learner, Persistable
 {
     private ?array $tree    = null;
     private int    $nFeatures = 0;
@@ -148,5 +149,29 @@ final class ExtraTreeRegressor implements Learner
     public function trained(): bool
     {
         return $this->tree !== null;
+    }
+
+    public function exportPhpTree(): array
+    {
+        return ['tree' => $this->tree, 'nFeatures' => $this->nFeatures, 'maxDepth' => $this->maxDepth, 'minSamplesSplit' => $this->minSamplesSplit, 'maxFeatures' => $this->maxFeatures];
+    }
+
+    public static function fromPhpTree(array $data): self
+    {
+        $i = new self((int) $data['maxDepth'], (int) $data['minSamplesSplit'], isset($data['maxFeatures']) ? (int) $data['maxFeatures'] : null);
+        $i->nFeatures = (int) $data['nFeatures'];
+        $i->tree = $data['tree'];
+        return $i;
+    }
+
+    public function save(string $dir): void
+    {
+        is_dir($dir) || mkdir($dir, 0755, true);
+        file_put_contents($dir . '/tree.json', json_encode($this->exportPhpTree()));
+    }
+
+    public static function load(string $dir): self
+    {
+        return self::fromPhpTree(json_decode(file_get_contents($dir . '/tree.json'), true));
     }
 }
