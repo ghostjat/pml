@@ -37,41 +37,6 @@ This results in a system that delivers **near-native performance** while retaini
 
 ## 🧩 Core Architecture
 
-### 🎯 SVG Diagram (Exportable)
-
-```svg
-<svg width="800" height="420" xmlns="http://www.w3.org/2000/svg">
-  <style>
-    .box { fill:#0f172a; stroke:#38bdf8; stroke-width:2; rx:10; }
-    .text { fill:#e2e8f0; font-size:14px; font-family:monospace; }
-    .arrow { stroke:#94a3b8; stroke-width:2; marker-end:url(#arrow); }
-  </style>
-  <defs>
-    <marker id="arrow" markerWidth="10" markerHeight="10" refX="10" refY="3" orient="auto">
-      <path d="M0,0 L10,3 L0,6 Z" fill="#94a3b8" />
-    </marker>
-  </defs>
-
-  <rect x="250" y="20" width="300" height="60" class="box" />
-  <text x="280" y="55" class="text">PHP Userland (Models/API)</text>
-
-  <line x1="400" y1="80" x2="400" y2="120" class="arrow" />
-
-  <rect x="250" y="120" width="300" height="60" class="box" />
-  <text x="290" y="155" class="text">FFI Bridge (Zero-copy)</text>
-
-  <line x1="400" y1="180" x2="400" y2="220" class="arrow" />
-
-  <rect x="250" y="220" width="300" height="60" class="box" />
-  <text x="260" y="255" class="text">C Tensor Engine (SIMD + OpenMP)</text>
-
-  <line x1="400" y1="280" x2="400" y2="320" class="arrow" />
-
-  <rect x="250" y="320" width="300" height="60" class="box" />
-  <text x="260" y="355" class="text">Hardware (CPU Cache / Threads)</text>
-</svg>
-```
-
 ---
 
 ┌────────────────────────────┐
