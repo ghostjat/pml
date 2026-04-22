@@ -47,17 +47,25 @@ final class ZScaleStandardizer implements Transformer, Stateful
         if (!$this->fitted()) {
             throw new RuntimeException("ZScaleStandardizer has not been fitted.");
         }
-        
+
         $samples = $dataset->samples();
-        
-        // FIXED: Only center the data if explicitly requested
+
+        // Broadcast-safe: if samples is 2D [N,D] and stats are 1D [D],
+        // reshape stats to [1,D] so C broadcast engine sees matching ndim.
+        $ndim  = count($samples->shape());
+        $means = ($ndim > 1 && count($this->means->shape()) === 1)
+            ? $this->means->reshape(1, ...$this->means->shape())
+            : $this->means;
+        $stds  = ($ndim > 1 && count($this->stds->shape()) === 1)
+            ? $this->stds->reshape(1, ...$this->stds->shape())
+            : $this->stds;
+
         if ($this->center) {
-            $samples = $samples->sub($this->means);
+            $samples = $samples->sub($means);
         }
-        
-        // Scale variance
-        $scaled = $samples->divInplace($this->stds);
-        
+
+        $scaled = $samples->divInplace($stds);
+
         return new Dataset($scaled, $dataset->labels());
     }
 
@@ -73,7 +81,10 @@ final class ZScaleStandardizer implements Transformer, Stateful
 
     public function loadStateDict(array $dict, string $prefix = ''): void
     {
-        $this->means = $dict[$prefix . 'means'] ?? null;
-        $this->stds  = $dict[$prefix . 'stds']  ?? null;
+        $rawMeans = $dict[$prefix . 'means'] ?? null;
+        $rawStds  = $dict[$prefix . 'stds']  ?? null;
+        // copy() converts mmap-backed (read-only) tensors to normal heap tensors
+        $this->means = $rawMeans?->copy();
+        $this->stds  = $rawStds?->copy();
     }
 }

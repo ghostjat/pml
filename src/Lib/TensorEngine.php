@@ -386,6 +386,16 @@ final class TensorEngine {
                 TensorC* tensor_gbdt_predict_all(TensorC* X_bins, TensorC* feats, TensorC* thresholds,
                                                  TensorC* lefts, TensorC* rights,
                                                  TensorC* tree_sizes, float base_score);
+                void     tensor_gbdt_hist_subtract(TensorC* parent_g, TensorC* parent_h,
+                                                   TensorC* sibling_g, TensorC* sibling_h,
+                                                   TensorC* out_g, TensorC* out_h);
+                int      tensor_gbdt_train_tree(TensorC* bins, TensorC* g, TensorC* h,
+                                                int Q, int max_leaves,
+                                                float lambda, float alpha, float gamma,
+                                                float min_hess, float lr,
+                                                TensorC* preds,
+                                                TensorC* out_feats, TensorC* out_thresholds,
+                                                TensorC* out_lefts, TensorC* out_rights);
 
                 TensorC* tensor_quantile_fit(TensorC* X, int n_quantiles);
                 TensorC* tensor_quantile_transform(TensorC* X, TensorC* landmarks, int n_quantiles);

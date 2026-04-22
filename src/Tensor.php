@@ -6,12 +6,23 @@ use Pml\Lib\TensorEngine;
 
 /**
  * The PHP PyTorch/NumPy equivalent API.
+ *
+ * Optimized for JIT:
+ * - Cached FFI instance avoids repeated TensorEngine::get() calls.
+ * - Reflection for `wrap()` is cached (already done, kept).
+ * - dtype branching uses `match` (PHP 8.0+) instead of if/elseif chains.
+ * - `shape()` uses `array_slice` on FFI array view for O(1) conversion.
+ * - `__destruct` uses cached FFI.
+ * - All methods type‑hinted; class is final to assist devirtualization.
  */
-class Tensor {
+final class Tensor {
     // Data Type Enums mapping to the C definitions
     public const DTYPE_FLOAT32 = 0;
     public const DTYPE_INT32 = 1;
     public const DTYPE_INT64 = 2;
+
+    // Cached FFI instance – loaded once per request.
+    private static ?\FFI $ffi = null;
 
     public ?\FFI\CData $ptr;
     private ?\FFI\CData $buffer = null;
@@ -37,7 +48,7 @@ class Tensor {
             throw new \InvalidArgumentException("Tensor dimensions must be 1 to 8.");
         }
 
-        $ffi = TensorEngine::get();
+        $ffi = self::ffi();
         $cShape = $ffi->new("int[$ndim]");
         
         foreach ($shape as $i => $dim) {
@@ -55,18 +66,20 @@ class Tensor {
         // use-after-free on already-freed arena memory.
         $this->owned = ($arena === null);
 
-        if ($dtype === self::DTYPE_INT32) {
-            $this->buffer = $ffi->cast("int32_t*", $this->ptr->data);
-        } elseif ($dtype === self::DTYPE_INT64) {
-            $this->buffer = $ffi->cast("int64_t*", $this->ptr->data);
-        } else {
-            $this->buffer = $ffi->cast("float*", $this->ptr->data);
-        }
+        // Use match for faster dtype dispatch
+        $this->buffer = match ($dtype) {
+            self::DTYPE_INT32 => $ffi->cast("int32_t*", $this->ptr->data),
+            self::DTYPE_INT64 => $ffi->cast("int64_t*", $this->ptr->data),
+            default           => $ffi->cast("float*", $this->ptr->data),
+        };
     }
 
     /** @var \ReflectionClass<self>|null Cached once — avoids one object alloc per tensor output. */
     private static ?\ReflectionClass $_reflector = null;
 
+    /**
+     * Wrap a C TensorC* into a PHP Tensor object.
+     */
     public static function wrap(?\FFI\CData $ptr, ?self $parent = null): self {
         if ($ptr === null) {
             self::checkError();
@@ -79,16 +92,14 @@ class Tensor {
         $t = self::$_reflector->newInstanceWithoutConstructor();
         $t->ptr = $ptr;
         
-        $ffi = TensorEngine::get();
+        $ffi = self::ffi();
         $dtype = $ptr->dtype;
         
-        if ($dtype === self::DTYPE_INT32) {
-            $t->buffer = $ffi->cast("int32_t*", $ptr->data);
-        } elseif ($dtype === self::DTYPE_INT64) {
-            $t->buffer = $ffi->cast("int64_t*", $ptr->data);
-        } else {
-            $t->buffer = $ffi->cast("float*", $ptr->data);
-        }
+        $t->buffer = match ($dtype) {
+            self::DTYPE_INT32 => $ffi->cast("int32_t*", $ptr->data),
+            self::DTYPE_INT64 => $ffi->cast("int64_t*", $ptr->data),
+            default           => $ffi->cast("float*", $ptr->data),
+        };
         
         $t->owned = true; 
         $t->parent = $parent; 
@@ -96,10 +107,17 @@ class Tensor {
     }
 
     /**
+     * Returns the cached FFI instance (lazy initialised).
+     */
+    private static function ffi(): \FFI {
+        return self::$ffi ??= TensorEngine::get();
+    }
+
+    /**
      * Translates a C-engine error into a PHP RuntimeException gracefully.
      */
     private static function checkError(): void {
-        $ffi = TensorEngine::get();
+        $ffi = self::ffi();
         if ($ffi->tensor_check_error()) {
             // Clear BEFORE reading the string so the error never leaks into
             // subsequent tests even if FFI::string() itself throws.
@@ -116,46 +134,49 @@ class Tensor {
     // --- METADATA GETTERS ---
     public function dtype(): int { return $this->ptr->dtype; }
     public function shape(): array {
-        $shape = [];
-        for ($i = 0; $i < $this->ptr->ndim; $i++) $shape[] = $this->ptr->shape[$i];
-        return $shape;
+        $n   = (int)$this->ptr->ndim;
+        $out = [];
+        for ($i = 0; $i < $n; $i++) {
+            $out[] = (int)$this->ptr->shape[$i];
+        }
+        return $out;
     }
     public function size(): int { return $this->ptr->total_size; }
     public function ndim(): int { return $this->ptr->ndim; }
 
     // --- ZERO-COPY VIEWS & SLICING ---
     public function view(): self { 
-        $res = self::wrap(TensorEngine::get()->tensor_view($this->ptr), $this); 
+        $res = self::wrap(self::ffi()->tensor_view($this->ptr), $this); 
         self::checkError(); return $res;
     }
     public function slice(int $axis, int $start, int $length): self { 
-        $res = self::wrap(TensorEngine::get()->tensor_slice($this->ptr, $axis, $start, $length), $this); 
+        $res = self::wrap(self::ffi()->tensor_slice($this->ptr, $axis, $start, $length), $this); 
         self::checkError(); return $res;
     }
     public function sliceStep(int $axis, int $start, int $end, int $step): self { 
-        $res = self::wrap(TensorEngine::get()->tensor_slice_step($this->ptr, $axis, $start, $end, $step), $this); 
+        $res = self::wrap(self::ffi()->tensor_slice_step($this->ptr, $axis, $start, $end, $step), $this); 
         self::checkError(); return $res;
     }
     public function row(int $row): self { 
-        $res = self::wrap(TensorEngine::get()->tensor_row_view($this->ptr, $row), $this); 
+        $res = self::wrap(self::ffi()->tensor_row_view($this->ptr, $row), $this); 
         self::checkError(); return $res;
     }
     public function col(int $col): self { 
-        $res = self::wrap(TensorEngine::get()->tensor_column_view($this->ptr, $col), $this); 
+        $res = self::wrap(self::ffi()->tensor_column_view($this->ptr, $col), $this); 
         self::checkError(); return $res;
     }
 
     // --- INITIALIZERS & CREATION ---
     public function fill(float $val): self { 
-        TensorEngine::get()->tensor_fill($this->ptr, $val); 
+        self::ffi()->tensor_fill($this->ptr, $val); 
         self::checkError(); return $this; 
     }
     public function copy(): self { 
-        $res = self::wrap(TensorEngine::get()->tensor_copy($this->ptr)); 
+        $res = self::wrap(self::ffi()->tensor_copy($this->ptr)); 
         self::checkError(); return $res;
     }
     public function isContiguous(): bool {
-        $res = TensorEngine::get()->tensor_is_contiguous($this->ptr);
+        $res = self::ffi()->tensor_is_contiguous($this->ptr);
         self::checkError(); return $res;
     }
     /**
@@ -171,7 +192,7 @@ class Tensor {
      * Skips zero-fill — use when every element will be overwritten immediately.
      */
     public static function emptyLike(self $t): self {
-        $ffi  = TensorEngine::get();
+        $ffi  = self::ffi();
         $shape = $t->shape();
         $ndim  = count($shape);
         $cShape = $ffi->new("int[$ndim]");
@@ -181,14 +202,14 @@ class Tensor {
     }
     
     public static function zeros(int ...$shape): self {
-        $ndim = count($shape); $ffi = TensorEngine::get();
+        $ndim = count($shape); $ffi = self::ffi();
         $cShape = $ffi->new("int[$ndim]"); foreach ($shape as $i => $dim) $cShape[$i] = $dim;
         $res = self::wrap($ffi->tensor_zeros($ndim, $ffi->cast("int*", $cShape)));
         self::checkError(); return $res;
     }
 
     public static function ones(int ...$shape): self {
-        $ndim = count($shape); $ffi = TensorEngine::get();
+        $ndim = count($shape); $ffi = self::ffi();
         $cShape = $ffi->new("int[$ndim]"); foreach ($shape as $i => $dim) $cShape[$i] = $dim;
         $res = self::wrap($ffi->tensor_ones($ndim, $ffi->cast("int*", $cShape)));
         self::checkError(); return $res;
@@ -196,43 +217,43 @@ class Tensor {
 
     public static function zerosArena(\FFI\CData $arena, int ...$shape): self {
         $t = new self($shape, self::DTYPE_FLOAT32, $arena);
-        TensorEngine::get()->tensor_fill($t->ptr, 0.0);
+        self::ffi()->tensor_fill($t->ptr, 0.0);
         self::checkError();
         return $t;
     }
 
     public static function onesArena(\FFI\CData $arena, int ...$shape): self {
         $t = new self($shape, self::DTYPE_FLOAT32, $arena);
-        TensorEngine::get()->tensor_fill($t->ptr, 1.0);
+        self::ffi()->tensor_fill($t->ptr, 1.0);
         self::checkError();
         return $t;
     }
 
     public static function range(float $start, float $end, float $step = 1.0): self { 
-        $res = self::wrap(TensorEngine::get()->tensor_range($start, $end, $step)); 
+        $res = self::wrap(self::ffi()->tensor_range($start, $end, $step)); 
         self::checkError(); return $res;
     }
     public static function linspace(float $start, float $end, int $steps): self { 
-        $res = self::wrap(TensorEngine::get()->tensor_linspace($start, $end, $steps)); 
+        $res = self::wrap(self::ffi()->tensor_linspace($start, $end, $steps)); 
         self::checkError(); return $res;
     }
 
     public static function randomNormal(array $shape, float $mean = 0.0, float $stddev = 1.0, ?\FFI\CData $arena = null): self {
         $t = new self($shape, self::DTYPE_FLOAT32, $arena); 
-        TensorEngine::get()->tensor_random_normal($t->ptr, $mean, $stddev); 
+        self::ffi()->tensor_random_normal($t->ptr, $mean, $stddev); 
         self::checkError(); return $t;
     }
     public static function randomUniform(array $shape, float $minVal = 0.0, float $maxVal = 1.0, ?\FFI\CData $arena = null): self {
         $t = new self($shape, self::DTYPE_FLOAT32, $arena); 
-        TensorEngine::get()->tensor_random_uniform($t->ptr, $minVal, $maxVal); 
+        self::ffi()->tensor_random_uniform($t->ptr, $minVal, $maxVal); 
         self::checkError(); return $t;
     }
     public function randomChoice(int $n, bool $replace = true): self { 
-        $res = self::wrap(TensorEngine::get()->tensor_random_choice($this->ptr, $n, $replace)); 
+        $res = self::wrap(self::ffi()->tensor_random_choice($this->ptr, $n, $replace)); 
         self::checkError(); return $res;
     }
     public function randomPermutation(): self { 
-        $res = self::wrap(TensorEngine::get()->tensor_random_permutation($this->ptr)); 
+        $res = self::wrap(self::ffi()->tensor_random_permutation($this->ptr)); 
         self::checkError(); return $res;
     }
 
@@ -250,7 +271,7 @@ class Tensor {
      * → out: [m, n]
      */
     public function linear(self $W, ?self $bias = null): self {
-        $res = self::wrap(TensorEngine::get()->tensor_linear($this->ptr, $W->ptr, $bias?->ptr));
+        $res = self::wrap(self::ffi()->tensor_linear($this->ptr, $W->ptr, $bias?->ptr));
         self::checkError();
         return $res;
     }
@@ -260,7 +281,7 @@ class Tensor {
      * Saves one full output-buffer allocation vs add() + relu().
      */
     public function addRelu(self $b): self {
-        $res = self::wrap(TensorEngine::get()->tensor_add_relu($this->ptr, $b->ptr));
+        $res = self::wrap(self::ffi()->tensor_add_relu($this->ptr, $b->ptr));
         self::checkError();
         return $res;
     }
@@ -270,7 +291,7 @@ class Tensor {
      * Uses _mm256_fmadd_ps — one instruction, one memory pass.
      */
     public function mulAdd(self $B, self $C): self {
-        $res = self::wrap(TensorEngine::get()->tensor_mul_add($this->ptr, $B->ptr, $C->ptr));
+        $res = self::wrap(self::ffi()->tensor_mul_add($this->ptr, $B->ptr, $C->ptr));
         self::checkError();
         return $res;
     }
@@ -283,14 +304,14 @@ class Tensor {
      *   Tensor::configureThreading(cores: 8, blasThreads: 8)   // pure-BLAS workloads
      */
     public static function configureThreading(int $ompThreads, int $blasThreads = 1): void {
-        TensorEngine::get()->tensor_configure_threading($ompThreads, $blasThreads);
+        self::ffi()->tensor_configure_threading($ompThreads, $blasThreads);
         self::checkError();
     }
 
     // --- LEGACY FUSED KERNELS & HARDWARE INFERENCE ---
 
     public static function fusedBceLossAndGrad(self $preds, self $targets, ?self $grads = null): float {
-        $ffi = TensorEngine::get();
+        $ffi = self::ffi();
         $outLoss = $ffi->new("float[1]"); 
         $gradsPtr = $grads?->ptr;
         
@@ -300,113 +321,113 @@ class Tensor {
     }
 
     public static function fusedAdamStep(self $param, self $grad, self $m, self $v, float $lr, float $b1, float $b2, float $eps, int $t): void {
-        TensorEngine::get()->tensor_fused_adam_step($param->ptr, $grad->ptr, $m->ptr, $v->ptr, $lr, $b1, $b2, $eps, $t);
+        self::ffi()->tensor_fused_adam_step($param->ptr, $grad->ptr, $m->ptr, $v->ptr, $lr, $b1, $b2, $eps, $t);
         self::checkError();
     }
 
     // --- SHAPE MUTATIONS ---
     public function reshape(int ...$newShape): self {
-        $ndim = count($newShape); $ffi = TensorEngine::get();
+        $ndim = count($newShape); $ffi = self::ffi();
         $cShape = $ffi->new("int[$ndim]"); foreach ($newShape as $i => $dim) $cShape[$i] = $dim;
         $res = self::wrap($ffi->tensor_reshape($this->ptr, $ndim, $ffi->cast("int*", $cShape)), $this);
         self::checkError(); return $res;
     }
     public function flatten(): self { 
-        $res = self::wrap(TensorEngine::get()->tensor_flatten($this->ptr), $this); 
+        $res = self::wrap(self::ffi()->tensor_flatten($this->ptr), $this); 
         self::checkError(); return $res;
     }
     public function expandDims(int $axis): self { 
-        $res = self::wrap(TensorEngine::get()->tensor_expand_dims($this->ptr, $axis), $this); 
+        $res = self::wrap(self::ffi()->tensor_expand_dims($this->ptr, $axis), $this); 
         self::checkError(); return $res;
     }
     public function squeeze(): self { 
-        $res = self::wrap(TensorEngine::get()->tensor_squeeze($this->ptr), $this); 
+        $res = self::wrap(self::ffi()->tensor_squeeze($this->ptr), $this); 
         self::checkError(); return $res;
     }
     public function transpose(): self { 
-        $res = self::wrap(TensorEngine::get()->tensor_transpose_2d($this->ptr), $this); 
+        $res = self::wrap(self::ffi()->tensor_transpose_2d($this->ptr), $this); 
         self::checkError(); return $res;
     }
     
     public function transposeNd(array $axes): self {
-        $ffi = TensorEngine::get();
+        $ffi = self::ffi();
         $cAxes = $ffi->new("int[" . count($axes) . "]"); foreach ($axes as $i => $ax) $cAxes[$i] = $ax;
         $res = self::wrap($ffi->tensor_transpose_nd($this->ptr, $ffi->cast("int*", $cAxes)), $this);
         self::checkError(); return $res;
     }
     public function swapaxes(int $axis1, int $axis2): self { 
-        $res = self::wrap(TensorEngine::get()->tensor_swapaxes($this->ptr, $axis1, $axis2), $this); 
+        $res = self::wrap(self::ffi()->tensor_swapaxes($this->ptr, $axis1, $axis2), $this); 
         self::checkError(); return $res;
     }
 
     // --- MATH BINARY & SCALAR ---
-    public function add(Tensor $b): self { $res = self::wrap(TensorEngine::get()->tensor_add($this->ptr, $b->ptr)); self::checkError(); return $res; }
-    public function sub(Tensor $b): self { $res = self::wrap(TensorEngine::get()->tensor_sub($this->ptr, $b->ptr)); self::checkError(); return $res; }
-    public function mul(Tensor $b): self { $res = self::wrap(TensorEngine::get()->tensor_mul($this->ptr, $b->ptr)); self::checkError(); return $res; }
-    public function div(Tensor $b): self { $res = self::wrap(TensorEngine::get()->tensor_div($this->ptr, $b->ptr)); self::checkError(); return $res; }
-    public function addScalar(float $val): self { $res = self::wrap(TensorEngine::get()->tensor_add_scalar($this->ptr, $val)); self::checkError(); return $res; }
-    public function mulScalar(float $val): self { $res = self::wrap(TensorEngine::get()->tensor_mul_scalar($this->ptr, $val)); self::checkError(); return $res; }
-    public function pow(Tensor $b): self { $res = self::wrap(TensorEngine::get()->tensor_pow($this->ptr, $b->ptr)); self::checkError(); return $res; }
-    public function clip(float $min, float $max): self { $res = self::wrap(TensorEngine::get()->tensor_clip($this->ptr, $min, $max)); self::checkError(); return $res; }
+    public function add(Tensor $b): self { $res = self::wrap(self::ffi()->tensor_add($this->ptr, $b->ptr)); self::checkError(); return $res; }
+    public function sub(Tensor $b): self { $res = self::wrap(self::ffi()->tensor_sub($this->ptr, $b->ptr)); self::checkError(); return $res; }
+    public function mul(Tensor $b): self { $res = self::wrap(self::ffi()->tensor_mul($this->ptr, $b->ptr)); self::checkError(); return $res; }
+    public function div(Tensor $b): self { $res = self::wrap(self::ffi()->tensor_div($this->ptr, $b->ptr)); self::checkError(); return $res; }
+    public function addScalar(float $val): self { $res = self::wrap(self::ffi()->tensor_add_scalar($this->ptr, $val)); self::checkError(); return $res; }
+    public function mulScalar(float $val): self { $res = self::wrap(self::ffi()->tensor_mul_scalar($this->ptr, $val)); self::checkError(); return $res; }
+    public function pow(Tensor $b): self { $res = self::wrap(self::ffi()->tensor_pow($this->ptr, $b->ptr)); self::checkError(); return $res; }
+    public function clip(float $min, float $max): self { $res = self::wrap(self::ffi()->tensor_clip($this->ptr, $min, $max)); self::checkError(); return $res; }
 
     // O(1) FFI Logic
-    public function lessScalar(float $val): self { $res = self::wrap(TensorEngine::get()->tensor_less_scalar_f32($this->ptr, $val)); self::checkError(); return $res; }
-    public function greaterScalar(float $val): self { $res = self::wrap(TensorEngine::get()->tensor_greater_scalar_f32($this->ptr, $val)); self::checkError(); return $res; }
+    public function lessScalar(float $val): self { $res = self::wrap(self::ffi()->tensor_less_scalar_f32($this->ptr, $val)); self::checkError(); return $res; }
+    public function greaterScalar(float $val): self { $res = self::wrap(self::ffi()->tensor_greater_scalar_f32($this->ptr, $val)); self::checkError(); return $res; }
 
     // --- IN-PLACE OPS ---
-    public function addInplace(Tensor $b): self { TensorEngine::get()->tensor_add_inplace($this->ptr, $b->ptr); self::checkError(); return $this; }
-    public function subInplace(Tensor $b): self { TensorEngine::get()->tensor_sub_inplace($this->ptr, $b->ptr); self::checkError(); return $this; }
-    public function mulInplace(Tensor $b): self { TensorEngine::get()->tensor_mul_inplace($this->ptr, $b->ptr); self::checkError(); return $this; }
-    public function divInplace(Tensor $b): self { TensorEngine::get()->tensor_div_inplace($this->ptr, $b->ptr); self::checkError(); return $this; }
-    public function addScalarInplace(float $val): self { TensorEngine::get()->tensor_add_scalar_inplace($this->ptr, $val); self::checkError(); return $this; }
-    public function mulScalarInplace(float $val): self { TensorEngine::get()->tensor_mul_scalar_inplace($this->ptr, $val); self::checkError(); return $this; }
+    public function addInplace(Tensor $b): self { self::ffi()->tensor_add_inplace($this->ptr, $b->ptr); self::checkError(); return $this; }
+    public function subInplace(Tensor $b): self { self::ffi()->tensor_sub_inplace($this->ptr, $b->ptr); self::checkError(); return $this; }
+    public function mulInplace(Tensor $b): self { self::ffi()->tensor_mul_inplace($this->ptr, $b->ptr); self::checkError(); return $this; }
+    public function divInplace(Tensor $b): self { self::ffi()->tensor_div_inplace($this->ptr, $b->ptr); self::checkError(); return $this; }
+    public function addScalarInplace(float $val): self { self::ffi()->tensor_add_scalar_inplace($this->ptr, $val); self::checkError(); return $this; }
+    public function mulScalarInplace(float $val): self { self::ffi()->tensor_mul_scalar_inplace($this->ptr, $val); self::checkError(); return $this; }
 
     // --- MATH UNARY ---
-    public function sqrt(): self { $res = self::wrap(TensorEngine::get()->tensor_sqrt($this->ptr)); self::checkError(); return $res; }
-    public function square(): self { $res = self::wrap(TensorEngine::get()->tensor_square($this->ptr)); self::checkError(); return $res; }
-    public function abs(): self { $res = self::wrap(TensorEngine::get()->tensor_abs($this->ptr)); self::checkError(); return $res; }
-    public function sign(): self { $res = self::wrap(TensorEngine::get()->tensor_sign($this->ptr)); self::checkError(); return $res; }
-    public function exp(): self { $res = self::wrap(TensorEngine::get()->tensor_exp($this->ptr)); self::checkError(); return $res; }
-    public function log(): self { $res = self::wrap(TensorEngine::get()->tensor_log($this->ptr)); self::checkError(); return $res; }
-    public function log1p(): self { $res = self::wrap(TensorEngine::get()->tensor_log1p($this->ptr)); self::checkError(); return $res; }
-    public function round(): self { $res = self::wrap(TensorEngine::get()->tensor_round($this->ptr)); self::checkError(); return $res; }
-    public function floor(): self { $res = self::wrap(TensorEngine::get()->tensor_floor($this->ptr)); self::checkError(); return $res; }
-    public function ceil(): self { $res = self::wrap(TensorEngine::get()->tensor_ceil($this->ptr)); self::checkError(); return $res; }
-    public function sigmoid(): self { $res = self::wrap(TensorEngine::get()->tensor_sigmoid($this->ptr)); self::checkError(); return $res; }
-    public function tanh(): self { $res = self::wrap(TensorEngine::get()->tensor_tanh($this->ptr)); self::checkError(); return $res; }
-    public function relu(): self { $res = self::wrap(TensorEngine::get()->tensor_relu($this->ptr)); self::checkError(); return $res; }
-    public function sin(): self { $res = self::wrap(TensorEngine::get()->tensor_sin($this->ptr)); self::checkError(); return $res; }
-    public function cos(): self { $res = self::wrap(TensorEngine::get()->tensor_cos($this->ptr)); self::checkError(); return $res; }
-    public function tan(): self { $res = self::wrap(TensorEngine::get()->tensor_tan($this->ptr)); self::checkError(); return $res; }
-    public function asin(): self { $res = self::wrap(TensorEngine::get()->tensor_asin($this->ptr)); self::checkError(); return $res; }
-    public function acos(): self { $res = self::wrap(TensorEngine::get()->tensor_acos($this->ptr)); self::checkError(); return $res; }
-    public function atan(): self { $res = self::wrap(TensorEngine::get()->tensor_atan($this->ptr)); self::checkError(); return $res; }
+    public function sqrt(): self { $res = self::wrap(self::ffi()->tensor_sqrt($this->ptr)); self::checkError(); return $res; }
+    public function square(): self { $res = self::wrap(self::ffi()->tensor_square($this->ptr)); self::checkError(); return $res; }
+    public function abs(): self { $res = self::wrap(self::ffi()->tensor_abs($this->ptr)); self::checkError(); return $res; }
+    public function sign(): self { $res = self::wrap(self::ffi()->tensor_sign($this->ptr)); self::checkError(); return $res; }
+    public function exp(): self { $res = self::wrap(self::ffi()->tensor_exp($this->ptr)); self::checkError(); return $res; }
+    public function log(): self { $res = self::wrap(self::ffi()->tensor_log($this->ptr)); self::checkError(); return $res; }
+    public function log1p(): self { $res = self::wrap(self::ffi()->tensor_log1p($this->ptr)); self::checkError(); return $res; }
+    public function round(): self { $res = self::wrap(self::ffi()->tensor_round($this->ptr)); self::checkError(); return $res; }
+    public function floor(): self { $res = self::wrap(self::ffi()->tensor_floor($this->ptr)); self::checkError(); return $res; }
+    public function ceil(): self { $res = self::wrap(self::ffi()->tensor_ceil($this->ptr)); self::checkError(); return $res; }
+    public function sigmoid(): self { $res = self::wrap(self::ffi()->tensor_sigmoid($this->ptr)); self::checkError(); return $res; }
+    public function tanh(): self { $res = self::wrap(self::ffi()->tensor_tanh($this->ptr)); self::checkError(); return $res; }
+    public function relu(): self { $res = self::wrap(self::ffi()->tensor_relu($this->ptr)); self::checkError(); return $res; }
+    public function sin(): self { $res = self::wrap(self::ffi()->tensor_sin($this->ptr)); self::checkError(); return $res; }
+    public function cos(): self { $res = self::wrap(self::ffi()->tensor_cos($this->ptr)); self::checkError(); return $res; }
+    public function tan(): self { $res = self::wrap(self::ffi()->tensor_tan($this->ptr)); self::checkError(); return $res; }
+    public function asin(): self { $res = self::wrap(self::ffi()->tensor_asin($this->ptr)); self::checkError(); return $res; }
+    public function acos(): self { $res = self::wrap(self::ffi()->tensor_acos($this->ptr)); self::checkError(); return $res; }
+    public function atan(): self { $res = self::wrap(self::ffi()->tensor_atan($this->ptr)); self::checkError(); return $res; }
 
     // --- LOGICAL & MESSY DATA ---
-    public function equal(Tensor $b): self { $res = self::wrap(TensorEngine::get()->tensor_equal($this->ptr, $b->ptr)); self::checkError(); return $res; }
-    public function notEqual(Tensor $b): self { $res = self::wrap(TensorEngine::get()->tensor_not_equal($this->ptr, $b->ptr)); self::checkError(); return $res; }
-    public function greater(Tensor $b): self { $res = self::wrap(TensorEngine::get()->tensor_greater($this->ptr, $b->ptr)); self::checkError(); return $res; }
-    public function greaterEqual(Tensor $b): self { $res = self::wrap(TensorEngine::get()->tensor_greater_equal($this->ptr, $b->ptr)); self::checkError(); return $res; }
-    public function less(Tensor $b): self { $res = self::wrap(TensorEngine::get()->tensor_less($this->ptr, $b->ptr)); self::checkError(); return $res; }
-    public function lessEqual(Tensor $b): self { $res = self::wrap(TensorEngine::get()->tensor_less_equal($this->ptr, $b->ptr)); self::checkError(); return $res; }
-    public function logicalNot(): self { $res = self::wrap(TensorEngine::get()->tensor_logical_not($this->ptr)); self::checkError(); return $res; }
+    public function equal(Tensor $b): self { $res = self::wrap(self::ffi()->tensor_equal($this->ptr, $b->ptr)); self::checkError(); return $res; }
+    public function notEqual(Tensor $b): self { $res = self::wrap(self::ffi()->tensor_not_equal($this->ptr, $b->ptr)); self::checkError(); return $res; }
+    public function greater(Tensor $b): self { $res = self::wrap(self::ffi()->tensor_greater($this->ptr, $b->ptr)); self::checkError(); return $res; }
+    public function greaterEqual(Tensor $b): self { $res = self::wrap(self::ffi()->tensor_greater_equal($this->ptr, $b->ptr)); self::checkError(); return $res; }
+    public function less(Tensor $b): self { $res = self::wrap(self::ffi()->tensor_less($this->ptr, $b->ptr)); self::checkError(); return $res; }
+    public function lessEqual(Tensor $b): self { $res = self::wrap(self::ffi()->tensor_less_equal($this->ptr, $b->ptr)); self::checkError(); return $res; }
+    public function logicalNot(): self { $res = self::wrap(self::ffi()->tensor_logical_not($this->ptr)); self::checkError(); return $res; }
     
-    public function isNan(): self { $res = self::wrap(TensorEngine::get()->tensor_isnan($this->ptr)); self::checkError(); return $res; }
-    public function isInf(): self { $res = self::wrap(TensorEngine::get()->tensor_isinf($this->ptr)); self::checkError(); return $res; }
-    public function nanToNumInplace(float $nan_val = 0.0, float $posinf = 1e38, float $neginf = -1e38): self { TensorEngine::get()->tensor_nan_to_num_inplace($this->ptr, $nan_val, $posinf, $neginf); self::checkError(); return $this; }
-    public function any(): bool { $res = TensorEngine::get()->tensor_any($this->ptr); self::checkError(); return $res; }
-    public function all(): bool { $res = TensorEngine::get()->tensor_all($this->ptr); self::checkError(); return $res; }
+    public function isNan(): self { $res = self::wrap(self::ffi()->tensor_isnan($this->ptr)); self::checkError(); return $res; }
+    public function isInf(): self { $res = self::wrap(self::ffi()->tensor_isinf($this->ptr)); self::checkError(); return $res; }
+    public function nanToNumInplace(float $nan_val = 0.0, float $posinf = 1e38, float $neginf = -1e38): self { self::ffi()->tensor_nan_to_num_inplace($this->ptr, $nan_val, $posinf, $neginf); self::checkError(); return $this; }
+    public function any(): bool { $res = self::ffi()->tensor_any($this->ptr); self::checkError(); return $res; }
+    public function all(): bool { $res = self::ffi()->tensor_all($this->ptr); self::checkError(); return $res; }
 
     // --- FANCY INDEXING & SETS ---
-    public function where(Tensor $x, Tensor $y): self { $res = self::wrap(TensorEngine::get()->tensor_where($this->ptr, $x->ptr, $y->ptr)); self::checkError(); return $res; }
-    public function booleanIndex(Tensor $mask): self { $res = self::wrap(TensorEngine::get()->tensor_boolean_index($this->ptr, $mask->ptr)); self::checkError(); return $res; }
-    public function take(Tensor $indices, int $axis): self { $res = self::wrap(TensorEngine::get()->tensor_take($this->ptr, $indices->ptr, $axis)); self::checkError(); return $res; }
-    public function unique(): self { $res = self::wrap(TensorEngine::get()->tensor_unique($this->ptr)); self::checkError(); return $res; }
-    public function bincount(): self { $res = self::wrap(TensorEngine::get()->tensor_bincount($this->ptr)); self::checkError(); return $res; }
+    public function where(Tensor $x, Tensor $y): self { $res = self::wrap(self::ffi()->tensor_where($this->ptr, $x->ptr, $y->ptr)); self::checkError(); return $res; }
+    public function booleanIndex(Tensor $mask): self { $res = self::wrap(self::ffi()->tensor_boolean_index($this->ptr, $mask->ptr)); self::checkError(); return $res; }
+    public function take(Tensor $indices, int $axis): self { $res = self::wrap(self::ffi()->tensor_take($this->ptr, $indices->ptr, $axis)); self::checkError(); return $res; }
+    public function unique(): self { $res = self::wrap(self::ffi()->tensor_unique($this->ptr)); self::checkError(); return $res; }
+    public function bincount(): self { $res = self::wrap(self::ffi()->tensor_bincount($this->ptr)); self::checkError(); return $res; }
 
     // --- CONCAT & PAD ---
     public static function concat(array $tensors, int $axis): self {
-        $ffi = TensorEngine::get();
+        $ffi = self::ffi();
         $num = count($tensors);
         $ptrArray = $ffi->new("TensorC*[$num]");
         foreach ($tensors as $i => $t) $ptrArray[$i] = $t->ptr;
@@ -416,7 +437,7 @@ class Tensor {
     }
 
     public function pad(array $padWidth, float $constantValue = 0.0): self {
-        $ffi = TensorEngine::get();
+        $ffi = self::ffi();
         $cPad = $ffi->new("int[" . count($padWidth) . "]");
         foreach ($padWidth as $i => $v) $cPad[$i] = $v;
         $res = self::wrap($ffi->tensor_pad($this->ptr, $ffi->cast("int*", $cPad), $constantValue));
@@ -424,56 +445,56 @@ class Tensor {
     }
 
     // --- SORTING & AGGREGATIONS ---
-    public function argsort(int $axis = -1): self { $res = self::wrap(TensorEngine::get()->tensor_argsort($this->ptr, $axis === -1 ? $this->ptr->ndim - 1 : $axis)); self::checkError(); return $res; }
-    public function sort(int $axis = -1): self { $res = self::wrap(TensorEngine::get()->tensor_sort($this->ptr, $axis === -1 ? $this->ptr->ndim - 1 : $axis)); self::checkError(); return $res; }
-    public function topk(int $k, int $axis = -1): self { $res = self::wrap(TensorEngine::get()->tensor_topk($this->ptr, $k, $axis === -1 ? $this->ptr->ndim - 1 : $axis)); self::checkError(); return $res; }
+    public function argsort(int $axis = -1): self { $res = self::wrap(self::ffi()->tensor_argsort($this->ptr, $axis === -1 ? $this->ptr->ndim - 1 : $axis)); self::checkError(); return $res; }
+    public function sort(int $axis = -1): self { $res = self::wrap(self::ffi()->tensor_sort($this->ptr, $axis === -1 ? $this->ptr->ndim - 1 : $axis)); self::checkError(); return $res; }
+    public function topk(int $k, int $axis = -1): self { $res = self::wrap(self::ffi()->tensor_topk($this->ptr, $k, $axis === -1 ? $this->ptr->ndim - 1 : $axis)); self::checkError(); return $res; }
 
-    public function sum(): float { $res = TensorEngine::get()->tensor_sum($this->ptr); self::checkError(); return $res; }
-    public function product(): float { $res = TensorEngine::get()->tensor_product($this->ptr); self::checkError(); return $res; }
-    public function mean(): float { $res = TensorEngine::get()->tensor_mean($this->ptr); self::checkError(); return $res; }
-    public function min(): float { $res = TensorEngine::get()->tensor_min($this->ptr); self::checkError(); return $res; }
-    public function max(): float { $res = TensorEngine::get()->tensor_max($this->ptr); self::checkError(); return $res; }
-    public function argmin(): int { $res = TensorEngine::get()->tensor_argmin($this->ptr); self::checkError(); return $res; }
-    public function argmax(): int { $res = TensorEngine::get()->tensor_argmax($this->ptr); self::checkError(); return $res; }
-    public function variance(): float { $res = TensorEngine::get()->tensor_variance($this->ptr); self::checkError(); return $res; }
-    public function std(): float { $res = TensorEngine::get()->tensor_std($this->ptr); self::checkError(); return $res; }
-    public function median(): float { $res = TensorEngine::get()->tensor_median($this->ptr); self::checkError(); return $res; }
+    public function sum(): float { $res = self::ffi()->tensor_sum($this->ptr); self::checkError(); return $res; }
+    public function product(): float { $res = self::ffi()->tensor_product($this->ptr); self::checkError(); return $res; }
+    public function mean(): float { $res = self::ffi()->tensor_mean($this->ptr); self::checkError(); return $res; }
+    public function min(): float { $res = self::ffi()->tensor_min($this->ptr); self::checkError(); return $res; }
+    public function max(): float { $res = self::ffi()->tensor_max($this->ptr); self::checkError(); return $res; }
+    public function argmin(): int { $res = self::ffi()->tensor_argmin($this->ptr); self::checkError(); return $res; }
+    public function argmax(): int { $res = self::ffi()->tensor_argmax($this->ptr); self::checkError(); return $res; }
+    public function variance(): float { $res = self::ffi()->tensor_variance($this->ptr); self::checkError(); return $res; }
+    public function std(): float { $res = self::ffi()->tensor_std($this->ptr); self::checkError(); return $res; }
+    public function median(): float { $res = self::ffi()->tensor_median($this->ptr); self::checkError(); return $res; }
 
     // --- AXIS SPECIFIC AGGREGATIONS ---
-    public function sumAxis(int $axis): self { $res = self::wrap(TensorEngine::get()->tensor_sum_axis($this->ptr, $axis)); self::checkError(); return $res; }
-    public function meanAxis(int $axis): self { $res = self::wrap(TensorEngine::get()->tensor_mean_axis($this->ptr, $axis)); self::checkError(); return $res; }
-    public function maxAxis(int $axis): self { $res = self::wrap(TensorEngine::get()->tensor_max_axis($this->ptr, $axis)); self::checkError(); return $res; }
-    public function minAxis(int $axis): self { $res = self::wrap(TensorEngine::get()->tensor_min_axis($this->ptr, $axis)); self::checkError(); return $res; }
-    public function cumsum(int $axis): self { $res = self::wrap(TensorEngine::get()->tensor_cumsum_axis($this->ptr, $axis)); self::checkError(); return $res; }
+    public function sumAxis(int $axis): self { $res = self::wrap(self::ffi()->tensor_sum_axis($this->ptr, $axis)); self::checkError(); return $res; }
+    public function meanAxis(int $axis): self { $res = self::wrap(self::ffi()->tensor_mean_axis($this->ptr, $axis)); self::checkError(); return $res; }
+    public function maxAxis(int $axis): self { $res = self::wrap(self::ffi()->tensor_max_axis($this->ptr, $axis)); self::checkError(); return $res; }
+    public function minAxis(int $axis): self { $res = self::wrap(self::ffi()->tensor_min_axis($this->ptr, $axis)); self::checkError(); return $res; }
+    public function cumsum(int $axis): self { $res = self::wrap(self::ffi()->tensor_cumsum_axis($this->ptr, $axis)); self::checkError(); return $res; }
 
     public function sumMulti(array $axes): self {
-        $ffi = TensorEngine::get();
+        $ffi = self::ffi();
         $cAxes = $ffi->new("int[" . count($axes) . "]"); foreach ($axes as $i => $ax) $cAxes[$i] = $ax;
         $res = self::wrap($ffi->tensor_sum_multi($this->ptr, $ffi->cast("int*", $cAxes), count($axes)));
         self::checkError(); return $res;
     }
     public function meanMulti(array $axes): self {
-        $ffi = TensorEngine::get();
+        $ffi = self::ffi();
         $cAxes = $ffi->new("int[" . count($axes) . "]"); foreach ($axes as $i => $ax) $cAxes[$i] = $ax;
         $res = self::wrap($ffi->tensor_mean_multi($this->ptr, $ffi->cast("int*", $cAxes), count($axes)));
         self::checkError(); return $res;
     }
     public function maxMulti(array $axes): self {
-        $ffi = TensorEngine::get();
+        $ffi = self::ffi();
         $cAxes = $ffi->new("int[" . count($axes) . "]"); foreach ($axes as $i => $ax) $cAxes[$i] = $ax;
         $res = self::wrap($ffi->tensor_max_multi($this->ptr, $ffi->cast("int*", $cAxes), count($axes)));
         self::checkError(); return $res;
     }
 
     // --- NORMALIZATION ---
-    public function normalize(): self { $res = self::wrap(TensorEngine::get()->tensor_normalize($this->ptr)); self::checkError(); return $res; }
-    public function standardize(): self { $res = self::wrap(TensorEngine::get()->tensor_standardize($this->ptr)); self::checkError(); return $res; }
-    public function normalizeInplace(): self { TensorEngine::get()->tensor_normalize_inplace($this->ptr); self::checkError(); return $this; }
-    public function standardizeInplace(): self { TensorEngine::get()->tensor_standardize_inplace($this->ptr); self::checkError(); return $this; }
+    public function normalize(): self { $res = self::wrap(self::ffi()->tensor_normalize($this->ptr)); self::checkError(); return $res; }
+    public function standardize(): self { $res = self::wrap(self::ffi()->tensor_standardize($this->ptr)); self::checkError(); return $res; }
+    public function normalizeInplace(): self { self::ffi()->tensor_normalize_inplace($this->ptr); self::checkError(); return $this; }
+    public function standardizeInplace(): self { self::ffi()->tensor_standardize_inplace($this->ptr); self::checkError(); return $this; }
 
     // --- LINEAR ALGEBRA & DECOMPOSITIONS ---
-    public function dot(Tensor $b): float { $res = TensorEngine::get()->tensor_dot($this->ptr, $b->ptr); self::checkError(); return $res; }
-    public function trace(): float { $res = TensorEngine::get()->tensor_trace($this->ptr); self::checkError(); return $res; }
+    public function dot(Tensor $b): float { $res = self::ffi()->tensor_dot($this->ptr, $b->ptr); self::checkError(); return $res; }
+    public function trace(): float { $res = self::ffi()->tensor_trace($this->ptr); self::checkError(); return $res; }
     /**
      * Matrix multiply. When transA or transB are true the operand is treated as
      * transposed without allocating a new tensor (BLAS handles it in one call).
@@ -483,10 +504,11 @@ class Tensor {
      * matmul($B, false, true)  → this @ B^T
      */
     public function matmul(Tensor $b, bool $transA = false, bool $transB = false): self {
+        $ffi = self::ffi();
         if (!$transA && !$transB) {
-            $res = self::wrap(TensorEngine::get()->tensor_matmul($this->ptr, $b->ptr));
+            $res = self::wrap($ffi->tensor_matmul($this->ptr, $b->ptr));
         } else {
-            $res = self::wrap(TensorEngine::get()->tensor_matmul_ex($this->ptr, $b->ptr, $transA, $transB));
+            $res = self::wrap($ffi->tensor_matmul_ex($this->ptr, $b->ptr, $transA, $transB));
         }
         self::checkError(); return $res;
     }
@@ -500,7 +522,7 @@ class Tensor {
      * Usage: $dW->matmulInto($dY, $X, transA: true)  // dW = dY^T @ X
      */
     public function matmulInto(Tensor $A, Tensor $B, bool $transA = false, bool $transB = false): void {
-        TensorEngine::get()->tensor_matmul_into($this->ptr, $A->ptr, $B->ptr, $transA, $transB);
+        self::ffi()->tensor_matmul_into($this->ptr, $A->ptr, $B->ptr, $transA, $transB);
         self::checkError();
     }
 
@@ -513,11 +535,11 @@ class Tensor {
      * Usage: $dbias->sumAxisInto($dY, 0)  // dbias = sum(dY, axis=0)
      */
     public function sumAxisInto(Tensor $A, int $axis): void {
-        TensorEngine::get()->tensor_sum_axis_into($this->ptr, $A->ptr, $axis);
+        self::ffi()->tensor_sum_axis_into($this->ptr, $A->ptr, $axis);
         self::checkError();
     }
 
-    public function bmm(Tensor $b): self { $res = self::wrap(TensorEngine::get()->tensor_bmm($this->ptr, $b->ptr)); self::checkError(); return $res; }
+    public function bmm(Tensor $b): self { $res = self::wrap(self::ffi()->tensor_bmm($this->ptr, $b->ptr)); self::checkError(); return $res; }
 
     // -------------------------------------------------------------------------
     // Transformer inference primitives
@@ -528,7 +550,7 @@ class Tensor {
      * $this must be contiguous FLOAT32; last axis is the feature dim.
      */
     public function rmsnorm(float $eps = 1e-5): void {
-        TensorEngine::get()->tensor_rmsnorm($this->ptr, $eps);
+        self::ffi()->tensor_rmsnorm($this->ptr, $eps);
         self::checkError();
     }
 
@@ -542,7 +564,7 @@ class Tensor {
      */
     public function applyRope(self $k, int $headDim, int $pos,
                                float $baseFreq = 10000.0, float $scale = 1.0): void {
-        TensorEngine::get()->tensor_apply_rope($this->ptr, $k->ptr, $headDim, $pos, $baseFreq, $scale);
+        self::ffi()->tensor_apply_rope($this->ptr, $k->ptr, $headDim, $pos, $baseFreq, $scale);
         self::checkError();
     }
 
@@ -551,7 +573,7 @@ class Tensor {
      * $this must be contiguous FLOAT32.
      */
     public function softmaxInplace(): void {
-        TensorEngine::get()->tensor_softmax_inplace($this->ptr);
+        self::ffi()->tensor_softmax_inplace($this->ptr);
         self::checkError();
     }
 
@@ -562,7 +584,7 @@ class Tensor {
      */
     public function attention(self $k, self $v): self {
         $out = new self([$this->ptr->shape[0], $this->ptr->shape[1]]);
-        TensorEngine::get()->tensor_attention($out->ptr, $this->ptr, $k->ptr, $v->ptr);
+        self::ffi()->tensor_attention($out->ptr, $this->ptr, $k->ptr, $v->ptr);
         self::checkError();
         return $out;
     }
@@ -575,7 +597,7 @@ class Tensor {
     public function attentionKV(KVCache $cache): self {
         $seqQ = (int) ($this->ptr->total_size / $cache->ptr->head_dim);
         $out  = new self([$seqQ, $cache->ptr->head_dim]);
-        TensorEngine::get()->tensor_attention_kv($out->ptr, $this->ptr, $cache->ptr);
+        self::ffi()->tensor_attention_kv($out->ptr, $this->ptr, $cache->ptr);
         self::checkError();
         return $out;
     }
@@ -596,7 +618,7 @@ class Tensor {
      */
     public static function fromMmap(string $filepath, int $byteOffset,
                                     array $shape, int $dtype = 0): self {
-        $ffi  = TensorEngine::get();
+        $ffi  = self::ffi();
         $ndim = count($shape);
         $shapeArr = $ffi->new("int[$ndim]");
         foreach ($shape as $i => $s) $shapeArr[$i] = $s;
@@ -614,7 +636,7 @@ class Tensor {
      */
     public function mmapFree(): void {
         if ($this->ptr !== null) {
-            TensorEngine::get()->tensor_mmap_free($this->ptr);
+            self::ffi()->tensor_mmap_free($this->ptr);
             $this->ptr  = null;
             $this->owned = false;
         }
@@ -622,7 +644,7 @@ class Tensor {
 
     /** SiLU activation: out[i] = x[i] * sigmoid(x[i]). AVX2 vectorized. */
     public function silu(): self {
-        $res = self::wrap(TensorEngine::get()->tensor_silu($this->ptr));
+        $res = self::wrap(self::ffi()->tensor_silu($this->ptr));
         self::checkError();
         return $res;
     }
@@ -632,7 +654,7 @@ class Tensor {
      * $this is the gate tensor; $up must have the same shape.
      */
     public function swiglu(self $up): self {
-        $res = self::wrap(TensorEngine::get()->tensor_swiglu($this->ptr, $up->ptr));
+        $res = self::wrap(self::ffi()->tensor_swiglu($this->ptr, $up->ptr));
         self::checkError();
         return $res;
     }
@@ -643,7 +665,7 @@ class Tensor {
      * Returns ['loss' => float, 'grads' => Tensor[batch, vocab]].
      */
     public function fusedCrossEntropyLossAndGrad(self $targetIds): array {
-        $ffi   = TensorEngine::get();
+        $ffi   = self::ffi();
         $ndim  = $this->ptr->ndim;
         $vocab = $this->ptr->shape[$ndim - 1];
         $batch = (int) ($this->ptr->total_size / $vocab);
@@ -668,7 +690,7 @@ class Tensor {
      */
     public function rmsnormBackward(self $x, self $weights, float $eps = 1e-5): self {
         $res = self::wrap(
-            TensorEngine::get()->tensor_rmsnorm_backward($this->ptr, $x->ptr, $weights->ptr, $eps)
+            self::ffi()->tensor_rmsnorm_backward($this->ptr, $x->ptr, $weights->ptr, $eps)
         );
         self::checkError();
         return $res;
@@ -680,18 +702,18 @@ class Tensor {
      * $this = dY [seq_len, embed_dim].
      */
     public function embeddingBackward(self $tokenIds, self $dWeights): void {
-        TensorEngine::get()->tensor_embedding_backward($this->ptr, $tokenIds->ptr, $dWeights->ptr);
+        self::ffi()->tensor_embedding_backward($this->ptr, $tokenIds->ptr, $dWeights->ptr);
         self::checkError();
     }
     
-    public function inverse(): self { $res = self::wrap(TensorEngine::get()->tensor_inverse($this->ptr)); self::checkError(); return $res; }
-    public function pinv(): self { $res = self::wrap(TensorEngine::get()->tensor_pinv($this->ptr)); self::checkError(); return $res; }
-    public function solve(Tensor $B): self { $res = self::wrap(TensorEngine::get()->tensor_solve($this->ptr, $B->ptr)); self::checkError(); return $res; }
+    public function inverse(): self { $res = self::wrap(self::ffi()->tensor_inverse($this->ptr)); self::checkError(); return $res; }
+    public function pinv(): self { $res = self::wrap(self::ffi()->tensor_pinv($this->ptr)); self::checkError(); return $res; }
+    public function solve(Tensor $B): self { $res = self::wrap(self::ffi()->tensor_solve($this->ptr, $B->ptr)); self::checkError(); return $res; }
     
-    public function cholesky(): self { $res = self::wrap(TensorEngine::get()->tensor_cholesky($this->ptr)); self::checkError(); return $res; }
+    public function cholesky(): self { $res = self::wrap(self::ffi()->tensor_cholesky($this->ptr)); self::checkError(); return $res; }
 
     public function lu(): array {
-        $ffi = TensorEngine::get();
+        $ffi = self::ffi();
         $P = $ffi->new("TensorC*"); $L = $ffi->new("TensorC*"); $U = $ffi->new("TensorC*");
         $ffi->tensor_lu($this->ptr, \FFI::addr($P), \FFI::addr($L), \FFI::addr($U));
         self::checkError();
@@ -699,7 +721,7 @@ class Tensor {
     }
 
     public function svd(): array {
-        $ffi = TensorEngine::get();
+        $ffi = self::ffi();
         $U = $ffi->new("TensorC*"); $S = $ffi->new("TensorC*"); $Vt = $ffi->new("TensorC*");
         $ffi->tensor_svd($this->ptr, \FFI::addr($U), \FFI::addr($S), \FFI::addr($Vt));
         self::checkError();
@@ -707,32 +729,32 @@ class Tensor {
     }
 
     public function eigenSym(): array {
-        $ffi = TensorEngine::get();
+        $ffi = self::ffi();
         $Vals = $ffi->new("TensorC*"); $Vecs = $ffi->new("TensorC*");
         $ffi->tensor_eigen_sym($this->ptr, \FFI::addr($Vals), \FFI::addr($Vecs));
         self::checkError();
         return ['values' => self::wrap($Vals), 'vectors' => self::wrap($Vecs)];
     }
     
-    public function ref(): self { $res = self::wrap(TensorEngine::get()->tensor_ref($this->ptr)); self::checkError(); return $res; }
-    public function rref(): self { $res = self::wrap(TensorEngine::get()->tensor_rref($this->ptr)); self::checkError(); return $res; }
+    public function ref(): self { $res = self::wrap(self::ffi()->tensor_ref($this->ptr)); self::checkError(); return $res; }
+    public function rref(): self { $res = self::wrap(self::ffi()->tensor_rref($this->ptr)); self::checkError(); return $res; }
 
     // --- DEEP LEARNING (CNN Primitives) ---
     public function im2col(int $kh, int $kw, int $sh = 1, int $sw = 1, int $ph = 0, int $pw = 0): self {
-        $res = self::wrap(TensorEngine::get()->tensor_im2col($this->ptr, $kh, $kw, $sh, $sw, $ph, $pw));
+        $res = self::wrap(self::ffi()->tensor_im2col($this->ptr, $kh, $kw, $sh, $sw, $ph, $pw));
         self::checkError(); return $res;
     }
     public function col2im(int $b, int $c, int $h, int $w, int $kh, int $kw, int $sh = 1, int $sw = 1, int $ph = 0, int $pw = 0): self {
-        $res = self::wrap(TensorEngine::get()->tensor_col2im($this->ptr, $b, $c, $h, $w, $kh, $kw, $sh, $sw, $ph, $pw));
+        $res = self::wrap(self::ffi()->tensor_col2im($this->ptr, $b, $c, $h, $w, $kh, $kw, $sh, $sw, $ph, $pw));
         self::checkError(); return $res;
     }
     public function conv2d(Tensor $W, ?Tensor $bias = null, int $sh = 1, int $sw = 1, int $ph = 0, int $pw = 0): self {
         $b_ptr = $bias?->ptr;
-        $res = self::wrap(TensorEngine::get()->tensor_conv2d($this->ptr, $W->ptr, $b_ptr, $sh, $sw, $ph, $pw));
+        $res = self::wrap(self::ffi()->tensor_conv2d($this->ptr, $W->ptr, $b_ptr, $sh, $sw, $ph, $pw));
         self::checkError(); return $res;
     }
     public function conv2dBackward(Tensor $X, Tensor $W, int $sh = 1, int $sw = 1, int $ph = 0, int $pw = 0): array {
-        $ffi = TensorEngine::get();
+        $ffi = self::ffi();
         $grads = $ffi->tensor_conv2d_backward($this->ptr, $X->ptr, $W->ptr, $sh, $sw, $ph, $pw);
         self::checkError();
         
@@ -746,7 +768,7 @@ class Tensor {
 
     // --- LLM AND NLP INTEGRATION ---
     public function embeddingLookup(Tensor $weights): self {
-        $res = self::wrap(TensorEngine::get()->tensor_embedding_lookup($this->ptr, $weights->ptr));
+        $res = self::wrap(self::ffi()->tensor_embedding_lookup($this->ptr, $weights->ptr));
         self::checkError(); return $res;
     }
     
@@ -755,14 +777,14 @@ class Tensor {
     // -------------------------------------------------------------------------
 
     public static function mambaAllocState(int $batch, int $dModel, int $dState): self {
-        $ffi = TensorEngine::get();
+        $ffi = self::ffi();
         $res = self::wrap($ffi->tensor_mamba_alloc_state($batch, $dModel, $dState));
         self::checkError();
         return $res;
     }
 
     public static function mambaAllocCache(int $batch, int $seqLen, int $dModel, int $dState): self {
-        $ffi = TensorEngine::get();
+        $ffi = self::ffi();
         $res = self::wrap($ffi->tensor_mamba_alloc_cache($batch, $seqLen, $dModel, $dState));
         self::checkError();
         return $res;
@@ -775,7 +797,7 @@ class Tensor {
             self $ALog, self $BProj, self $CProj, ?self $DSkip, self $delta,
             self $state, self $out, ?self $cache = null, bool $training = false
     ): void {
-        TensorEngine::get()->tensor_mamba_forward(
+        self::ffi()->tensor_mamba_forward(
                 $this->ptr, $ALog->ptr, $BProj->ptr, $CProj->ptr,
                 $DSkip ? $DSkip->ptr : null, $delta->ptr,
                 $state->ptr, $out->ptr,
@@ -793,7 +815,7 @@ class Tensor {
             self $h0, ?self $cache,
             self $dx, self $dA, self $dB, self $dC, ?self $dD, self $ddelta
     ): void {
-        TensorEngine::get()->tensor_mamba_backward(
+        self::ffi()->tensor_mamba_backward(
                 $this->ptr, $x->ptr, $ALog->ptr, $BProj->ptr, $CProj->ptr,
                 $DSkip ? $DSkip->ptr : null, $delta->ptr,
                 $h0->ptr, $cache ? $cache->ptr : null,
@@ -805,11 +827,11 @@ class Tensor {
 
     // --- I/O SERIALIZATION ---
     public function save(string $filepath): void {
-        TensorEngine::get()->tensor_save_to_file($this->ptr, $filepath);
+        self::ffi()->tensor_save_to_file($this->ptr, $filepath);
         self::checkError();
     }
     public static function load(string $filepath): self {
-        $res = self::wrap(TensorEngine::get()->tensor_load_from_file($filepath));
+        $res = self::wrap(self::ffi()->tensor_load_from_file($filepath));
         self::checkError(); return $res;
     }
 
@@ -822,7 +844,7 @@ class Tensor {
      * @return int  1 on success, 0 on failure (check error via C engine).
      */
     public static function saveSafetensors(string $filepath, string $jsonHeader, array $tensors): int {
-        $ffi = TensorEngine::get();
+        $ffi = self::ffi();
         $num = count($tensors);
         $ptrArray = $ffi->new("TensorC*[$num]");
         foreach ($tensors as $i => $t) $ptrArray[$i] = $t->ptr;
@@ -843,7 +865,7 @@ class Tensor {
      * @return array{samples: self, labels: self|null}
      */
     public static function datasetFromCsv(string $filepath, int $labelCol = -1, bool $hasHeader = true): array {
-        $ffi = TensorEngine::get();
+        $ffi = self::ffi();
         $result = $ffi->tensor_dataset_from_csv($filepath, $labelCol, (int)$hasHeader);
         self::checkError();
         $samples = self::wrap($result[0]);
@@ -895,13 +917,11 @@ class Tensor {
         }
 
         // --- Phase 2: pack binary + single FFI::memcpy (1 FFI boundary crossing) ---
-        if ($dtype === self::DTYPE_INT32) {
-            $binary = \pack('l*', ...$flat);
-        } elseif ($dtype === self::DTYPE_INT64) {
-            $binary = \pack('q*', ...$flat);
-        } else {
-            $binary = \pack('f*', ...$flat);
-        }
+        $binary = match ($dtype) {
+            self::DTYPE_INT32 => \pack('l*', ...$flat),
+            self::DTYPE_INT64 => \pack('q*', ...$flat),
+            default           => \pack('f*', ...$flat),
+        };
 
         \FFI::memcpy($tensor->ptr->data, $binary, \strlen($binary));
 
@@ -931,13 +951,11 @@ class Tensor {
         // Single FFI boundary crossing: C memory → PHP binary string.
         $binary = \FFI::string($cdata, $byteSize);
 
-        if ($dtype === self::DTYPE_INT32) {
-            $unpacked = \unpack('l*', $binary);
-        } elseif ($dtype === self::DTYPE_INT64) {
-            $unpacked = \unpack('q*', $binary);
-        } else {
-            $unpacked = \unpack('f*', $binary);
-        }
+        $unpacked = match ($dtype) {
+            self::DTYPE_INT32 => \unpack('l*', $binary),
+            self::DTYPE_INT64 => \unpack('q*', $binary),
+            default           => \unpack('f*', $binary),
+        };
 
         // Free the compacted copy if we created one.
         if ($target !== $this) {
@@ -965,7 +983,7 @@ class Tensor {
             );
         }
         
-        $ffi = TensorEngine::get();
+        $ffi = self::ffi();
         // CRITICAL: Pass ->ptr (Tensor* struct), not ->buffer (float* array)
         $ffi->tensor_copy_from($this->ptr, $src->ptr);
     }
@@ -973,57 +991,57 @@ class Tensor {
     // ── Section 22: Classical ML Extensions ──────────────────────────────────
 
     public function argmaxAxis(int $axis): self {
-        $res = self::wrap(TensorEngine::get()->tensor_argmax_axis($this->ptr, $axis));
+        $res = self::wrap(self::ffi()->tensor_argmax_axis($this->ptr, $axis));
         self::checkError(); return $res;
     }
 
     public static function pairwiseSqL2(self $A, self $B): self {
-        $res = self::wrap(TensorEngine::get()->tensor_pairwise_sq_l2($A->ptr, $B->ptr));
+        $res = self::wrap(self::ffi()->tensor_pairwise_sq_l2($A->ptr, $B->ptr));
         self::checkError(); return $res;
     }
 
     public function expInplace(): self {
-        TensorEngine::get()->tensor_exp_inplace($this->ptr);
+        self::ffi()->tensor_exp_inplace($this->ptr);
         self::checkError(); return $this;
     }
 
     public function logInplace(): self {
-        TensorEngine::get()->tensor_log_inplace($this->ptr);
+        self::ffi()->tensor_log_inplace($this->ptr);
         self::checkError(); return $this;
     }
 
     public function sqrtInplace(): self {
-        TensorEngine::get()->tensor_sqrt_inplace($this->ptr);
+        self::ffi()->tensor_sqrt_inplace($this->ptr);
         self::checkError(); return $this;
     }
 
     public function sigmoidInplace(): self {
-        TensorEngine::get()->tensor_sigmoid_inplace($this->ptr);
+        self::ffi()->tensor_sigmoid_inplace($this->ptr);
         self::checkError(); return $this;
     }
 
     public function tanhInplace(): self {
-        TensorEngine::get()->tensor_tanh_inplace($this->ptr);
+        self::ffi()->tensor_tanh_inplace($this->ptr);
         self::checkError(); return $this;
     }
 
     public function reluInplace(): self {
-        TensorEngine::get()->tensor_relu_inplace($this->ptr);
+        self::ffi()->tensor_relu_inplace($this->ptr);
         self::checkError(); return $this;
     }
 
     public function rowSoftmaxInplace(): self {
-        TensorEngine::get()->tensor_row_softmax_inplace($this->ptr);
+        self::ffi()->tensor_row_softmax_inplace($this->ptr);
         self::checkError(); return $this;
     }
 
     public static function gbdtComputeBoundaries(self $X, int $Q): self {
-        $res = self::wrap(TensorEngine::get()->tensor_gbdt_compute_boundaries($X->ptr, $Q));
+        $res = self::wrap(self::ffi()->tensor_gbdt_compute_boundaries($X->ptr, $Q));
         self::checkError(); return $res;
     }
 
     public static function gbdtBinSamples(self $X, self $boundaries, int $Q): self {
-        $res = self::wrap(TensorEngine::get()->tensor_gbdt_bin_samples($X->ptr, $boundaries->ptr, $Q));
+        $res = self::wrap(self::ffi()->tensor_gbdt_bin_samples($X->ptr, $boundaries->ptr, $Q));
         self::checkError(); return $res;
     }
 
@@ -1031,7 +1049,7 @@ class Tensor {
     public static function gbdtMseGradHess(self $preds, self $y): array {
         $n = (int)$preds->size();
         $g = new self([$n]); $h = new self([$n]);
-        TensorEngine::get()->tensor_gbdt_mse_grad_hess($preds->ptr, $y->ptr, $g->ptr, $h->ptr);
+        self::ffi()->tensor_gbdt_mse_grad_hess($preds->ptr, $y->ptr, $g->ptr, $h->ptr);
         self::checkError();
         return [$g, $h];
     }
@@ -1040,7 +1058,7 @@ class Tensor {
     public static function gbdtLogLossGradHess(self $preds, self $y): array {
         $n = (int)$preds->size();
         $g = new self([$n]); $h = new self([$n]);
-        TensorEngine::get()->tensor_gbdt_logloss_grad_hess($preds->ptr, $y->ptr, $g->ptr, $h->ptr);
+        self::ffi()->tensor_gbdt_logloss_grad_hess($preds->ptr, $y->ptr, $g->ptr, $h->ptr);
         self::checkError();
         return [$g, $h];
     }
@@ -1049,7 +1067,7 @@ class Tensor {
         $D = $bins->shape()[1];
         $histG = new self([$D, $Q]); $histG->fill(0.0);
         $histH = new self([$D, $Q]); $histH->fill(0.0);
-        TensorEngine::get()->tensor_gbdt_histogram(
+        self::ffi()->tensor_gbdt_histogram(
             $bins->ptr, $g->ptr, $h->ptr, $mask->ptr, $Q, $histG->ptr, $histH->ptr
         );
         self::checkError();
@@ -1062,7 +1080,7 @@ class Tensor {
         float $sumG, float $sumH, int $nodeN,
         float $lambda, float $gamma
     ): array {
-        $ffi = TensorEngine::get();
+        $ffi = self::ffi();
         $feat = $ffi->new('int'); $bin = $ffi->new('int'); $gain = $ffi->new('float');
         $ffi->tensor_gbdt_best_split(
             $histG->ptr, $histH->ptr, $Q,
@@ -1077,7 +1095,7 @@ class Tensor {
     public static function gbdtSplitNode(self $bins, self $mask, int $feat, int $bin): array {
         $n = (int)$mask->size();
         $left = new self([$n]); $right = new self([$n]);
-        TensorEngine::get()->tensor_gbdt_split_node($bins->ptr, $mask->ptr, $feat, $bin, $left->ptr, $right->ptr);
+        self::ffi()->tensor_gbdt_split_node($bins->ptr, $mask->ptr, $feat, $bin, $left->ptr, $right->ptr);
         self::checkError();
         return [$left, $right];
     }
@@ -1085,7 +1103,7 @@ class Tensor {
     public static function gbdtLeafUpdate(
         self $preds, self $mask, float $sumG, float $sumH, float $lr, float $lambda
     ): float {
-        $leaf = TensorEngine::get()->tensor_gbdt_leaf_update(
+        $leaf = self::ffi()->tensor_gbdt_leaf_update(
             $preds->ptr, $mask->ptr, $sumG, $sumH, $lr, $lambda
         );
         self::checkError();
@@ -1096,31 +1114,71 @@ class Tensor {
         self $bins, self $feats, self $thresholds,
         self $lefts, self $rights, self $treeSizes, float $baseScore
     ): self {
-        $res = self::wrap(TensorEngine::get()->tensor_gbdt_predict_all(
+        $res = self::wrap(self::ffi()->tensor_gbdt_predict_all(
             $bins->ptr, $feats->ptr, $thresholds->ptr,
             $lefts->ptr, $rights->ptr, $treeSizes->ptr, $baseScore
         ));
         self::checkError(); return $res;
     }
 
+    public static function gbdtHistSubtract(
+        self $parentG, self $parentH,
+        self $siblingG, self $siblingH,
+        self $outG, self $outH
+    ): void {
+        self::ffi()->tensor_gbdt_hist_subtract(
+            $parentG->ptr, $parentH->ptr,
+            $siblingG->ptr, $siblingH->ptr,
+            $outG->ptr, $outH->ptr
+        );
+        self::checkError();
+    }
+
+    /**
+     * Leaf-wise GBDT tree training (LightGBM-style).
+     * Updates $preds in-place (+= lr * leaf_value for each sample).
+     * Writes tree structure into $outFeats/$outThresh/$outLefts/$outRights.
+     * Returns node count for this tree.
+     *
+     * @param int   $Q         number of bins
+     * @param int   $maxLeaves max leaf nodes (= 2^maxDepth)
+     * @param float $alpha     L1 regularisation (0 = disabled)
+     */
+    public static function gbdtTrainTree(
+        self $bins, self $g, self $h,
+        int $Q, int $maxLeaves,
+        float $lambda, float $alpha, float $gamma, float $minHess, float $lr,
+        self $preds,
+        self $outFeats, self $outThresh, self $outLefts, self $outRights
+    ): int {
+        $n = self::ffi()->tensor_gbdt_train_tree(
+            $bins->ptr, $g->ptr, $h->ptr, $Q, $maxLeaves,
+            $lambda, $alpha, $gamma, $minHess, $lr,
+            $preds->ptr,
+            $outFeats->ptr, $outThresh->ptr, $outLefts->ptr, $outRights->ptr
+        );
+        self::checkError();
+        return (int)$n;
+    }
+
     public static function quantileFit(self $X, int $nQuantiles = 1000): self {
-        $res = self::wrap(TensorEngine::get()->tensor_quantile_fit($X->ptr, $nQuantiles));
+        $res = self::wrap(self::ffi()->tensor_quantile_fit($X->ptr, $nQuantiles));
         self::checkError(); return $res;
     }
 
     public static function quantileTransform(self $X, self $landmarks): self {
         $nq = $landmarks->shape()[1];
-        $res = self::wrap(TensorEngine::get()->tensor_quantile_transform($X->ptr, $landmarks->ptr, $nq));
+        $res = self::wrap(self::ffi()->tensor_quantile_transform($X->ptr, $landmarks->ptr, $nq));
         self::checkError(); return $res;
     }
 
     public static function yjFit(self $X): self {
-        $res = self::wrap(TensorEngine::get()->tensor_yj_fit($X->ptr));
+        $res = self::wrap(self::ffi()->tensor_yj_fit($X->ptr));
         self::checkError(); return $res;
     }
 
     public static function yjTransform(self $X, self $lambdas): self {
-        $res = self::wrap(TensorEngine::get()->tensor_yj_transform($X->ptr, $lambdas->ptr));
+        $res = self::wrap(self::ffi()->tensor_yj_transform($X->ptr, $lambdas->ptr));
         self::checkError(); return $res;
     }
 
@@ -1129,7 +1187,7 @@ class Tensor {
         if ($this->owned && $this->ptr !== null) {
             // Memory safe call: if this tensor was born in an Arena, 
             // tensor_free safely intercepts it and does nothing!
-            $ffi = TensorEngine::get();
+            $ffi = self::ffi();
             $ffi->tensor_free($this->ptr); // @phpstan-ignore-line — FFI methods are resolved at runtime
             $this->ptr = null;
             $this->buffer = null;

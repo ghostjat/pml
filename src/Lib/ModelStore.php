@@ -188,7 +188,7 @@ final class ModelStore
                 continue;
             }
             $prop = $ref->getProperty($name);
-            $prop->setAccessible(true);
+            // setAccessible() is a no-op since PHP 8.1 and deprecated in 8.5
             $prop->setValue($model, $tensor);
         }
     }
@@ -215,7 +215,7 @@ final class ModelStore
         }
 
         foreach ($ref->getProperties() as $prop) {
-            $prop->setAccessible(true);
+            // setAccessible() is a no-op since PHP 8.1 and deprecated in 8.5
             if (!$prop->isInitialized($model)) {
                 continue;
             }
@@ -299,7 +299,7 @@ final class ModelStore
                 continue;
             }
             $prop = $ref->getProperty($name);
-            $prop->setAccessible(true);
+            // setAccessible() is a no-op since PHP 8.1 and deprecated in 8.5
             if (is_array($val) && isset($val['__object__'])) {
                 $val = self::fromArray($val['data']);
             }
@@ -328,7 +328,7 @@ final class ModelStore
             if ($typeName !== Tensor::class && !is_subclass_of($typeName, Tensor::class)) {
                 continue;
             }
-            $prop->setAccessible(true);
+            // setAccessible() is a no-op since PHP 8.1 and deprecated in 8.5
             if (!$prop->isInitialized($model)) {
                 continue;
             }

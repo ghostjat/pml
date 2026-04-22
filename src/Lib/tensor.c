@@ -5790,6 +5790,432 @@ Tensor* tensor_gbdt_predict_all(Tensor* X_bins, Tensor* feats, Tensor* threshold
     return out;
 }
 
+// ─── 22.5b  GBDT LEAF-WISE ENGINE (LightGBM-style)  ──────────────────────────
+// Histogram subtraction, priority-queue leaf-wise growth, L1+L2 regularisation.
+// All per-sample work stays in C; PHP outer loop over T trees calls one function.
+
+// ── L1+L2 score & leaf-weight helpers ────────────────────────────────────────
+
+static inline float _gbdt_score_l1(float g, float h, float lam, float alpha) {
+    float ag = fabsf(g);
+    float cl = ag > alpha ? ag - alpha : 0.0f;
+    return cl * cl / (h + lam);
+}
+
+static inline float _gbdt_leaf_val_l1(float g, float h, float lam, float alpha) {
+    float ag = fabsf(g);
+    float cl = ag > alpha ? ag - alpha : 0.0f;
+    return -(g >= 0.0f ? cl : -cl) / (h + lam);
+}
+
+// ── Public histogram subtraction: out_g = parent_g - sibling_g  (same for h) ─
+// All tensors must be [D*Q] FLOAT32 and same size.
+void tensor_gbdt_hist_subtract(Tensor* parent_g, Tensor* parent_h,
+                                Tensor* sibling_g, Tensor* sibling_h,
+                                Tensor* out_g,     Tensor* out_h) {
+    if (!parent_g || !parent_h || !sibling_g || !sibling_h || !out_g || !out_h) return;
+    size_t n = parent_g->total_size;
+    float* pg = F32(parent_g);  float* ph = F32(parent_h);
+    float* sg = F32(sibling_g); float* sh = F32(sibling_h);
+    float* og = F32(out_g);     float* oh = F32(out_h);
+
+    size_t i = 0;
+#ifdef __AVX512F__
+    for (; i + 16 <= n; i += 16) {
+        _mm512_storeu_ps(og + i, _mm512_sub_ps(_mm512_loadu_ps(pg + i), _mm512_loadu_ps(sg + i)));
+        _mm512_storeu_ps(oh + i, _mm512_sub_ps(_mm512_loadu_ps(ph + i), _mm512_loadu_ps(sh + i)));
+    }
+#elif defined(__AVX2__)
+    for (; i + 8 <= n; i += 8) {
+        _mm256_storeu_ps(og + i, _mm256_sub_ps(_mm256_loadu_ps(pg + i), _mm256_loadu_ps(sg + i)));
+        _mm256_storeu_ps(oh + i, _mm256_sub_ps(_mm256_loadu_ps(ph + i), _mm256_loadu_ps(sh + i)));
+    }
+#endif
+    for (; i < n; i++) { og[i] = pg[i] - sg[i]; oh[i] = ph[i] - sh[i]; }
+}
+
+// ── Priority queue (max-heap by best_gain) ─────────────────────────────────
+
+typedef struct {
+    int   node_id;
+    int   hist_slot;
+    int   idx_start;
+    int   idx_count;
+    float sum_g;
+    float sum_h;
+    float best_gain;
+    int   best_feat;
+    int   best_bin;
+} _GBDTLeaf;
+
+static void _pq_push(_GBDTLeaf* heap, int* sz, _GBDTLeaf e) {
+    int i = (*sz)++;
+    heap[i] = e;
+    while (i > 0) {
+        int p = (i - 1) >> 1;
+        if (heap[p].best_gain >= heap[i].best_gain) break;
+        _GBDTLeaf tmp = heap[p]; heap[p] = heap[i]; heap[i] = tmp;
+        i = p;
+    }
+}
+
+static _GBDTLeaf _pq_pop(_GBDTLeaf* heap, int* sz) {
+    _GBDTLeaf top = heap[0];
+    heap[0] = heap[--(*sz)];
+    int i = 0, n = *sz;
+    for (;;) {
+        int l = 2*i+1, r = 2*i+2, best = i;
+        if (l < n && heap[l].best_gain > heap[best].best_gain) best = l;
+        if (r < n && heap[r].best_gain > heap[best].best_gain) best = r;
+        if (best == i) break;
+        _GBDTLeaf tmp = heap[i]; heap[i] = heap[best]; heap[best] = tmp;
+        i = best;
+    }
+    return top;
+}
+
+// ── Build histogram for an explicit index list ─────────────────────────────
+
+static void _build_hist_idx_serial(
+    const int32_t* bins_flat, const float* gp, const float* hp,
+    const int* indices, int count, int D, int Q,
+    float* hist_g, float* hist_h)
+{
+    memset(hist_g, 0, (size_t)D * Q * sizeof(float));
+    memset(hist_h, 0, (size_t)D * Q * sizeof(float));
+    for (int k = 0; k < count; k++) {
+        int si = indices[k];
+        float gi = gp[si], hi = hp[si];
+        const int32_t* bi = bins_flat + (size_t)si * D;
+        for (int d = 0; d < D; d++) {
+            size_t pos = (size_t)d * Q + bi[d];
+            hist_g[pos] += gi;
+            hist_h[pos] += hi;
+        }
+    }
+}
+
+static void _build_hist_idx_par(
+    const int32_t* bins_flat, const float* gp, const float* hp,
+    const int* indices, int count, int D, int Q,
+    float* thr_bufs, int max_threads,
+    float* hist_g, float* hist_h)
+{
+    size_t DQ = (size_t)D * Q;
+    if (count <= 8 * D) {
+        _build_hist_idx_serial(bins_flat, gp, hp, indices, count, D, Q, hist_g, hist_h);
+        return;
+    }
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        if (tid >= max_threads) tid = max_threads - 1;
+        float* lg = thr_bufs + (size_t)tid * 2 * DQ;
+        float* lh = lg + DQ;
+        memset(lg, 0, 2 * DQ * sizeof(float));
+        #pragma omp for schedule(static)
+        for (int k = 0; k < count; k++) {
+            int si = indices[k];
+            float gi = gp[si], hi2 = hp[si];
+            const int32_t* bi = bins_flat + (size_t)si * D;
+            for (int d = 0; d < D; d++) {
+                size_t pos = (size_t)d * Q + bi[d];
+                lg[pos] += gi;
+                lh[pos] += hi2;
+            }
+        }
+    }
+    memset(hist_g, 0, DQ * sizeof(float));
+    memset(hist_h, 0, DQ * sizeof(float));
+    for (int t = 0; t < max_threads; t++) {
+        float* lg = thr_bufs + (size_t)t * 2 * DQ;
+        float* lh = lg + DQ;
+        for (size_t j = 0; j < DQ; j++) { hist_g[j] += lg[j]; hist_h[j] += lh[j]; }
+    }
+}
+
+// ── Find best split on raw histogram arrays (L1+L2) ─────────────────────────
+
+static void _best_split_raw(
+    const float* hist_g, const float* hist_h,
+    int D, int Q, float sum_g, float sum_h,
+    float lambda, float alpha, float gamma,
+    int* out_feat, int* out_bin, float* out_gain)
+{
+    *out_feat = -1; *out_bin = -1; *out_gain = -1.0f;
+    float root_score = _gbdt_score_l1(sum_g, sum_h, lambda, alpha);
+    float best = gamma;
+
+    for (int d = 0; d < D; d++) {
+        float gl = 0.0f, hl = 0.0f;
+        for (int b = 0; b < Q - 1; b++) {
+            size_t pos = (size_t)d * Q + b;
+            gl += hist_g[pos]; hl += hist_h[pos];
+            float gr = sum_g - gl, hr = sum_h - hl;
+            if (hl < 1e-6f || hr < 1e-6f) continue;
+            float gain = 0.5f * (_gbdt_score_l1(gl, hl, lambda, alpha)
+                               + _gbdt_score_l1(gr, hr, lambda, alpha)
+                               - root_score);
+            if (gain > best) { best = gain; *out_feat = d; *out_bin = b; *out_gain = gain; }
+        }
+    }
+}
+
+// ── Histogram subtraction on raw float arrays ────────────────────────────────
+
+static void _hist_subtract_raw(const float* pg, const float* ph,
+                                const float* sg, const float* sh,
+                                float* og, float* oh, size_t DQ)
+{
+    size_t i = 0;
+#ifdef __AVX2__
+    for (; i + 8 <= DQ; i += 8) {
+        _mm256_storeu_ps(og+i, _mm256_sub_ps(_mm256_loadu_ps(pg+i), _mm256_loadu_ps(sg+i)));
+        _mm256_storeu_ps(oh+i, _mm256_sub_ps(_mm256_loadu_ps(ph+i), _mm256_loadu_ps(sh+i)));
+    }
+#endif
+    for (; i < DQ; i++) { og[i] = pg[i] - sg[i]; oh[i] = ph[i] - sh[i]; }
+}
+
+// ── Main leaf-wise train tree ─────────────────────────────────────────────────
+// bins:        [N,D] INT32   — pre-binned samples
+// g, h:        [N] FLOAT32   — gradients / hessians for this round
+// Q:           number of bins per feature
+// max_leaves:  maximum leaf nodes in this tree (= 2^max_depth)
+// lambda,alpha,gamma,min_hess,lr — regularisation & growth control
+// preds:       [N] FLOAT32 — updated IN-PLACE with += lr*leaf_value
+// out_feats,out_thresholds,out_lefts,out_rights: [max_nodes] FLOAT32 — filled here
+// Returns number of nodes used (tree size).
+int tensor_gbdt_train_tree(
+    Tensor* bins, Tensor* g, Tensor* h,
+    int Q, int max_leaves,
+    float lambda, float alpha, float gamma, float min_hess, float lr,
+    Tensor* preds,
+    Tensor* out_feats, Tensor* out_thresholds,
+    Tensor* out_lefts,  Tensor* out_rights)
+{
+    if (!bins || !g || !h || !preds || !out_feats || !out_thresholds || !out_lefts || !out_rights)
+        return 0;
+    if (bins->ndim != 2 || bins->dtype != DTYPE_INT32) return 0;
+    if (max_leaves < 1) max_leaves = 1;
+
+    int N = bins->shape[0], D = bins->shape[1];
+    int max_nodes = (int)out_feats->total_size;
+    size_t DQ = (size_t)D * Q;
+    int n_slots = max_leaves + 2;
+    int max_threads = omp_get_max_threads();
+
+    // ── Allocate working memory ──────────────────────────────────────────────
+    size_t hist_bytes  = (size_t)n_slots * 2 * DQ * sizeof(float);
+    size_t thr_bytes   = (size_t)max_threads * 2 * DQ * sizeof(float);
+    size_t idx_bytes   = (size_t)N * sizeof(int);
+    size_t slot_bytes  = (size_t)n_slots * sizeof(int);
+    size_t pq_bytes    = (size_t)(max_leaves + 1) * sizeof(_GBDTLeaf);
+
+    // hist_pool and thr_bufs use safe_memalign (pool-aware, SIMD-aligned).
+    // sample_idx, tmp_idx, slot_used, pq use plain calloc/free to avoid
+    // pool bin-size contamination (safe_malloc allocates exact bytes but
+    // safe_free_size rounds to bin — retrieval with a larger request overflows).
+    float*    hist_pool  = (float*)safe_memalign(64, hist_bytes);
+    float*    thr_bufs   = (float*)safe_memalign(64, thr_bytes);
+    int*      sample_idx = (int*)calloc(N, sizeof(int));
+    int*      tmp_idx    = (int*)calloc(N, sizeof(int));
+    int*      slot_used  = (int*)calloc((size_t)n_slots, sizeof(int));
+    _GBDTLeaf* pq        = (_GBDTLeaf*)calloc((size_t)(max_leaves + 1), sizeof(_GBDTLeaf));
+
+    int ret = 0;
+    if (!hist_pool || !thr_bufs || !sample_idx || !tmp_idx || !slot_used || !pq) {
+        if (hist_pool)  safe_free_size(hist_pool, hist_bytes);
+        if (thr_bufs)   safe_free_size(thr_bufs,  thr_bytes);
+        free(sample_idx); free(tmp_idx); free(slot_used); free(pq);
+        return 0;
+    }
+
+    for (int i = 0; i < N; i++) sample_idx[i] = i;
+
+    // ── Slot pool helpers ─────────────────────────────────────────────────────
+#define _HS_G(s)    (hist_pool + (size_t)(s) * 2 * DQ)
+#define _HS_H(s)    (hist_pool + (size_t)(s) * 2 * DQ + DQ)
+#define _ALLOC_SLOT(out) do {                                           \
+    (out) = -1;                                                          \
+    for (int _s = 0; _s < n_slots; _s++) {                              \
+        if (!slot_used[_s]) { slot_used[_s] = 1; (out) = _s; break; }  \
+    }                                                                    \
+} while(0)
+#define _FREE_SLOT(s)  (slot_used[(s)] = 0)
+
+    // ── Initialise output arrays ──────────────────────────────────────────────
+    float* fp = F32(out_feats); float* tp = F32(out_thresholds);
+    float* lp = F32(out_lefts); float* rp = F32(out_rights);
+    for (int i = 0; i < max_nodes; i++) { fp[i]=-1.0f; tp[i]=0.0f; lp[i]=-1.0f; rp[i]=-1.0f; }
+
+    const int32_t* bp = I32(bins);
+    float* gp = F32(g); float* hp2 = F32(h); float* pp = F32(preds);
+
+    // ── Root: build histogram and compute sums ────────────────────────────────
+    int root_slot; _ALLOC_SLOT(root_slot);
+    _build_hist_idx_par(bp, gp, hp2, sample_idx, N, D, Q, thr_bufs, max_threads,
+                        _HS_G(root_slot), _HS_H(root_slot));
+
+    float root_sg = 0.0f, root_sh = 0.0f;
+    for (int i = 0; i < N; i++) { root_sg += gp[i]; root_sh += hp2[i]; }
+
+    int next_node = 1;
+    int pq_sz = 0;
+    int splits_done = 0;
+    int max_splits = max_leaves - 1;
+
+    // Find root best split
+    int rf = -1, rb = -1; float rg_gain = -1.0f;
+    if (root_sh >= min_hess)
+        _best_split_raw(_HS_G(root_slot), _HS_H(root_slot), D, Q,
+                        root_sg, root_sh, lambda, alpha, gamma, &rf, &rb, &rg_gain);
+
+    if (rf < 0 || rg_gain <= 0.0f || max_splits == 0) {
+        // Root is a leaf — single-node tree
+        float lv = _gbdt_leaf_val_l1(root_sg, root_sh, lambda, alpha);
+        tp[0] = lr * lv; fp[0] = -1.0f;
+        float delta = lr * lv;
+        for (int i = 0; i < N; i++) pp[i] += delta;
+        _FREE_SLOT(root_slot);
+        ret = 1;
+    } else {
+        _GBDTLeaf root_entry = {0, root_slot, 0, N, root_sg, root_sh, rg_gain, rf, rb};
+        _pq_push(pq, &pq_sz, root_entry);
+
+        while (pq_sz > 0 && splits_done < max_splits) {
+            _GBDTLeaf leaf = _pq_pop(pq, &pq_sz);
+            splits_done++;
+
+            int feat = leaf.best_feat, split_bin = leaf.best_bin;
+            int start = leaf.idx_start, count = leaf.idx_count;
+            const int* cur = sample_idx + start;
+
+            // Partition indices: left = bin <= split_bin, right = > split_bin
+            int l_count = 0, r_tail = count - 1;
+            for (int k = 0; k < count; k++) {
+                int si = cur[k];
+                if (bp[(size_t)si * D + feat] <= split_bin)
+                    tmp_idx[l_count++] = si;
+                else
+                    tmp_idx[r_tail--] = si;
+            }
+            int r_count = count - l_count;
+            memcpy(sample_idx + start, tmp_idx, (size_t)count * sizeof(int));
+
+            int l_start = start, r_start = start + l_count;
+            int left_nid = next_node++, right_nid = next_node++;
+
+            // Write internal node
+            fp[leaf.node_id] = (float)feat;
+            tp[leaf.node_id] = (float)split_bin;
+            lp[leaf.node_id] = (float)left_nid;
+            rp[leaf.node_id] = (float)right_nid;
+
+            // Compute child sums from histogram prefix and partition
+            float l_sg = 0.0f, l_sh = 0.0f;
+            for (int k = 0; k < l_count; k++) {
+                l_sg += gp[sample_idx[l_start + k]];
+                l_sh += hp2[sample_idx[l_start + k]];
+            }
+            float r_sg = leaf.sum_g - l_sg, r_sh = leaf.sum_h - l_sh;
+
+            // Allocate slots for children
+            int s_slot, o_slot;
+            _ALLOC_SLOT(s_slot); _ALLOC_SLOT(o_slot);
+
+            // Build histogram for smaller child; subtract for larger
+            int small_nid, large_nid, small_sl, large_sl;
+            int small_start, small_count, large_start, large_count;
+            float small_sg, small_sh, large_sg, large_sh;
+
+            if (l_count <= r_count) {
+                _build_hist_idx_par(bp, gp, hp2, sample_idx + l_start, l_count,
+                                    D, Q, thr_bufs, max_threads, _HS_G(s_slot), _HS_H(s_slot));
+                _hist_subtract_raw(_HS_G(leaf.hist_slot), _HS_H(leaf.hist_slot),
+                                   _HS_G(s_slot), _HS_H(s_slot),
+                                   _HS_G(o_slot), _HS_H(o_slot), DQ);
+                small_nid = left_nid;  small_sl = s_slot; small_start = l_start; small_count = l_count; small_sg = l_sg; small_sh = l_sh;
+                large_nid = right_nid; large_sl = o_slot; large_start = r_start; large_count = r_count; large_sg = r_sg; large_sh = r_sh;
+            } else {
+                _build_hist_idx_par(bp, gp, hp2, sample_idx + r_start, r_count,
+                                    D, Q, thr_bufs, max_threads, _HS_G(s_slot), _HS_H(s_slot));
+                _hist_subtract_raw(_HS_G(leaf.hist_slot), _HS_H(leaf.hist_slot),
+                                   _HS_G(s_slot), _HS_H(s_slot),
+                                   _HS_G(o_slot), _HS_H(o_slot), DQ);
+                small_nid = right_nid; small_sl = s_slot; small_start = r_start; small_count = r_count; small_sg = r_sg; small_sh = r_sh;
+                large_nid = left_nid;  large_sl = o_slot; large_start = l_start; large_count = l_count; large_sg = l_sg; large_sh = l_sh;
+            }
+            _FREE_SLOT(leaf.hist_slot);
+
+            // Process both children — pack into fixed array to avoid goto
+            int  child_nid[2]   = {small_nid,   large_nid};
+            int  child_sl[2]    = {small_sl,     large_sl};
+            int  child_start[2] = {small_start,  large_start};
+            int  child_count[2] = {small_count,  large_count};
+            float child_sg[2]   = {small_sg,     large_sg};
+            float child_sh[2]   = {small_sh,     large_sh};
+
+            for (int ci = 0; ci < 2; ci++) {
+                int   cnid  = child_nid[ci];
+                int   csl   = child_sl[ci];
+                int   cs    = child_start[ci];
+                int   cc    = child_count[ci];
+                float csg   = child_sg[ci], csh = child_sh[ci];
+                float* chg  = _HS_G(csl);   float* chh = _HS_H(csl);
+
+                if (csh < min_hess || cc <= 0 || splits_done >= max_splits) {
+                    float lv = _gbdt_leaf_val_l1(csg, csh, lambda, alpha);
+                    fp[cnid] = -1.0f; tp[cnid] = lr * lv;
+                    float delta = lr * lv;
+                    for (int k = 0; k < cc; k++) pp[sample_idx[cs + k]] += delta;
+                    _FREE_SLOT(csl);
+                    continue;
+                }
+                int cf = -1, cb = -1; float cg_gain = -1.0f;
+                _best_split_raw(chg, chh, D, Q, csg, csh, lambda, alpha, gamma,
+                                &cf, &cb, &cg_gain);
+                if (cf < 0 || cg_gain <= 0.0f) {
+                    float lv = _gbdt_leaf_val_l1(csg, csh, lambda, alpha);
+                    fp[cnid] = -1.0f; tp[cnid] = lr * lv;
+                    float delta = lr * lv;
+                    for (int k = 0; k < cc; k++) pp[sample_idx[cs + k]] += delta;
+                    _FREE_SLOT(csl);
+                } else {
+                    _GBDTLeaf cl = {cnid, csl, cs, cc, csg, csh, cg_gain, cf, cb};
+                    _pq_push(pq, &pq_sz, cl);
+                }
+            }
+        }
+
+        // Drain remaining PQ entries as leaves
+        while (pq_sz > 0) {
+            _GBDTLeaf leaf = _pq_pop(pq, &pq_sz);
+            float lv = _gbdt_leaf_val_l1(leaf.sum_g, leaf.sum_h, lambda, alpha);
+            tp[leaf.node_id] = lr * lv; fp[leaf.node_id] = -1.0f;
+            float delta = lr * lv;
+            const int* idx = sample_idx + leaf.idx_start;
+            for (int k = 0; k < leaf.idx_count; k++) pp[idx[k]] += delta;
+            _FREE_SLOT(leaf.hist_slot);
+        }
+
+        ret = next_node;
+    }
+
+#undef _HS_G
+#undef _HS_H
+#undef _ALLOC_SLOT
+#undef _FREE_SLOT
+
+    safe_free_size(hist_pool, hist_bytes);
+    safe_free_size(thr_bufs,  thr_bytes);
+    free(sample_idx);
+    free(tmp_idx);
+    free(slot_used);
+    free(pq);
+    return ret;
+}
+
 // ─── 22.6  QUANTILE TRANSFORM  ────────────────────────────────────────────────
 /* Fit quantile landmarks for each feature.
  * X: [N,D] → returns [D, n_quantiles] FLOAT32 */
