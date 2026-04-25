@@ -402,6 +402,126 @@ final class TensorEngine {
 
                 TensorC* tensor_yj_fit(TensorC* X);
                 TensorC* tensor_yj_transform(TensorC* X, TensorC* lambdas);
+
+                // ── DataFrame lifecycle (internal allocation) ─────────────────
+                DataFrame*  df_create(size_t n_rows, size_t n_cols);
+
+                // ── Section 10–15: Extended DataFrame Operations ──────────────
+
+                // Vectorized filtering
+                DataFrame*  df_apply_mask(const DataFrame* df, const int32_t* mask);
+                DataFrame*  df_where_f32(const DataFrame* df, int col_idx, int cmp_op, float val);
+                DataFrame*  df_where_str(const DataFrame* df, int col_idx, const char* val);
+
+                // Sorting
+                DataFrame*  df_sort_by_col(const DataFrame* df, int col_idx, bool ascending);
+
+                // GroupBy aggregation (group_col must be STRING / categorical)
+                DataFrame*  df_groupby_agg(const DataFrame* df,
+                                            int group_col_idx,
+                                            const int* agg_col_idxs, int n_agg,
+                                            int agg_type);
+                DataFrame*  df_groupby_multi_agg(const DataFrame* df,
+                                                   int group_col_idx,
+                                                   const int* agg_col_idxs,
+                                                   const int* agg_types,
+                                                   int n);
+
+                // Join / merge
+                DataFrame*  df_join(const DataFrame* left, const DataFrame* right,
+                                     int left_col_idx, int right_col_idx, int join_type);
+
+                // Schema mutations
+                DataFrame*  df_add_f32_column(const DataFrame* df, const char* name,
+                                               const float* data, size_t n_rows);
+                DataFrame*  df_drop_column_new(const DataFrame* df, int col_idx);
+                void        df_rename_column(DataFrame* df, int col_idx, const char* new_name);
+                DataFrame*  df_cast_to_f32(const DataFrame* df, int col_idx);
+                DataFrame*  df_fill_null_f32(const DataFrame* df, int col_idx, float fill_val);
+                DataFrame*  df_concat_rows(const DataFrame* a, const DataFrame* b);
+
+                // Describe / sample / value counts
+                TensorC*    df_describe(const DataFrame* df);
+                DataFrame*  df_value_counts(const DataFrame* df, int col_idx);
+                DataFrame*  df_sample_rows(const DataFrame* df, size_t n,
+                                            bool replace, uint64_t seed);
+
+                // ── BPE Tokenizer ─────────────────────────────────────────────
+                typedef struct Tokenizer Tokenizer;
+
+                Tokenizer*  tok_load_json(const char* tokenizer_json_path);
+                Tokenizer*  tok_load(const char* vocab_path, const char* merges_path);
+                void        tok_free(Tokenizer* tok);
+
+                int32_t*    tok_encode(const Tokenizer* tok, const char* text,
+                                        bool add_bos, int* n_out);
+                TensorC*    tok_encode_batch(const Tokenizer* tok,
+                                              const char** texts, int n_texts,
+                                              bool add_bos, int max_len);
+
+                char*       tok_decode(const Tokenizer* tok, const int32_t* ids,
+                                        int n, bool skip_special);
+
+                const char* tok_id_to_str(const Tokenizer* tok, int id);
+                int         tok_str_to_id(const Tokenizer* tok, const char* str);
+                bool        tok_is_special(const Tokenizer* tok, int id);
+
+                int         tok_vocab_size(const Tokenizer* tok);
+                int         tok_bos_id(const Tokenizer* tok);
+                int         tok_eos_id(const Tokenizer* tok);
+                int         tok_pad_id(const Tokenizer* tok);
+                int         tok_unk_id(const Tokenizer* tok);
+
+                // ── Inference Engine ──────────────────────────────────────────
+                typedef struct InferenceSession InferenceSession;
+
+                typedef struct {
+                    int   arch;
+                    int   vocab_size;
+                    int   n_layers;
+                    int   n_heads;
+                    int   n_kv_heads;
+                    int   d_model;
+                    int   d_ff;
+                    int   max_seq_len;
+                    float rms_eps;
+                    float rope_base;
+                    float rope_scale;
+                    float attn_scale;
+                    bool  tie_embeddings;
+                    int   bos_id;
+                    int   eos_id;
+                } ModelConfig;
+
+                InferenceSession* inf_load(const char* model_dir,
+                                            const ModelConfig* cfg,
+                                            Tokenizer* tok);
+                InferenceSession* inf_load_file(const char* weights_path,
+                                                 const ModelConfig* cfg,
+                                                 Tokenizer* tok);
+                void              inf_free(InferenceSession* sess);
+
+                TensorC*  inf_step(InferenceSession* sess,
+                                    int32_t token_id, int pos);
+                TensorC*  inf_forward(InferenceSession* sess,
+                                       const int32_t* tokens, int n_tokens);
+                void      inf_reset_kv(InferenceSession* sess);
+
+                int32_t   inf_sample_greedy(const TensorC* logits);
+                int32_t   inf_sample(InferenceSession* sess,
+                                      const TensorC* logits,
+                                      float temperature, float top_p);
+                int       inf_generate_ids(InferenceSession* sess,
+                                            const int32_t* prompt_ids, int n_prompt,
+                                            int max_new_tokens,
+                                            float temperature, float top_p,
+                                            uint64_t seed,
+                                            int32_t* out_ids);
+
+                bool      inf_parse_config(const char* config_json_path,
+                                            ModelConfig* cfg);
+                TensorC*  inf_get_weight(const InferenceSession* sess,
+                                          const char* name);
             ", $libPath);
         }
         return self::$ffi;

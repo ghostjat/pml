@@ -294,6 +294,148 @@ Tensor **pipeline_transform_batch(const DataFrame       *df,
                                     size_t                 n,
                                     const TransformPipeline *pl);
 
+/* ============================================================================
+ * 10.  VECTORIZED FILTERING
+ * ========================================================================== */
+
+typedef enum {
+    DF_CMP_EQ  = 0,   /* ==  */
+    DF_CMP_NEQ = 1,   /* !=  */
+    DF_CMP_GT  = 2,   /* >   */
+    DF_CMP_GTE = 3,   /* >=  */
+    DF_CMP_LT  = 4,   /* <   */
+    DF_CMP_LTE = 5    /* <=  */
+} DFCmpOp;
+
+/**
+ * Apply a precomputed boolean mask (int32_t 0/1, length == df->n_rows).
+ * Returns a new DataFrame containing only the rows where mask[i] != 0.
+ */
+DataFrame *df_apply_mask(const DataFrame *df, const int32_t *mask);
+
+/**
+ * Filter rows where a FLOAT32 or INT32 column satisfies cmp_op vs scalar val.
+ * STRING columns are rejected (sets error, returns NULL).
+ */
+DataFrame *df_where_f32(const DataFrame *df, int col_idx, int cmp_op, float val);
+
+/**
+ * Filter rows where a STRING column exactly equals val (O(1) category lookup).
+ * Returns empty DataFrame (not NULL) when val is not present in the column.
+ */
+DataFrame *df_where_str(const DataFrame *df, int col_idx, const char *val);
+
+/* ============================================================================
+ * 11.  SORTING
+ * ========================================================================== */
+
+/**
+ * Sort rows by column col_idx (FLOAT32, INT32, or STRING by category index).
+ * Returns a new sorted DataFrame; original is unchanged.
+ */
+DataFrame *df_sort_by_col(const DataFrame *df, int col_idx, bool ascending);
+
+/* ============================================================================
+ * 12.  GROUPBY AGGREGATION
+ *
+ * group_col must be a STRING (categorical) column.
+ * agg_cols must be FLOAT32 or INT32.
+ * Returns: new DataFrame [group_col | agg_col_0 | agg_col_1 | ...]
+ *          rows = number of distinct categories in group_col.
+ * ========================================================================== */
+
+typedef enum {
+    DF_AGG_SUM   = 0,
+    DF_AGG_MEAN  = 1,
+    DF_AGG_MIN   = 2,
+    DF_AGG_MAX   = 3,
+    DF_AGG_COUNT = 4,
+    DF_AGG_STD   = 5
+} DFAggType;
+
+/** All agg_col_idxs use the same agg_type. */
+DataFrame *df_groupby_agg(const DataFrame *df,
+                           int group_col_idx,
+                           const int *agg_col_idxs, int n_agg,
+                           int agg_type);
+
+/** Per-column agg type: agg_col_idxs[i] → agg_types[i]. */
+DataFrame *df_groupby_multi_agg(const DataFrame *df,
+                                  int group_col_idx,
+                                  const int *agg_col_idxs,
+                                  const int *agg_types,
+                                  int n);
+
+/* ============================================================================
+ * 13.  JOIN / MERGE  (sort-merge equijoin, single key column)
+ * ========================================================================== */
+
+typedef enum {
+    DF_JOIN_INNER = 0,
+    DF_JOIN_LEFT  = 1
+} DFJoinType;
+
+/**
+ * Equijoin on one column from each DataFrame.
+ * Result: all left columns + all right columns except the right join key.
+ * Unmatched left rows (left join): right columns filled with NaN / INT32_MIN.
+ */
+DataFrame *df_join(const DataFrame *left,
+                   const DataFrame *right,
+                   int left_col_idx,
+                   int right_col_idx,
+                   int join_type);
+
+/* ============================================================================
+ * 14.  SCHEMA MUTATIONS  (all return new DataFrames; caller owns result)
+ * ========================================================================== */
+
+/** Append a FLOAT32 column; n_rows must match df->n_rows. */
+DataFrame *df_add_f32_column(const DataFrame *df, const char *name,
+                              const float *data, size_t n_rows);
+
+/** Return new DataFrame without column at col_idx. */
+DataFrame *df_drop_column_new(const DataFrame *df, int col_idx);
+
+/** In-place rename — safe for exclusively-owned DataFrames. */
+void df_rename_column(DataFrame *df, int col_idx, const char *new_name);
+
+/** Return new DataFrame with INT32/STRING column cast to FLOAT32.
+ *  INT32_MIN (missing sentinel) → NaN. */
+DataFrame *df_cast_to_f32(const DataFrame *df, int col_idx);
+
+/** Return new DataFrame with NaN values in FLOAT32 column replaced with fill_val. */
+DataFrame *df_fill_null_f32(const DataFrame *df, int col_idx, float fill_val);
+
+/** Vertical concatenation of two DataFrames with matching column count and dtypes.
+ *  STRING columns: categories are merged and indices remapped. */
+DataFrame *df_concat_rows(const DataFrame *a, const DataFrame *b);
+
+/* ============================================================================
+ * 15.  DESCRIBE / SAMPLE / VALUE COUNTS
+ * ========================================================================== */
+
+/**
+ * Summary statistics for all FLOAT32 columns.
+ * Returns Tensor [n_float_cols × 5]: [count, mean, std, min, max] per row.
+ */
+Tensor *df_describe(const DataFrame *df);
+
+/**
+ * Frequency table for a STRING column.
+ * Returns new DataFrame: [category(STRING) | count(FLOAT32)], sorted desc.
+ */
+DataFrame *df_value_counts(const DataFrame *df, int col_idx);
+
+/**
+ * Random row sample.
+ * replace=true  → sampling with replacement (bootstrapping).
+ * replace=false → Fisher-Yates without replacement (n <= n_rows required).
+ * seed=0        → use current time.
+ */
+DataFrame *df_sample_rows(const DataFrame *df, size_t n, bool replace,
+                           uint64_t seed);
+
 #ifdef __cplusplus
 }
 #endif

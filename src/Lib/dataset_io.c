@@ -1292,3 +1292,887 @@ const char *df_col_category_name(const DataFrame *df, int col_idx, int cat_idx) 
     if (cat_idx < 0 || cat_idx >= col->n_categories) return NULL;
     return col->categories[cat_idx];
 }
+
+/* ============================================================================
+ * Sections 10–15: Extended DataFrame Operations
+ *
+ * filter/where, sort, groupby, join, schema mutations, describe, sampling.
+ * All heavy work runs in C; PHP is orchestration only.
+ * ========================================================================== */
+
+#ifdef _OPENMP
+#  include <omp.h>
+#endif
+#include <time.h>
+
+/* ── Internal helpers ───────────────────────────────────────────────────── */
+
+/* Copy only category metadata (names + hash map) from src to dst col. */
+static bool _col_copy_cats(DFColumn *dst, const DFColumn *src) {
+    if (src->dtype != DF_DTYPE_STRING) return true;
+    dst->_cat_cap = dst->n_categories = src->n_categories;
+    if (src->n_categories == 0) {
+        dst->categories = NULL;
+        dst->cat_map    = ht_create();
+        return dst->cat_map != NULL;
+    }
+    dst->categories = malloc((size_t)src->n_categories * sizeof(char *));
+    if (!dst->categories) return false;
+    dst->cat_map = ht_create();
+    if (!dst->cat_map) { free(dst->categories); dst->categories = NULL; return false; }
+    for (int32_t i = 0; i < src->n_categories; i++) {
+        dst->categories[i] = src->categories[i] ? strdup(src->categories[i]) : NULL;
+        if (dst->categories[i])
+            ht_put(dst->cat_map, dst->categories[i], strlen(dst->categories[i]), (int)i);
+    }
+    return true;
+}
+
+/*
+ * Allocate dst->data and scatter rows at indices[] from src.
+ * dst must already have dtype, name, and (STRING) categories set.
+ */
+static bool _col_scatter(DFColumn *dst, const DFColumn *src,
+                          const size_t *indices, size_t n) {
+    size_t esz = (src->dtype == DF_DTYPE_FLOAT32) ? sizeof(float) : sizeof(int32_t);
+    dst->data = malloc(n ? n * esz : 1); /* malloc(0) is implementation-defined */
+    if (!dst->data) return false;
+    const char *sp = (const char *)src->data;
+    char       *dp = (char *)dst->data;
+    for (size_t i = 0; i < n; i++)
+        memcpy(dp + i * esz, sp + indices[i] * esz, esz);
+    return true;
+}
+
+/*
+ * Build an output DataFrame shell: schema copied from src, data buffers empty.
+ */
+static DataFrame *_df_shell(size_t out_n, size_t n_cols,
+                              const DFColumn *src_cols) {
+    DataFrame *out = df_create(out_n, n_cols);
+    if (!out) return NULL;
+    for (size_t c = 0; c < n_cols; c++) {
+        DFColumn *dc = &out->columns[c];
+        const DFColumn *sc = &src_cols[c];
+        memcpy(dc->name, sc->name, DF_MAX_COL_NAME);
+        dc->dtype = sc->dtype;
+        if (!_col_copy_cats(dc, sc)) { df_free(out); return NULL; }
+    }
+    return out;
+}
+
+/* ── Section 10: Vectorized Filtering ─────────────────────────────────── */
+
+DataFrame *df_apply_mask(const DataFrame *df, const int32_t *mask) {
+    if (!df || !mask) DF_ERR("df_apply_mask: NULL argument");
+    size_t n = df->n_rows;
+
+    /* Count matching rows */
+    size_t out_n = 0;
+    for (size_t i = 0; i < n; i++) out_n += (mask[i] != 0);
+
+    /* Build dense index array */
+    size_t *idx = (size_t *)malloc(out_n ? out_n * sizeof(size_t) : 1);
+    if (!idx) DF_ERR("df_apply_mask: OOM index array");
+    size_t j = 0;
+    for (size_t i = 0; i < n; i++) if (mask[i]) idx[j++] = i;
+
+    /* Scatter into new DataFrame */
+    DataFrame *out = _df_shell(out_n, df->n_cols, df->columns);
+    if (!out) { free(idx); DF_ERR("df_apply_mask: OOM DataFrame shell"); }
+    for (size_t c = 0; c < df->n_cols; c++) {
+        if (!_col_scatter(&out->columns[c], &df->columns[c], idx, out_n)) {
+            free(idx); df_free(out); DF_ERR("df_apply_mask: OOM column data");
+        }
+    }
+    free(idx);
+    return out;
+}
+
+DataFrame *df_where_f32(const DataFrame *df, int col_idx, int cmp_op, float val) {
+    if (!df || col_idx < 0 || (size_t)col_idx >= df->n_cols)
+        DF_ERR("df_where_f32: invalid argument");
+    const DFColumn *col = &df->columns[col_idx];
+    if (col->dtype == DF_DTYPE_STRING)
+        DF_ERR("df_where_f32: column is STRING; use df_where_str");
+
+    size_t n = df->n_rows;
+    int32_t *mask = (int32_t *)malloc(n ? n * sizeof(int32_t) : 1);
+    if (!mask) DF_ERR("df_where_f32: OOM mask");
+
+    if (col->dtype == DF_DTYPE_FLOAT32) {
+        const float *d = (const float *)col->data;
+#pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < n; i++) {
+            switch ((DFCmpOp)cmp_op) {
+                case DF_CMP_EQ:  mask[i]=(d[i]==val); break;
+                case DF_CMP_NEQ: mask[i]=(d[i]!=val); break;
+                case DF_CMP_GT:  mask[i]=(d[i]> val); break;
+                case DF_CMP_GTE: mask[i]=(d[i]>=val); break;
+                case DF_CMP_LT:  mask[i]=(d[i]< val); break;
+                default:         mask[i]=(d[i]<=val); break;
+            }
+        }
+    } else {
+        const int32_t *d = (const int32_t *)col->data;
+        int32_t iv = (int32_t)val;
+#pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < n; i++) {
+            switch ((DFCmpOp)cmp_op) {
+                case DF_CMP_EQ:  mask[i]=(d[i]==iv); break;
+                case DF_CMP_NEQ: mask[i]=(d[i]!=iv); break;
+                case DF_CMP_GT:  mask[i]=(d[i]> iv); break;
+                case DF_CMP_GTE: mask[i]=(d[i]>=iv); break;
+                case DF_CMP_LT:  mask[i]=(d[i]< iv); break;
+                default:         mask[i]=(d[i]<=iv); break;
+            }
+        }
+    }
+    DataFrame *out = df_apply_mask(df, mask);
+    free(mask);
+    return out;
+}
+
+DataFrame *df_where_str(const DataFrame *df, int col_idx, const char *val) {
+    if (!df || col_idx < 0 || (size_t)col_idx >= df->n_cols || !val)
+        DF_ERR("df_where_str: invalid argument");
+    const DFColumn *col = &df->columns[col_idx];
+    if (col->dtype != DF_DTYPE_STRING)
+        DF_ERR("df_where_str: column is not STRING");
+
+    /* Intern val to category index — O(1) */
+    HashEntry *e = col->cat_map ? ht_get(col->cat_map, val, strlen(val)) : NULL;
+    if (!e) {
+        /* value absent → empty result DataFrame */
+        DataFrame *out = _df_shell(0, df->n_cols, df->columns);
+        if (!out) DF_ERR("df_where_str: OOM empty df");
+        for (size_t c = 0; c < df->n_cols; c++) {
+            out->columns[c].data = malloc(1);
+            if (!out->columns[c].data) { df_free(out); DF_ERR("df_where_str: OOM col data"); }
+        }
+        return out;
+    }
+    int32_t cat_idx = (int32_t)e->value;
+
+    size_t n = df->n_rows;
+    int32_t *mask = (int32_t *)malloc(n ? n * sizeof(int32_t) : 1);
+    if (!mask) DF_ERR("df_where_str: OOM mask");
+
+    const int32_t *d = (const int32_t *)col->data;
+#pragma omp parallel for simd schedule(static)
+    for (size_t i = 0; i < n; i++) mask[i] = (d[i] == cat_idx);
+
+    DataFrame *out = df_apply_mask(df, mask);
+    free(mask);
+    return out;
+}
+
+/* ── Section 11: Sorting ─────────────────────────────────────────────── */
+
+typedef struct { size_t idx; float key_f; int32_t key_i; } _SortEnt;
+
+static int _sort_f32_asc (const void *a, const void *b) {
+    float ka = ((_SortEnt*)a)->key_f, kb = ((_SortEnt*)b)->key_f;
+    return (ka > kb) - (ka < kb);
+}
+static int _sort_f32_desc(const void *a, const void *b) {
+    return _sort_f32_asc(b, a);
+}
+static int _sort_i32_asc (const void *a, const void *b) {
+    int32_t ka = ((_SortEnt*)a)->key_i, kb = ((_SortEnt*)b)->key_i;
+    return (ka > kb) - (ka < kb);
+}
+static int _sort_i32_desc(const void *a, const void *b) {
+    return _sort_i32_asc(b, a);
+}
+
+DataFrame *df_sort_by_col(const DataFrame *df, int col_idx, bool ascending) {
+    if (!df || col_idx < 0 || (size_t)col_idx >= df->n_cols)
+        DF_ERR("df_sort_by_col: invalid argument");
+
+    const DFColumn *col = &df->columns[col_idx];
+    size_t n = df->n_rows;
+
+    _SortEnt *ents = (_SortEnt *)malloc(n ? n * sizeof(_SortEnt) : 1);
+    if (!ents) DF_ERR("df_sort_by_col: OOM sort entries");
+
+    if (col->dtype == DF_DTYPE_FLOAT32) {
+        const float *d = (const float *)col->data;
+        for (size_t i = 0; i < n; i++) { ents[i].idx = i; ents[i].key_f = d[i]; }
+        qsort(ents, n, sizeof(_SortEnt), ascending ? _sort_f32_asc : _sort_f32_desc);
+    } else { /* INT32 or STRING (sort by category index) */
+        const int32_t *d = (const int32_t *)col->data;
+        for (size_t i = 0; i < n; i++) { ents[i].idx = i; ents[i].key_i = d[i]; }
+        qsort(ents, n, sizeof(_SortEnt), ascending ? _sort_i32_asc : _sort_i32_desc);
+    }
+
+    /* Build permutation index array */
+    size_t *perm = (size_t *)malloc(n ? n * sizeof(size_t) : 1);
+    if (!perm) { free(ents); DF_ERR("df_sort_by_col: OOM perm array"); }
+    for (size_t i = 0; i < n; i++) perm[i] = ents[i].idx;
+    free(ents);
+
+    DataFrame *out = _df_shell(n, df->n_cols, df->columns);
+    if (!out) { free(perm); DF_ERR("df_sort_by_col: OOM DataFrame shell"); }
+    for (size_t c = 0; c < df->n_cols; c++) {
+        if (!_col_scatter(&out->columns[c], &df->columns[c], perm, n)) {
+            free(perm); df_free(out); DF_ERR("df_sort_by_col: OOM column data");
+        }
+    }
+    free(perm);
+    return out;
+}
+
+/* ── Section 12: GroupBy Aggregation ─────────────────────────────────── */
+
+/*
+ * Per-group accumulator tracks all stats needed for any agg type in one pass.
+ * Two passes required for STD (mean needed before variance accumulation).
+ */
+typedef struct {
+    double  sum;
+    double  sum2;  /* sum of squares — for std */
+    float   min;
+    float   max;
+    int32_t count;
+} _GBAcc;
+
+DataFrame *df_groupby_multi_agg(const DataFrame *df,
+                                 int group_col_idx,
+                                 const int *agg_col_idxs,
+                                 const int *agg_types,
+                                 int n_agg) {
+    if (!df || group_col_idx < 0 || (size_t)group_col_idx >= df->n_cols
+            || !agg_col_idxs || !agg_types || n_agg <= 0)
+        DF_ERR("df_groupby_multi_agg: invalid argument");
+
+    const DFColumn *gcol = &df->columns[group_col_idx];
+    if (gcol->dtype != DF_DTYPE_STRING)
+        DF_ERR("df_groupby_multi_agg: group column must be STRING (categorical)");
+
+    int n_groups = gcol->n_categories;
+    size_t n_rows = df->n_rows;
+
+    /* Validate agg columns */
+    for (int ac = 0; ac < n_agg; ac++) {
+        int ci = agg_col_idxs[ac];
+        if (ci < 0 || (size_t)ci >= df->n_cols
+                || df->columns[ci].dtype == DF_DTYPE_STRING)
+            DF_ERR("df_groupby_multi_agg: agg column must be FLOAT32 or INT32");
+    }
+
+    /* ── Pass 1: parallel accumulation per group ───────────────────────── */
+    int n_threads = 1;
+#ifdef _OPENMP
+    n_threads = omp_get_max_threads();
+#endif
+    /* thread_acc[thread][group * n_agg + ac_col] */
+    size_t acc_stride = (size_t)n_groups * (size_t)n_agg;
+    _GBAcc *thread_acc = (_GBAcc *)malloc((size_t)n_threads * acc_stride * sizeof(_GBAcc));
+    if (!thread_acc) DF_ERR("df_groupby_multi_agg: OOM accumulators");
+
+    /* Initialise */
+    for (size_t k = 0; k < (size_t)n_threads * acc_stride; k++) {
+        thread_acc[k].sum   = 0.0;
+        thread_acc[k].sum2  = 0.0;
+        thread_acc[k].min   =  1e38f;
+        thread_acc[k].max   = -1e38f;
+        thread_acc[k].count = 0;
+    }
+
+    /* Gather pointers to agg column data */
+    const float **agg_data = (const float **)malloc((size_t)n_agg * sizeof(float *));
+    if (!agg_data) { free(thread_acc); DF_ERR("df_groupby_multi_agg: OOM agg_data ptrs"); }
+    for (int ac = 0; ac < n_agg; ac++)
+        agg_data[ac] = (const float *)df->columns[agg_col_idxs[ac]].data;
+
+    const int32_t *gdata = (const int32_t *)gcol->data;
+
+#pragma omp parallel
+    {
+        int tid = 0;
+#ifdef _OPENMP
+        tid = omp_get_thread_num();
+#endif
+        _GBAcc *my_acc = thread_acc + (size_t)tid * acc_stride;
+#pragma omp for schedule(static)
+        for (size_t r = 0; r < n_rows; r++) {
+            int32_t g = gdata[r];
+            if (g < 0 || g >= n_groups) continue;
+            for (int ac = 0; ac < n_agg; ac++) {
+                float v = agg_data[ac][r];
+                if (v != v) continue; /* NaN sentinel skip */
+                _GBAcc *a = &my_acc[g * n_agg + ac];
+                a->sum  += v;
+                a->sum2 += (double)v * v;
+                if (v < a->min) a->min = v;
+                if (v > a->max) a->max = v;
+                a->count++;
+            }
+        }
+    }
+    free(agg_data);
+
+    /* ── Reduce across threads ─────────────────────────────────────────── */
+    _GBAcc *global_acc = (_GBAcc *)calloc(acc_stride, sizeof(_GBAcc));
+    if (!global_acc) { free(thread_acc); DF_ERR("df_groupby_multi_agg: OOM global acc"); }
+    for (size_t k = 0; k < acc_stride; k++) {
+        global_acc[k].min = 1e38f; global_acc[k].max = -1e38f;
+    }
+    for (int t = 0; t < n_threads; t++) {
+        _GBAcc *ta = thread_acc + (size_t)t * acc_stride;
+        for (size_t k = 0; k < acc_stride; k++) {
+            global_acc[k].sum   += ta[k].sum;
+            global_acc[k].sum2  += ta[k].sum2;
+            global_acc[k].count += ta[k].count;
+            if (ta[k].min < global_acc[k].min) global_acc[k].min = ta[k].min;
+            if (ta[k].max > global_acc[k].max) global_acc[k].max = ta[k].max;
+        }
+    }
+    free(thread_acc);
+
+    /* ── Build output DataFrame: [group_col | agg_col_0 | ... ] ─────────── */
+    size_t out_cols = 1 + (size_t)n_agg;
+    DataFrame *out = df_create((size_t)n_groups, out_cols);
+    if (!out) { free(global_acc); DF_ERR("df_groupby_multi_agg: OOM output df"); }
+
+    /* Group column (STRING) */
+    DFColumn *ogc = &out->columns[0];
+    memcpy(ogc->name, gcol->name, DF_MAX_COL_NAME);
+    ogc->dtype = DF_DTYPE_STRING;
+    if (!_col_copy_cats(ogc, gcol)) {
+        free(global_acc); df_free(out); DF_ERR("df_groupby_multi_agg: OOM group col cats");
+    }
+    ogc->data = malloc((size_t)n_groups * sizeof(int32_t));
+    if (!ogc->data) { free(global_acc); df_free(out); DF_ERR("df_groupby_multi_agg: OOM group col data"); }
+    for (int g = 0; g < n_groups; g++) ((int32_t *)ogc->data)[g] = (int32_t)g;
+
+    /* Aggregated columns */
+    for (int ac = 0; ac < n_agg; ac++) {
+        DFColumn *oc = &out->columns[1 + ac];
+        const DFColumn *sc = &df->columns[agg_col_idxs[ac]];
+        memcpy(oc->name, sc->name, DF_MAX_COL_NAME);
+        oc->dtype = DF_DTYPE_FLOAT32;
+        oc->data = malloc((size_t)n_groups * sizeof(float));
+        if (!oc->data) {
+            free(global_acc); df_free(out); DF_ERR("df_groupby_multi_agg: OOM agg col data");
+        }
+        float *od = (float *)oc->data;
+        int agg_t = agg_types[ac];
+        for (int g = 0; g < n_groups; g++) {
+            _GBAcc *a = &global_acc[g * n_agg + ac];
+            switch ((DFAggType)agg_t) {
+                case DF_AGG_SUM:   od[g] = (float)a->sum;   break;
+                case DF_AGG_MEAN:  od[g] = a->count ? (float)(a->sum / a->count) : 0.0f; break;
+                case DF_AGG_MIN:   od[g] = a->count ? a->min : 0.0f; break;
+                case DF_AGG_MAX:   od[g] = a->count ? a->max : 0.0f; break;
+                case DF_AGG_COUNT: od[g] = (float)a->count; break;
+                case DF_AGG_STD: {
+                    if (a->count < 2) { od[g] = 0.0f; break; }
+                    double mean = a->sum / a->count;
+                    double var  = a->sum2 / a->count - mean * mean;
+                    od[g] = (float)sqrt(var < 0.0 ? 0.0 : var);
+                    break;
+                }
+                default: od[g] = 0.0f; break;
+            }
+        }
+    }
+    free(global_acc);
+    return out;
+}
+
+DataFrame *df_groupby_agg(const DataFrame *df,
+                           int group_col_idx,
+                           const int *agg_col_idxs, int n_agg,
+                           int agg_type) {
+    /* Broadcast single agg_type to all columns */
+    int *types = (int *)malloc((size_t)n_agg * sizeof(int));
+    if (!types) DF_ERR("df_groupby_agg: OOM");
+    for (int i = 0; i < n_agg; i++) types[i] = agg_type;
+    DataFrame *out = df_groupby_multi_agg(df, group_col_idx,
+                                           agg_col_idxs, types, n_agg);
+    free(types);
+    return out;
+}
+
+/* ── Section 13: Join / Merge ─────────────────────────────────────────── */
+
+/*
+ * Sort-merge equijoin on a single column.
+ * Supports INT32 and FLOAT32 key columns (treated as int32 for equality).
+ * For STRING keys: uses category index (so same string in both dfs must map
+ * to same category value — valid when using df_where_str-style pipelines).
+ */
+
+typedef struct { size_t orig; float key; } _JoinEnt;
+
+static int _je_asc(const void *a, const void *b) {
+    float ka = ((_JoinEnt*)a)->key, kb = ((_JoinEnt*)b)->key;
+    return (ka > kb) - (ka < kb);
+}
+
+/*
+ * Build sorted key+index array for a column.
+ */
+static _JoinEnt *_build_join_ents(const DFColumn *col, size_t n) {
+    _JoinEnt *ents = (_JoinEnt *)malloc(n ? n * sizeof(_JoinEnt) : 1);
+    if (!ents) return NULL;
+    if (col->dtype == DF_DTYPE_FLOAT32) {
+        const float *d = (const float *)col->data;
+        for (size_t i = 0; i < n; i++) { ents[i].orig = i; ents[i].key = d[i]; }
+    } else {
+        const int32_t *d = (const int32_t *)col->data;
+        for (size_t i = 0; i < n; i++) { ents[i].orig = i; ents[i].key = (float)d[i]; }
+    }
+    qsort(ents, n, sizeof(_JoinEnt), _je_asc);
+    return ents;
+}
+
+/*
+ * Scatter one element from column to output at position out_row.
+ * Output column data must already be allocated.
+ */
+static void _col_put_elem(DFColumn *dst, const DFColumn *src,
+                          size_t src_row, size_t dst_row) {
+    size_t esz = (src->dtype == DF_DTYPE_FLOAT32) ? sizeof(float) : sizeof(int32_t);
+    memcpy((char *)dst->data + dst_row * esz,
+           (const char *)src->data + src_row * esz, esz);
+}
+
+static void _col_put_null(DFColumn *dst, size_t dst_row) {
+    if (dst->dtype == DF_DTYPE_FLOAT32) {
+        float nan = 0.0f / 0.0f; /* NaN sentinel */
+        memcpy((char *)dst->data + dst_row * sizeof(float), &nan, sizeof(float));
+    } else {
+        int32_t miss = INT32_MIN;
+        memcpy((char *)dst->data + dst_row * sizeof(int32_t), &miss, sizeof(int32_t));
+    }
+}
+
+DataFrame *df_join(const DataFrame *left,
+                   const DataFrame *right,
+                   int left_col_idx,
+                   int right_col_idx,
+                   int join_type) {
+    if (!left || !right
+            || left_col_idx  < 0 || (size_t)left_col_idx  >= left->n_cols
+            || right_col_idx < 0 || (size_t)right_col_idx >= right->n_cols)
+        DF_ERR("df_join: invalid argument");
+
+    size_t ln = left->n_rows, rn = right->n_rows;
+
+    _JoinEnt *le = _build_join_ents(&left->columns[left_col_idx],   ln);
+    _JoinEnt *re = _build_join_ents(&right->columns[right_col_idx], rn);
+    if (!le || !re) { free(le); free(re); DF_ERR("df_join: OOM sort entries"); }
+
+    /* Phase 1 — count output rows */
+    size_t n_right_cols = right->n_cols - 1; /* exclude right join key */
+    size_t out_cols     = left->n_cols + n_right_cols;
+    size_t out_n        = 0;
+
+    size_t li = 0, ri = 0;
+    while (li < ln && ri < rn) {
+        float lk = le[li].key, rk = re[ri].key;
+        if (lk == rk) {
+            /* Count right group size */
+            size_t rg = ri;
+            while (rg < rn && re[rg].key == lk) rg++;
+            size_t rg_sz = rg - ri;
+            /* Count left group size */
+            size_t lg = li;
+            while (lg < ln && le[lg].key == lk) lg++;
+            out_n += (lg - li) * rg_sz;
+            li = lg; ri = rg;
+        } else if (lk < rk) {
+            if ((DFJoinType)join_type == DF_JOIN_LEFT) out_n++;
+            li++;
+        } else {
+            ri++;
+        }
+    }
+    if ((DFJoinType)join_type == DF_JOIN_LEFT) out_n += (ln - li); /* remaining unmatched left */
+
+    /* Phase 2 — build output schema */
+    /* Right columns: all except right_col_idx */
+    int *right_col_map = (int *)malloc(n_right_cols * sizeof(int));
+    if (!right_col_map) { free(le); free(re); DF_ERR("df_join: OOM col map"); }
+    size_t rm = 0;
+    for (size_t c = 0; c < right->n_cols; c++)
+        if ((int)c != right_col_idx) right_col_map[rm++] = (int)c;
+
+    /* Build combined column list for schema */
+    DFColumn *all_cols = (DFColumn *)calloc(out_cols, sizeof(DFColumn));
+    if (!all_cols) { free(le); free(re); free(right_col_map); DF_ERR("df_join: OOM cols"); }
+    for (size_t c = 0; c < left->n_cols; c++) {
+        memcpy(all_cols[c].name, left->columns[c].name, DF_MAX_COL_NAME);
+        all_cols[c].dtype = left->columns[c].dtype;
+    }
+    for (size_t c = 0; c < n_right_cols; c++) {
+        int rc = right_col_map[c];
+        memcpy(all_cols[left->n_cols + c].name, right->columns[rc].name, DF_MAX_COL_NAME);
+        all_cols[left->n_cols + c].dtype = right->columns[rc].dtype;
+    }
+
+    DataFrame *out = _df_shell(out_n, out_cols, all_cols);
+    free(all_cols);
+    if (!out) { free(le); free(re); free(right_col_map); DF_ERR("df_join: OOM output df"); }
+
+    /* Allocate output column data buffers */
+    for (size_t c = 0; c < out_cols; c++) {
+        DFColumn *oc = &out->columns[c];
+        size_t esz = (oc->dtype == DF_DTYPE_FLOAT32) ? sizeof(float) : sizeof(int32_t);
+        oc->data = malloc(out_n ? out_n * esz : 1);
+        if (!oc->data) {
+            free(le); free(re); free(right_col_map); df_free(out);
+            DF_ERR("df_join: OOM column data");
+        }
+    }
+
+    /* Phase 3 — scatter matching rows */
+    size_t out_r = 0;
+    li = 0; ri = 0;
+    while (li < ln && ri < rn) {
+        float lk = le[li].key, rk = re[ri].key;
+        if (lk == rk) {
+            size_t rg = ri;
+            while (rg < rn && re[rg].key == lk) rg++;
+            size_t lg = li;
+            while (lg < ln && le[lg].key == lk) lg++;
+
+            for (size_t l = li; l < lg; l++) {
+                for (size_t r = ri; r < rg; r++) {
+                    for (size_t c = 0; c < left->n_cols; c++)
+                        _col_put_elem(&out->columns[c], &left->columns[c], le[l].orig, out_r);
+                    for (size_t c = 0; c < n_right_cols; c++)
+                        _col_put_elem(&out->columns[left->n_cols + c],
+                                      &right->columns[right_col_map[c]], re[r].orig, out_r);
+                    out_r++;
+                }
+            }
+            li = lg; ri = rg;
+        } else if (lk < rk) {
+            if ((DFJoinType)join_type == DF_JOIN_LEFT) {
+                for (size_t c = 0; c < left->n_cols; c++)
+                    _col_put_elem(&out->columns[c], &left->columns[c], le[li].orig, out_r);
+                for (size_t c = 0; c < n_right_cols; c++)
+                    _col_put_null(&out->columns[left->n_cols + c], out_r);
+                out_r++;
+            }
+            li++;
+        } else {
+            ri++;
+        }
+    }
+    /* Remaining unmatched left rows (left join only) */
+    if ((DFJoinType)join_type == DF_JOIN_LEFT) {
+        while (li < ln) {
+            for (size_t c = 0; c < left->n_cols; c++)
+                _col_put_elem(&out->columns[c], &left->columns[c], le[li].orig, out_r);
+            for (size_t c = 0; c < n_right_cols; c++)
+                _col_put_null(&out->columns[left->n_cols + c], out_r);
+            out_r++; li++;
+        }
+    }
+
+    free(le); free(re); free(right_col_map);
+    return out;
+}
+
+/* ── Section 14: Schema Mutations ─────────────────────────────────────── */
+
+DataFrame *df_add_f32_column(const DataFrame *df, const char *name,
+                              const float *data, size_t n_rows) {
+    if (!df || !name || !data || n_rows != df->n_rows)
+        DF_ERR("df_add_f32_column: invalid argument");
+
+    size_t nc = df->n_cols + 1;
+    DataFrame *out = df_create(df->n_rows, nc);
+    if (!out) DF_ERR("df_add_f32_column: OOM");
+
+    for (size_t c = 0; c < df->n_cols; c++) {
+        if (!_col_copy(&out->columns[c], &df->columns[c], df->n_rows)) {
+            df_free(out); DF_ERR("df_add_f32_column: OOM col copy");
+        }
+    }
+
+    DFColumn *nc_col = &out->columns[df->n_cols];
+    strncpy(nc_col->name, name, DF_MAX_COL_NAME - 1);
+    nc_col->dtype = DF_DTYPE_FLOAT32;
+    nc_col->data  = malloc(n_rows * sizeof(float));
+    if (!nc_col->data) { df_free(out); DF_ERR("df_add_f32_column: OOM new col data"); }
+    memcpy(nc_col->data, data, n_rows * sizeof(float));
+    return out;
+}
+
+DataFrame *df_drop_column_new(const DataFrame *df, int col_idx) {
+    if (!df || col_idx < 0 || (size_t)col_idx >= df->n_cols)
+        DF_ERR("df_drop_column_new: invalid argument");
+
+    size_t nc = df->n_cols - 1;
+    DataFrame *out = df_create(df->n_rows, nc);
+    if (!out) DF_ERR("df_drop_column_new: OOM");
+
+    size_t oc = 0;
+    for (size_t c = 0; c < df->n_cols; c++) {
+        if ((int)c == col_idx) continue;
+        if (!_col_copy(&out->columns[oc++], &df->columns[c], df->n_rows)) {
+            df_free(out); DF_ERR("df_drop_column_new: OOM col copy");
+        }
+    }
+    return out;
+}
+
+void df_rename_column(DataFrame *df, int col_idx, const char *new_name) {
+    if (!df || col_idx < 0 || (size_t)col_idx >= df->n_cols || !new_name) return;
+    strncpy(df->columns[col_idx].name, new_name, DF_MAX_COL_NAME - 1);
+    df->columns[col_idx].name[DF_MAX_COL_NAME - 1] = '\0';
+}
+
+DataFrame *df_cast_to_f32(const DataFrame *df, int col_idx) {
+    if (!df || col_idx < 0 || (size_t)col_idx >= df->n_cols)
+        DF_ERR("df_cast_to_f32: invalid argument");
+    if (df->columns[col_idx].dtype == DF_DTYPE_FLOAT32)
+        DF_ERR("df_cast_to_f32: column is already FLOAT32");
+
+    DataFrame *out = df_create(df->n_rows, df->n_cols);
+    if (!out) DF_ERR("df_cast_to_f32: OOM");
+
+    for (size_t c = 0; c < df->n_cols; c++) {
+        if ((int)c != col_idx) {
+            if (!_col_copy(&out->columns[c], &df->columns[c], df->n_rows)) {
+                df_free(out); DF_ERR("df_cast_to_f32: OOM col copy");
+            }
+            continue;
+        }
+        DFColumn *oc = &out->columns[c];
+        const DFColumn *sc = &df->columns[c];
+        memcpy(oc->name, sc->name, DF_MAX_COL_NAME);
+        oc->dtype = DF_DTYPE_FLOAT32;
+        oc->data  = malloc(df->n_rows * sizeof(float));
+        if (!oc->data) { df_free(out); DF_ERR("df_cast_to_f32: OOM cast col"); }
+        const int32_t *src = (const int32_t *)sc->data;
+        float         *dst = (float *)oc->data;
+#pragma omp parallel for simd schedule(static)
+        for (size_t r = 0; r < df->n_rows; r++)
+            dst[r] = (src[r] == INT32_MIN) ? (0.0f/0.0f) : (float)src[r];
+    }
+    return out;
+}
+
+DataFrame *df_fill_null_f32(const DataFrame *df, int col_idx, float fill_val) {
+    if (!df || col_idx < 0 || (size_t)col_idx >= df->n_cols)
+        DF_ERR("df_fill_null_f32: invalid argument");
+    if (df->columns[col_idx].dtype != DF_DTYPE_FLOAT32)
+        DF_ERR("df_fill_null_f32: column is not FLOAT32");
+
+    DataFrame *out = df_create(df->n_rows, df->n_cols);
+    if (!out) DF_ERR("df_fill_null_f32: OOM");
+    for (size_t c = 0; c < df->n_cols; c++) {
+        if (!_col_copy(&out->columns[c], &df->columns[c], df->n_rows)) {
+            df_free(out); DF_ERR("df_fill_null_f32: OOM col copy");
+        }
+    }
+    float *d = (float *)out->columns[col_idx].data;
+#pragma omp parallel for simd schedule(static)
+    for (size_t r = 0; r < df->n_rows; r++)
+        if (d[r] != d[r]) d[r] = fill_val; /* NaN check */
+    return out;
+}
+
+DataFrame *df_concat_rows(const DataFrame *a, const DataFrame *b) {
+    if (!a || !b || a->n_cols != b->n_cols)
+        DF_ERR("df_concat_rows: NULL or mismatched column count");
+
+    size_t total = a->n_rows + b->n_rows;
+    DataFrame *out = df_create(total, a->n_cols);
+    if (!out) DF_ERR("df_concat_rows: OOM");
+
+    for (size_t c = 0; c < a->n_cols; c++) {
+        const DFColumn *ac = &a->columns[c];
+        const DFColumn *bc = &b->columns[c];
+        if (ac->dtype != bc->dtype) {
+            df_free(out); DF_ERR("df_concat_rows: dtype mismatch in column");
+        }
+        DFColumn *oc = &out->columns[c];
+        memcpy(oc->name, ac->name, DF_MAX_COL_NAME);
+        oc->dtype = ac->dtype;
+
+        size_t esz = (ac->dtype == DF_DTYPE_FLOAT32) ? sizeof(float) : sizeof(int32_t);
+        oc->data   = malloc(total ? total * esz : 1);
+        if (!oc->data) { df_free(out); DF_ERR("df_concat_rows: OOM col data"); }
+        memcpy((char *)oc->data,                   ac->data, a->n_rows * esz);
+        memcpy((char *)oc->data + a->n_rows * esz, bc->data, b->n_rows * esz);
+
+        /* For STRING columns: merge categories (reindex b's category indices) */
+        if (ac->dtype == DF_DTYPE_STRING) {
+            /* Copy a's categories as-is */
+            _col_copy_cats(oc, ac);
+            /* Append b's categories, remapping indices in b's data region */
+            int32_t *odata = (int32_t *)oc->data;
+            for (size_t r = a->n_rows; r < total; r++) {
+                int32_t old_idx = odata[r];
+                if (old_idx < 0 || old_idx >= bc->n_categories) {
+                    odata[r] = -1; continue;
+                }
+                const char *cat_str = bc->categories[old_idx];
+                if (!cat_str) { odata[r] = -1; continue; }
+                /* intern into oc's category map */
+                HashEntry *e = ht_get(oc->cat_map, cat_str, strlen(cat_str));
+                if (e) {
+                    odata[r] = (int32_t)e->value;
+                } else {
+                    odata[r] = _cat_intern(oc, cat_str, strlen(cat_str));
+                }
+            }
+        }
+    }
+    return out;
+}
+
+/* ── Section 15: Describe / Sample / ValueCounts ─────────────────────── */
+
+Tensor *df_describe(const DataFrame *df) {
+    if (!df) DF_ERR("df_describe: NULL DataFrame");
+
+    /* Collect FLOAT32 column indices */
+    int *f32_cols = (int *)malloc(df->n_cols * sizeof(int));
+    if (!f32_cols) DF_ERR("df_describe: OOM");
+    int nf = 0;
+    for (size_t c = 0; c < df->n_cols; c++)
+        if (df->columns[c].dtype == DF_DTYPE_FLOAT32) f32_cols[nf++] = (int)c;
+
+    if (nf == 0) { free(f32_cols); DF_ERR("df_describe: no FLOAT32 columns"); }
+
+    /* Output: [nf × 5] — [count, mean, std, min, max] */
+    int shape[2] = {nf, 5};
+    Tensor *out = tensor_create(2, shape);
+    if (!out) { free(f32_cols); DF_ERR("df_describe: OOM tensor"); }
+
+    float *od = F32(out);
+    size_t n  = df->n_rows;
+
+#pragma omp parallel for schedule(static)
+    for (int fi = 0; fi < nf; fi++) {
+        const float *d = (const float *)df->columns[f32_cols[fi]].data;
+        double sum = 0.0, sum2 = 0.0;
+        float  mn  =  1e38f, mx = -1e38f;
+        int    cnt = 0;
+        for (size_t r = 0; r < n; r++) {
+            float v = d[r];
+            if (v != v) continue; /* NaN */
+            sum  += v;
+            sum2 += (double)v * v;
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+            cnt++;
+        }
+        double mean = cnt ? sum / cnt : 0.0;
+        double var  = cnt > 1 ? (sum2 / cnt - mean * mean) : 0.0;
+        /* Row fi: [count, mean, std, min, max] */
+        od[fi * 5 + 0] = (float)cnt;
+        od[fi * 5 + 1] = (float)mean;
+        od[fi * 5 + 2] = (float)sqrt(var < 0.0 ? 0.0 : var);
+        od[fi * 5 + 3] = cnt ? mn : 0.0f;
+        od[fi * 5 + 4] = cnt ? mx : 0.0f;
+    }
+
+    free(f32_cols);
+    return out;
+}
+
+DataFrame *df_value_counts(const DataFrame *df, int col_idx) {
+    if (!df || col_idx < 0 || (size_t)col_idx >= df->n_cols)
+        DF_ERR("df_value_counts: invalid argument");
+    const DFColumn *col = &df->columns[col_idx];
+    if (col->dtype != DF_DTYPE_STRING)
+        DF_ERR("df_value_counts: column must be STRING");
+
+    int n_cats = col->n_categories;
+    int32_t *counts = (int32_t *)calloc((size_t)n_cats, sizeof(int32_t));
+    if (!counts) DF_ERR("df_value_counts: OOM counts");
+
+    const int32_t *d = (const int32_t *)col->data;
+    for (size_t r = 0; r < df->n_rows; r++)
+        if (d[r] >= 0 && d[r] < n_cats) counts[d[r]]++;
+
+    /* Sort categories by count descending (argsort) */
+    _SortEnt *ents = (_SortEnt *)malloc((size_t)n_cats * sizeof(_SortEnt));
+    if (!ents) { free(counts); DF_ERR("df_value_counts: OOM sort ents"); }
+    for (int i = 0; i < n_cats; i++) {
+        ents[i].idx   = (size_t)i;
+        ents[i].key_f = -(float)counts[i]; /* negate for desc sort */
+    }
+    qsort(ents, (size_t)n_cats, sizeof(_SortEnt), _sort_f32_asc);
+
+    /* Build output DataFrame: [category(STRING) | count(FLOAT32)] */
+    DataFrame *out = df_create((size_t)n_cats, 2);
+    if (!out) { free(counts); free(ents); DF_ERR("df_value_counts: OOM df"); }
+
+    /* Category column */
+    DFColumn *cc = &out->columns[0];
+    memcpy(cc->name, col->name, DF_MAX_COL_NAME);
+    cc->dtype = DF_DTYPE_STRING;
+    _col_copy_cats(cc, col);
+    cc->data = malloc((size_t)n_cats * sizeof(int32_t));
+    if (!cc->data) { free(counts); free(ents); df_free(out); DF_ERR("df_value_counts: OOM cat col"); }
+    for (int i = 0; i < n_cats; i++)
+        ((int32_t *)cc->data)[i] = (int32_t)ents[i].idx;
+
+    /* Count column */
+    DFColumn *cnt_col = &out->columns[1];
+    strncpy(cnt_col->name, "count", DF_MAX_COL_NAME - 1);
+    cnt_col->dtype = DF_DTYPE_FLOAT32;
+    cnt_col->data  = malloc((size_t)n_cats * sizeof(float));
+    if (!cnt_col->data) { free(counts); free(ents); df_free(out); DF_ERR("df_value_counts: OOM cnt col"); }
+    for (int i = 0; i < n_cats; i++)
+        ((float *)cnt_col->data)[i] = (float)counts[ents[i].idx];
+
+    free(counts); free(ents);
+    return out;
+}
+
+DataFrame *df_sample_rows(const DataFrame *df, size_t n, bool replace, uint64_t seed) {
+    if (!df) DF_ERR("df_sample_rows: NULL DataFrame");
+    if (n == 0) return df_create(0, df->n_cols);
+    if (!replace && n > df->n_rows)
+        DF_ERR("df_sample_rows: n > n_rows with replace=false");
+
+    /* Seed the RNG */
+    uint64_t state = seed ? seed : (uint64_t)time(NULL);
+    /* Xorshift64 */
+#define XS64(s) do { (s)^=(s)<<13; (s)^=(s)>>7; (s)^=(s)<<17; } while(0)
+
+    size_t *idx = (size_t *)malloc(n * sizeof(size_t));
+    if (!idx) DF_ERR("df_sample_rows: OOM index array");
+
+    if (replace) {
+        for (size_t i = 0; i < n; i++) {
+            XS64(state);
+            idx[i] = (size_t)(state % df->n_rows);
+        }
+    } else {
+        /* Fisher-Yates on an index array of size n_rows */
+        size_t *pool = (size_t *)malloc(df->n_rows * sizeof(size_t));
+        if (!pool) { free(idx); DF_ERR("df_sample_rows: OOM pool"); }
+        for (size_t i = 0; i < df->n_rows; i++) pool[i] = i;
+        for (size_t i = 0; i < n; i++) {
+            XS64(state);
+            size_t j = i + (size_t)(state % (df->n_rows - i));
+            size_t tmp = pool[i]; pool[i] = pool[j]; pool[j] = tmp;
+            idx[i] = pool[i];
+        }
+        free(pool);
+    }
+#undef XS64
+
+    DataFrame *out = _df_shell(n, df->n_cols, df->columns);
+    if (!out) { free(idx); DF_ERR("df_sample_rows: OOM df shell"); }
+    for (size_t c = 0; c < df->n_cols; c++) {
+        if (!_col_scatter(&out->columns[c], &df->columns[c], idx, n)) {
+            free(idx); df_free(out); DF_ERR("df_sample_rows: OOM col data");
+        }
+    }
+    free(idx);
+    return out;
+}
