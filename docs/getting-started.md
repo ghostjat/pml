@@ -1,6 +1,11 @@
+---
+layout: default
+title: Getting Started
+---
+
 # Getting Started
 
-This guide covers the minimum steps to run the PML framework, load data, and train a model.
+This page describes the environment setup, build path, and runtime validation for the framework.
 
 ## Requirements
 
@@ -11,7 +16,7 @@ This guide covers the minimum steps to run the PML framework, load data, and tra
 - `liblapacke-dev`
 - `composer`
 
-On Debian/Ubuntu:
+### Debian/Ubuntu
 
 ```bash
 sudo apt update
@@ -25,11 +30,11 @@ cd /home/ghost/projects/php/lab/ffi
 composer install
 ```
 
-## Build the C backend
+## Build and verify the native backend
 
-The C backend compiles automatically when `Pml\Lib\TensorEngine::get()` is called and `src/Lib/libtensor.so` is missing.
+The native backend is built automatically when `Pml\Lib\TensorEngine::get()` is first called.
 
-If you want to build it manually:
+Manual build:
 
 ```bash
 cd src/Lib
@@ -40,59 +45,44 @@ gcc -O3 -march=native -mtune=native -mfma -fno-math-errno -funsafe-math-optimiza
 ln -sf libtensor.so.7 libtensor.so
 ```
 
-## Run your first script
+## Verify runtime
 
-Create `examples/hello.php`:
+```bash
+php -r 'require "vendor/autoload.php"; echo Pml\Lib\TensorEngine::get() ? "OK\n" : "FAIL\n";'
+```
+
+## Validate dataset ingestion
 
 ```php
 <?php
 require 'vendor/autoload.php';
-
-use Pml\Tensor;
-
-$t = Tensor::zeros(2, 3)->fill(1.5);
-var_export($t->shape());
-print_r($t->toFlatArray());
-```
-
-Run it:
-
-```bash
-php examples/hello.php
-```
-
-## Load a dataset from CSV
-
-```php
-<?php
 use Pml\Dataset;
 
 $dataset = Dataset::load('datasets/housing/train.csv');
-print_r($dataset->schema());
+var_dump($dataset->numRows());
 ```
 
-## Train a model
+## Validate tensor operations
 
 ```php
-use Pml\Estimators\Regression\GBDTRegressor;
+<?php
+require 'vendor/autoload.php';
+use Pml\Tensor;
 
-$dataset = Dataset::fromCSV('datasets/housing/train.csv', labelColumn: 0)
-    ->dropNans()
-    ->materialize(labelCol: 0);
-
-$model = new GBDTRegressor();
-$model->train($dataset);
+$t = Tensor::zeros(4, 4);
+$t->fill(1.0);
+var_export($t->shape());
 ```
 
-## Save and load a model
+## Runtime checklist
 
-```php
-$model->save('saved_models/gbdt_regressor');
-$loaded = \Pml\Estimators\Regression\GBDTRegressor::load('saved_models/gbdt_regressor');
-```
+- `TensorEngine::get()` loads `libtensor.so`
+- `Dataset::fromCSV()` uses the numeric fast path when available
+- `Dataset::load()` preserves ETL mode for mixed-type CSVs
+- `Pipeline::save()` and `Pipeline::load()` persist metadata and tensor weights
 
 ## What to read next
 
-- `architecture.md` for the system design and C/PHP boundary.
-- `api/dataset.md` for dataset creation and ETL operations.
-- `api/tensor.md` for tensor algebra and zero-copy operations.
+- [Architecture](architecture.md)
+- [Core: Dataset](core/dataset.md)
+- [Core: FFI](core/ffi.md)

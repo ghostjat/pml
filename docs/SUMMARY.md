@@ -3,22 +3,27 @@
 - [Home](README.md)
 - [Getting Started](getting-started.md)
 - [Architecture](architecture.md)
-- API Reference
-  - [Overview](api/overview.md)
-  - [Dataset](api/dataset.md)
-  - [Tensor](api/tensor.md)
-  - [Models](api/models.md)
-  - [Training](api/training.md)
-  - [FFI](api/ffi.md)
-  - [NLP](api/nlp.md)
-  - [Vision](api/vision.md)
-  - [Utilities](api/utils.md)
+- Core
+  - [Tensors](core/tensors.md)
+  - [Dataset](core/dataset.md)
+  - [Memory](core/memory.md)
+  - [FFI](core/ffi.md)
+- Estimators
+  - [Overview](estimators/overview.md)
+  - [Regression](estimators/regression.md)
+  - [Classification](estimators/classification.md)
+  - [Training](estimators/training.md)
+- API
+  - [Reference](api.md)
+- Performance
+  - [Optimization](performance/optimization.md)
+  - [CPU Tuning](performance/cpu-tuning.md)
+  - [Memory Model](performance/memory-model.md)
 - Examples
-  - [Classification](examples/classification.md)
-  - [Regression](examples/regression.md)
-  - [Tokenization](examples/tokenization.md)
-  - [Custom Pipeline](examples/custom-pipeline.md)
+  - [Basic](examples/basic.md)
+  - [Pipeline](examples/pipeline.md)
+  - [Production](examples/production.md)
 - Advanced
-  - [Performance](advanced/performance.md)
-  - [Memory](advanced/memory.md)
+  - [Autograd](advanced/autograd.md)
+  - [Graph](advanced/graph.md)
   - [Internals](advanced/internals.md)

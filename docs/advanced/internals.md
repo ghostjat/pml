@@ -1,3 +1,8 @@
+---
+layout: default
+title: Internals
+---
+
 # Internals
 
 This page describes the internal implementation of the framework.
@@ -50,7 +55,7 @@ typedef struct {
 
 ## GBDT internals
 
-- `GBDTRegressor` and `GBDTClassifier` build histogram-based trees using `Tensor` kernels.
+- `GBDTRegressor` and `GBDTClassifier` build histogram-based trees using tensor kernels.
 - The native C backend provides functions such as `tensor_gbdt_train_tree()` and `tensor_gbdt_predict_all()`.
 - The PHP class assembles and saves tree structure tensors for inference.
 

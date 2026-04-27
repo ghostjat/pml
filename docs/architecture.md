@@ -1,78 +1,77 @@
+---
+layout: default
+title: Architecture
+---
+
 # Architecture
 
-The framework is organized as a PHP orchestration layer backed by a native C tensor engine.
+The framework is built as a PHP orchestration layer over a native C tensor engine. The design separates control flow from numeric computation.
 
 ## High-level architecture
 
-```
-PHP Application
-    ├── src/                  (PHP API layer)
-    │     ├── Dataset.php
-    │     ├── Tensor.php
-    │     ├── Pipeline.php
-    │     ├── Training/
-    │     ├── Transformers/
-    │     ├── Tokenizers/
-    │     └── Estimators/
-    └── src/Lib/              (FFI and persistence)
-          ├── TensorEngine.php
-          ├── ModelStore.php
-          ├── SafeTensorsIO.php
-          └── libtensor.so
+```text
+PHP layer                       Native C layer
+-----------                     -------------
+src/                            src/Lib/
+  Dataset.php                     TensorEngine.php
+  Tensor.php                      libtensor.so
+  Pipeline.php                    SafeTensorsIO.php
+  Transformers/                   tensor math kernels
+  Estimators/                     dataset ingestion
+                                 arena and memory primitives
 ```
 
-## Core design principles
+## Design principles
 
-- **PHP orchestrates only**: no ML math is implemented in PHP.
-- **C executes compute kernels**: tensor math, linear algebra, CSV ingestion, and neural network kernels are written in C and exposed through FFI.
-- **Zero-copy whenever possible**: dataset slicing, batching, and SafeTensors loading avoid unnecessary copies.
-- **Lazy ETL materialization**: the dataset can remain in ETL mode until tensor access is required.
+- PHP handles control flow, configuration, and persistence.
+- C implements numeric kernels, tensor memory, and dataset ingestion.
+- Zero-copy views minimize data movement.
+- ETL and tensor execution are kept separate.
 
 ## Dataset pipeline
 
-1. `Dataset::load()` reads a CSV into a C DataFrame in ETL mode.
-2. ETL methods such as `dropNans()`, `oneHotEncode()`, and `selectColumns()` operate on the C DataFrame.
-3. `materialize()` converts the DataFrame into numeric tensors.
-4. Most training and inference methods work in Tensor mode.
+```text
+CSV file
+   ├─ numeric-only fast path -> Tensor mode
+   └─ mixed-type fallback -> ETL mode -> transforms -> materialize -> Tensor mode
+```
 
-## Tensor engine layers
+### Pipeline steps
 
-- `TensorEngine.php` exposes `libtensor.so` via PHP `FFI::cdef()`.
-- The `Tensor` class is a PHP wrapper around native `TensorC*` pointers.
-- `TensorEngine` declares:
-  - tensor creation and views
-  - arithmetic and reductions
-  - matrix multiplication and BLAS-backed routines
-  - convolution / im2col / attention kernels
-  - dataset CSV ingestion and SafeTensors I/O
+1. `Dataset::load()` creates an ETL `DataFrame`.
+2. ETL transforms execute in native C.
+3. `Dataset::materialize()` converts the `DataFrame` to tensors.
+4. Estimators consume tensor data for training and inference.
 
-## Persistence and safety
+## Tensor engine
 
-- `ModelStore.php` serializes PHP object configuration and non-tensor state without using `serialize()`.
-- `SafeTensorsIO.php` writes tensor bytes to disk in the SafeTensors format.
-- `Pipeline::save()` and `Sequential::save()` produce:
-  - `config.json` for PHP state
-  - `*.safetensors` for tensor weights
+- `TensorEngine.php` loads or builds `libtensor.so`.
+- `FFI::cdef()` defines the native API once.
+- `Tensor` wraps `TensorC*` pointers and exposes a PHP API.
+
+## Persistence
+
+- `ModelStore` serializes object state without PHP `serialize()`.
+- `SafeTensorsIO` writes tensor weights to disk.
+- `Pipeline::save()` stores metadata and weights separately.
 
 ## Performance optimization points
 
-- **FFI caching**: both `TensorEngine` and `Tensor` cache the `FFI` instance.
-- **Shape and dtype metadata**: tensor metadata is read without copying buffer contents.
-- **Arena allocation**: optional arena support allows O(1) allocations for many tensors.
-- **Threading control**: `Tensor::configureThreading()` manages OpenMP and BLAS thread pools.
-- **Vectorized fused kernels**: matrix + bias, add+ReLU, FMA, and attention kernels are fused in C.
+- `TensorEngine::get()` caches the FFI interface.
+- `Tensor` caches shape and dtype metadata.
+- Arena allocation reduces allocator overhead.
+- Fused kernels reduce FFI boundary crossings.
 
-## Typical runtime flow
+## Runtime flow
 
-- PHP creates a `Dataset`.
-- PHP constructs a model or pipeline.
-- Training or inference calls traverse PHP objects.
-- Numeric work happens in `Tensor` methods that call C kernels.
-- Checkpoints are written by SafeTensors and JSON metadata.
+- PHP constructs dataset and model objects.
+- Training and inference traverse PHP objects.
+- Numeric compute runs in native C.
+- Model state is persisted with SafeTensors and JSON metadata.
 
-## How C and PHP interact
+## Cross references
 
-- PHP passes pointers to `TensorC` structs into native functions.
-- Many C methods return `TensorC*` pointers that are immediately wrapped by `Tensor::wrap()`.
-- `Tensor` objects own the C pointer by default and free it in `__destruct()`.
-- Zero-copy views retain a reference to the parent tensor to prevent premature free.
+- [Core: Dataset](core/dataset.md)
+- [Core: Tensors](core/tensors.md)
+- [Core: FFI](core/ffi.md)
+- [Estimators Overview](estimators/overview.md)
