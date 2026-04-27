@@ -1,0 +1,24 @@
+# Summary
+
+- [Home](README.md)
+- [Getting Started](getting-started.md)
+- [Architecture](architecture.md)
+- API Reference
+  - [Overview](api/overview.md)
+  - [Dataset](api/dataset.md)
+  - [Tensor](api/tensor.md)
+  - [Models](api/models.md)
+  - [Training](api/training.md)
+  - [FFI](api/ffi.md)
+  - [NLP](api/nlp.md)
+  - [Vision](api/vision.md)
+  - [Utilities](api/utils.md)
+- Examples
+  - [Classification](examples/classification.md)
+  - [Regression](examples/regression.md)
+  - [Tokenization](examples/tokenization.md)
+  - [Custom Pipeline](examples/custom-pipeline.md)
+- Advanced
+  - [Performance](advanced/performance.md)
+  - [Memory](advanced/memory.md)
+  - [Internals](advanced/internals.md)
