@@ -1,10 +1,15 @@
+---
+layout: default
+title: PML AutoML Framework
+---
+
 # PML AutoML Framework
 
 A high-performance machine learning framework in PHP with a native C FFI backend. Designed for speed, low memory use, and production-grade model accuracy.
 
 ## Overview
 
-PML combines PHP orchestration with a C tensor engine to deliver efficient data pipelines, fast training, and scalable inference. The framework is built for developers who need low-level control without sacrificing performance.
+PML combines PHP orchestration with a native C tensor engine to deliver efficient data pipelines, fast training, and scalable inference. The framework is built for developers who need low-level control without sacrificing performance.
 
 ## Features
 
@@ -19,14 +24,16 @@ PML combines PHP orchestration with a C tensor engine to deliver efficient data 
 1. Clone the repository:
 
    ```bash
-   git clone https://github.com/<your-org>/<your-repo>.git
-   cd <your-repo>
+   git clone https://github.com/ghostjat/pml.git
+   cd pml
    ```
+
 2. Install PHP dependencies:
 
    ```bash
    composer install
    ```
+
 3. Build the native backend when needed:
 
    ```bash
@@ -42,7 +49,7 @@ PML combines PHP orchestration with a C tensor engine to deliver efficient data 
 
 1. Install dependencies and prepare the project.
 2. Load a dataset from CSV.
-3. Train an estimator and evaluate results.
+3. Train an estimator and save the model.
 
 Example:
 
