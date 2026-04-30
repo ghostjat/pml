@@ -27,9 +27,12 @@ final class GaussianNB implements Learner, Probabilistic, Persistable, Saveable,
     private array $means = [];
     private array $variances = [];
     private array $classes = [];
-
-    // Smoothing factor to prevent division by zero in variance calculations
     private float $epsilon = 1e-9;
+
+    // Fused-kernel matrices (rebuilt after train() and load())
+    private ?Tensor $meansMatrix  = null;   // [K, D]
+    private ?Tensor $varsMatrix   = null;   // [K, D]
+    private ?Tensor $logNormsVec  = null;   // [K]
 
     public function train(Dataset $dataset): void
     {
@@ -69,6 +72,26 @@ final class GaussianNB implements Learner, Probabilistic, Persistable, Saveable,
             $this->means[$classKey] = $mean;
             $this->variances[$classKey] = $variance;
         }
+        $this->buildMatrices();
+    }
+
+    private function buildMatrices(): void
+    {
+        if (empty($this->classes) || empty($this->means)) return;
+        $meanRows = [];
+        $varRows  = [];
+        $logNorms = [];
+        foreach ($this->classes as $c) {
+            $ck = (string)$c;
+            $meanRows[] = $this->means[$ck]->expandDims(0);      // [1, D]
+            $varRows[]  = $this->variances[$ck]->expandDims(0);  // [1, D]
+            // log_norm[k] = log_prior[k] − 0.5·Σ_d log(2π·var[k,d])
+            $logNorms[] = $this->priors[$ck]
+                        - 0.5 * $this->variances[$ck]->mulScalar(2.0 * M_PI)->log()->sum();
+        }
+        $this->meansMatrix = Tensor::concat($meanRows, 0);  // [K, D]
+        $this->varsMatrix  = Tensor::concat($varRows,  0);  // [K, D]
+        $this->logNormsVec = Tensor::fromArray($logNorms);  // [K]
     }
 
     public function predict(Dataset $dataset): Tensor
@@ -82,35 +105,13 @@ final class GaussianNB implements Learner, Probabilistic, Persistable, Saveable,
         if (!$this->trained()) {
             throw new RuntimeException("GaussianNB has not been trained.");
         }
-
-        $x = $dataset->samples();
-        $logProbs = [];
-
-        // Compute the log probability for each class across all inference rows simultaneously
-        foreach ($this->classes as $c) {
-            $classKey = (string) $c;
-            $mean = $this->means[$classKey];
-            $var = $this->variances[$classKey];
-            $prior = $this->priors[$classKey];
-
-            // Gaussian Log-Likelihood Formula:
-            // -0.5 * sum(log(2 * pi * var)) - 0.5 * sum((x - mean)^2 / var) + log(prior)
-            
-            // 1. -0.5 * sum((x - mean)^2 / var, axis=1)
-            $diffSquared = $x->sub($mean)->square();
-            $term1 = $diffSquared->divInplace($var)->sumAxis(1)->mulScalarInplace(-0.5);
-
-            // 2. -0.5 * sum(log(2 * pi * var))
-            // This is a scalar constant for the class, computed efficiently in C
-            $term2Const = $var->mulScalar(2.0 * M_PI)->log()->sum() * -0.5;
-
-            // Combine and add Prior
-            $classLogProb = $term1->addScalarInplace($term2Const + $prior)->expandDims(1);
-            $logProbs[] = $classLogProb;
-        }
-
-        // Concatenate class log-probabilities into a continuous [N, K] matrix
-        return Tensor::concat($logProbs, 1);
+        // Single fused C call: K×(sub+square+div+sum+addScalar) → [N, K]
+        return Tensor::gnbLogLikelihood(
+            $dataset->samples(),
+            $this->meansMatrix,
+            $this->varsMatrix,
+            $this->logNormsVec
+        );
     }
 
     public function trained(): bool
@@ -194,6 +195,7 @@ final class GaussianNB implements Learner, Probabilistic, Persistable, Saveable,
         if (is_file($stPath)) {
             $i->loadStateDict(SafeTensorsIO::load($stPath));
         }
+        $i->buildMatrices();
         return $i;
     }
 }

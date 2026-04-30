@@ -5,6 +5,7 @@
 #include <math.h>
 #include <float.h>
 #include <time.h>
+#include <limits.h>
 #include <sys/time.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -652,6 +653,11 @@ void tensor_mul_scalar_inplace(Tensor* A, float val) { TENSOR_SCALAR_IMPL(_mm256
 
 static inline float _square(float x) { return x * x; }
 static inline float _sign(float x) { return (x > 0.0f) - (x < 0.0f); }
+/* Bit-level NaN check — immune to -ffast-math which breaks isnan()/isfinite() */
+static inline int _f32_is_nan(float x) {
+    uint32_t bits; memcpy(&bits, &x, sizeof(bits));
+    return (bits & 0x7FFFFFFFu) > 0x7F800000u;
+}
 static inline float _sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 
 #define TENSOR_MATH_UNARY(OP_NAME, MATH_FUNC) \
@@ -1940,6 +1946,24 @@ float tensor_dot(Tensor* A, Tensor* B) {
     return cblas_sdot(A->total_size, F32(A), A->stride[0], F32(B), B->stride[0]);
 }
 
+/* Sum of squared elements — equivalent to dot(v,v) but works on any shape.
+ * Used for gradient global-norm without allocating an intermediate tensor. */
+float tensor_sum_squares(Tensor* A) {
+    if (!A || A->dtype != DTYPE_FLOAT32) {
+        tensor_set_error("FATAL [SumSquares]: NULL or non-FLOAT32 tensor.");
+        return 0.0f;
+    }
+    size_t n = A->total_size;
+    const float* p = F32(A);
+    if (tensor_is_contiguous(A) && n <= (size_t)INT_MAX) {
+        return cblas_sdot((int)n, p, 1, p, 1);
+    }
+    float s = 0.0f;
+    #pragma omp simd reduction(+:s)
+    for (size_t i = 0; i < n; i++) s += p[i] * p[i];
+    return s;
+}
+
 float tensor_trace(Tensor* A) {
     if(A->ndim != 2 || A->shape[0] != A->shape[1] || A->dtype != DTYPE_FLOAT32) {
         TENSOR_ERROR_VAL(0.0f, "FATAL [Trace]: Must be 2D square matrix FLOAT32.");
@@ -2799,13 +2823,13 @@ Tensor* tensor_isnan(Tensor* A) {
             _mm256_storeu_ps(o + i, _mm256_and_ps(cmp, vone));
         }
 #endif
-        for (; i < n; i++) o[i] = isnan(a[i]) ? 1.0f : 0.0f;
+        for (; i < n; i++) o[i] = _f32_is_nan(a[i]) ? 1.0f : 0.0f;
     } else {
         int idx[8] = {0};
         for (size_t i = 0; i < out->total_size; i++) {
             size_t offset = 0;
             for (int d = 0; d < A->ndim; d++) offset += idx[d] * A->stride[d];
-            F32(out)[i] = isnan(F32(A)[offset]) ? 1.0f : 0.0f;
+            F32(out)[i] = _f32_is_nan(F32(A)[offset]) ? 1.0f : 0.0f;
             for (int d = A->ndim - 1; d >= 0; d--) {
                 idx[d]++; if (idx[d] < A->shape[d]) break; idx[d] = 0;
             }
@@ -2876,7 +2900,7 @@ void tensor_nan_to_num_inplace(Tensor* A, float nan_val, float posinf_val, float
         }
 #endif
         for (; i < n; i++) {
-            if (isnan(data[i])) data[i] = nan_val;
+            if (_f32_is_nan(data[i])) data[i] = nan_val;
             else if (isinf(data[i])) data[i] = data[i] > 0 ? posinf_val : neginf_val;
         }
     } else {
@@ -2884,7 +2908,7 @@ void tensor_nan_to_num_inplace(Tensor* A, float nan_val, float posinf_val, float
         for (size_t i = 0; i < A->total_size; i++) {
             size_t offset = 0;
             for (int d = 0; d < A->ndim; d++) offset += idx[d] * A->stride[d];
-            if (isnan(F32(A)[offset])) F32(A)[offset] = nan_val;
+            if (_f32_is_nan(F32(A)[offset])) F32(A)[offset] = nan_val;
             else if (isinf(F32(A)[offset])) F32(A)[offset] = F32(A)[offset] > 0 ? posinf_val : neginf_val;
             for (int d = A->ndim - 1; d >= 0; d--) {
                 idx[d]++; if (idx[d] < A->shape[d]) break; idx[d] = 0;
@@ -4497,12 +4521,22 @@ void tensor_fused_cross_entropy_loss_and_grad(Tensor* logits, Tensor* target_ids
     const int*   __restrict T  = (const int*)target_ids->data;
 
     float total_loss = 0.0f;
+    int   n_valid    = 0;
 
-#pragma omp parallel for schedule(static) reduction(+:total_loss)
+    /* tid == -1 signals a padding position: zero the gradient row and skip loss.
+     * This lets callers pack variable-length sequences into a padded batch without
+     * contaminating the loss or gradients. */
+#pragma omp parallel for schedule(static) reduction(+:total_loss) reduction(+:n_valid)
     for (int b = 0; b < batch; b++) {
         const float* __restrict row_l = L + (size_t)b * vocab;
         float*       __restrict row_g = G + (size_t)b * vocab;
         int tid = T[b];
+
+        if (tid < 0) {
+            memset(row_g, 0, (size_t)vocab * sizeof(float));
+            continue;
+        }
+        n_valid++;
 
         float mx = row_l[0];
         for (int i = 1; i < vocab; i++)
@@ -4526,7 +4560,7 @@ void tensor_fused_cross_entropy_loss_and_grad(Tensor* logits, Tensor* target_ids
         row_g[tid] -= 1.0f;
     }
 
-    *out_loss = total_loss / (float)batch;
+    *out_loss = n_valid > 0 ? total_loss / (float)n_valid : 0.0f;
 }
 
 Tensor* tensor_rmsnorm_backward(Tensor* dY, Tensor* X, Tensor* weights, float eps) {
@@ -6354,4 +6388,1067 @@ static float _yj_inv(float y, float lam) {
         if (fabsf(lam2) < 1e-6f) return -expm1f(-y);
         return 1.0f - powf(-y*lam2 + 1.0f, 1.0f/lam2);
     }
+}
+
+/* ============================================================================
+ * 22.8  NaN fill — replace NaN/Inf with fill_val in-place
+ * ========================================================================== */
+void tensor_fill_nan(Tensor* t, float fill_val) {
+    if (!t || t->dtype != DTYPE_FLOAT32) return;
+    float* d = F32(t);
+    int n = (int)t->total_size;
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < n; i++)
+        if (_f32_is_nan(d[i])) d[i] = fill_val;
+}
+
+/* ============================================================================
+ * 22.9  Pearson correlation — each column of X [N,D] vs vector y [N]
+ *       Returns [D] float tensor.  NaN pairs skipped (pairwise-complete).
+ * ========================================================================== */
+Tensor* tensor_pearson_cols(Tensor* X, Tensor* y) {
+    if (!X || !y || X->ndim != 2)
+        TENSOR_ERROR("tensor_pearson_cols: X must be [N,D]");
+    int N = X->shape[0], D = X->shape[1];
+    /* Accept y as [N] or [N,1] — both are contiguous with N elements */
+    int y_ok = (y->ndim == 1 && (int)y->total_size == N) ||
+               (y->ndim == 2 && y->shape[0] == N && y->shape[1] == 1);
+    if (!y_ok)
+        TENSOR_ERROR("tensor_pearson_cols: y must be [N] or [N,1]");
+
+    Tensor* Xc = tensor_is_contiguous(X) ? X : tensor_copy(X);
+    Tensor* yc = tensor_is_contiguous(y) ? y : tensor_copy(y);
+    Tensor* out = tensor_zeros(1, (int[]){D});
+    if (!out) { if (Xc!=X) tensor_free(Xc); if (yc!=y) tensor_free(yc); TENSOR_ERROR("OOM"); }
+
+    float* xp = F32(Xc);
+    float* yp = F32(yc);
+    float* rp = F32(out);
+
+#pragma omp parallel for schedule(static)
+    for (int j = 0; j < D; j++) {
+        double sx=0, sy=0, sxy=0, sx2=0, sy2=0;
+        int cnt = 0;
+        for (int i = 0; i < N; i++) {
+            float xv = xp[i*D + j], yv = yp[i];
+            if (_f32_is_nan(xv) || _f32_is_nan(yv)) continue;
+            sx  += xv;  sy  += yv;
+            sxy += (double)xv * yv;
+            sx2 += (double)xv * xv;
+            sy2 += (double)yv * yv;
+            cnt++;
+        }
+        if (cnt < 2) { rp[j] = 0.0f; continue; }
+        double num = cnt * sxy - sx * sy;
+        double den = sqrt((cnt*sx2 - sx*sx) * (cnt*sy2 - sy*sy));
+        rp[j] = (den < 1e-12) ? 0.0f : (float)(num / den);
+    }
+
+    if (Xc != X) tensor_free(Xc);
+    if (yc != y) tensor_free(yc);
+    return out;
+}
+
+/* ============================================================================
+ * 23. ADVANCED EDA STATISTICAL FUNCTIONS
+ * ========================================================================== */
+
+/* 23.1  Percentile of a flat tensor (p in [0,100]) */
+float tensor_percentile(Tensor* A, float p) {
+    if (!A || A->dtype != DTYPE_FLOAT32 || A->total_size == 0) return 0.0f;
+    size_t n = A->total_size;
+    float* buf = (float*)malloc(n * sizeof(float));
+    if (!buf) { TENSOR_ERROR_VAL(0.0f, "OOM"); }
+    memcpy(buf, A->data, n * sizeof(float));
+    qsort(buf, n, sizeof(float), cmp_float);
+    float idx = (p / 100.0f) * (float)(n - 1);
+    int lo = (int)idx;
+    int hi = lo + 1;
+    float frac = idx - (float)lo;
+    float result = (hi < (int)n) ? buf[lo] * (1.0f - frac) + buf[hi] * frac : buf[lo];
+    free(buf);
+    return result;
+}
+
+/* 23.2  IQR (interquartile range) of a flat tensor */
+float tensor_iqr(Tensor* A) {
+    return tensor_percentile(A, 75.0f) - tensor_percentile(A, 25.0f);
+}
+
+/* 23.3  MAD (median absolute deviation) */
+float tensor_mad(Tensor* A) {
+    if (!A || A->dtype != DTYPE_FLOAT32 || A->total_size == 0) return 0.0f;
+    float med = tensor_median(A);
+    size_t n = A->total_size;
+    float* buf = (float*)malloc(n * sizeof(float));
+    if (!buf) { TENSOR_ERROR_VAL(0.0f, "OOM"); }
+    float* src = F32(A);
+    for (size_t i = 0; i < n; i++) buf[i] = fabsf(src[i] - med);
+    qsort(buf, n, sizeof(float), cmp_float);
+    float result = (n % 2 == 0) ? (buf[n/2-1] + buf[n/2]) / 2.0f : buf[n/2];
+    free(buf);
+    return result;
+}
+
+/* 23.4  Fisher-Pearson skewness (standardized 3rd moment) */
+float tensor_skewness(Tensor* A) {
+    if (!A || A->dtype != DTYPE_FLOAT32 || A->total_size < 3) return 0.0f;
+    double n = (double)A->total_size;
+    double mean = 0.0, m2 = 0.0, m3 = 0.0;
+    float* d = F32(A);
+    for (size_t i = 0; i < A->total_size; i++) mean += d[i];
+    mean /= n;
+    for (size_t i = 0; i < A->total_size; i++) {
+        double dev = d[i] - mean;
+        m2 += dev * dev;
+        m3 += dev * dev * dev;
+    }
+    m2 /= n; m3 /= n;
+    if (m2 < 1e-12) return 0.0f;
+    return (float)(m3 / pow(m2, 1.5));
+}
+
+/* 23.5  Excess kurtosis (Fisher's definition: normal = 0) */
+float tensor_kurtosis(Tensor* A) {
+    if (!A || A->dtype != DTYPE_FLOAT32 || A->total_size < 4) return 0.0f;
+    double n = (double)A->total_size;
+    double mean = 0.0, m2 = 0.0, m4 = 0.0;
+    float* d = F32(A);
+    for (size_t i = 0; i < A->total_size; i++) mean += d[i];
+    mean /= n;
+    for (size_t i = 0; i < A->total_size; i++) {
+        double dev = d[i] - mean;
+        double dev2 = dev * dev;
+        m2 += dev2;
+        m4 += dev2 * dev2;
+    }
+    m2 /= n; m4 /= n;
+    if (m2 < 1e-12) return 0.0f;
+    return (float)(m4 / (m2 * m2) - 3.0);
+}
+
+/* 23.6  Shannon entropy of a flat float tensor via equal-width histogram.
+ *       n_bins: number of histogram bins (recommend 32-64 for continuous data). */
+float tensor_entropy_binned(Tensor* A, int n_bins) {
+    if (!A || A->dtype != DTYPE_FLOAT32 || A->total_size == 0 || n_bins < 2) return 0.0f;
+    float mn = tensor_min(A), mx = tensor_max(A);
+    if (mx - mn < 1e-12f) return 0.0f;
+    float rng = mx - mn;
+    int* hist = (int*)calloc((size_t)n_bins, sizeof(int));
+    if (!hist) { TENSOR_ERROR_VAL(0.0f, "OOM"); }
+    float* d = F32(A);
+    size_t n = A->total_size;
+    for (size_t i = 0; i < n; i++) {
+        int bin = (int)((d[i] - mn) / rng * (float)n_bins);
+        if (bin >= n_bins) bin = n_bins - 1;
+        hist[bin]++;
+    }
+    double entropy = 0.0;
+    for (int b = 0; b < n_bins; b++) {
+        if (hist[b] > 0) {
+            double p = (double)hist[b] / (double)n;
+            entropy -= p * log(p);
+        }
+    }
+    free(hist);
+    return (float)entropy;
+}
+
+/* 23.7  Full-column batch statistics for a single column of a [N,D] matrix.
+ *       col: column index; out must be float[10]:
+ *       [mean, std, skew, kurt, median, p25, p75, iqr, mad, nan_ratio] */
+void tensor_col_stats(Tensor* X, int col, float* out) {
+    if (!X || !out || X->ndim != 2 || col < 0 || col >= X->shape[1]) return;
+    int N = X->shape[0], D = X->shape[1];
+    float* xp = F32(X);
+    /* collect column, skip NaN */
+    float* buf = (float*)malloc((size_t)N * sizeof(float));
+    if (!buf) { TENSOR_ERROR_VOID("OOM"); }
+    int valid = 0;
+    int nan_count = 0;
+    for (int i = 0; i < N; i++) {
+        float v = xp[i * D + col];
+        if (_f32_is_nan(v)) { nan_count++; continue; }
+        buf[valid++] = v;
+    }
+    if (valid == 0) {
+        for (int i = 0; i < 10; i++) out[i] = 0.0f;
+        out[9] = 1.0f; /* all NaN */
+        free(buf); return;
+    }
+    /* mean */
+    double sum = 0.0;
+    for (int i = 0; i < valid; i++) sum += buf[i];
+    double mean = sum / valid;
+    /* std, skew, kurt via single pass with Welford + moments */
+    double m2 = 0.0, m3 = 0.0, m4 = 0.0;
+    for (int i = 0; i < valid; i++) {
+        double d = buf[i] - mean;
+        double d2 = d*d;
+        m2 += d2; m3 += d2*d; m4 += d2*d2;
+    }
+    m2 /= valid; m3 /= valid; m4 /= valid;
+    float std_v = (m2 > 1e-12) ? (float)sqrt(m2) : 0.0f;
+    float skew  = (m2 > 1e-12) ? (float)(m3 / pow(m2, 1.5)) : 0.0f;
+    float kurt  = (m2 > 1e-12) ? (float)(m4 / (m2*m2) - 3.0) : 0.0f;
+    /* median, p25, p75 via sort */
+    qsort(buf, (size_t)valid, sizeof(float), cmp_float);
+    float med  = (valid % 2 == 0) ? (buf[valid/2-1]+buf[valid/2])/2.0f : buf[valid/2];
+    float p25_idx = 0.25f * (valid - 1);
+    float p75_idx = 0.75f * (valid - 1);
+    int p25_lo = (int)p25_idx, p75_lo = (int)p75_idx;
+    float p25 = buf[p25_lo] * (1.0f - (p25_idx - p25_lo)) + (p25_lo+1 < valid ? buf[p25_lo+1] : buf[p25_lo]) * (p25_idx - p25_lo);
+    float p75 = buf[p75_lo] * (1.0f - (p75_idx - p75_lo)) + (p75_lo+1 < valid ? buf[p75_lo+1] : buf[p75_lo]) * (p75_idx - p75_lo);
+    float iqr_v = p75 - p25;
+    /* MAD */
+    float med_local = med;
+    for (int i = 0; i < valid; i++) buf[i] = fabsf(buf[i] - med_local);
+    qsort(buf, (size_t)valid, sizeof(float), cmp_float);
+    float mad_v = (valid % 2 == 0) ? (buf[valid/2-1]+buf[valid/2])/2.0f : buf[valid/2];
+    out[0] = (float)mean;
+    out[1] = std_v;
+    out[2] = skew;
+    out[3] = kurt;
+    out[4] = med;
+    out[5] = p25;
+    out[6] = p75;
+    out[7] = iqr_v;
+    out[8] = mad_v;
+    out[9] = (float)nan_count / (float)N;
+    free(buf);
+}
+
+/* 23.8  Pairwise Pearson correlation matrix for all columns of X [N,D].
+ *       Returns [D,D] float tensor. */
+Tensor* tensor_correlation_matrix(Tensor* X) {
+    if (!X || X->ndim != 2) TENSOR_ERROR("tensor_correlation_matrix: X must be [N,D]");
+    int N = X->shape[0], D = X->shape[1];
+    Tensor* Xc = tensor_is_contiguous(X) ? X : tensor_copy(X);
+    Tensor* out = tensor_zeros(2, (int[]){D, D});
+    if (!out) { if (Xc!=X) tensor_free(Xc); TENSOR_ERROR("OOM"); }
+    float* xp = F32(Xc);
+    float* op = F32(out);
+    /* precompute per-column mean and std */
+    double* col_mean = (double*)malloc((size_t)D * sizeof(double));
+    double* col_std  = (double*)malloc((size_t)D * sizeof(double));
+    if (!col_mean || !col_std) {
+        free(col_mean); free(col_std);
+        if (Xc!=X) tensor_free(Xc); tensor_free(out);
+        TENSOR_ERROR("OOM");
+    }
+    for (int j = 0; j < D; j++) {
+        double s = 0.0, s2 = 0.0;
+        int cnt = 0;
+        for (int i = 0; i < N; i++) {
+            float v = xp[i*D+j];
+            if (!_f32_is_nan(v)) { s += v; s2 += (double)v*v; cnt++; }
+        }
+        col_mean[j] = cnt > 0 ? s/cnt : 0.0;
+        double var = cnt > 1 ? s2/cnt - col_mean[j]*col_mean[j] : 0.0;
+        col_std[j] = var > 1e-12 ? sqrt(var) : 0.0;
+    }
+#pragma omp parallel for schedule(dynamic) if(D > 16)
+    for (int j = 0; j < D; j++) {
+        op[j*D+j] = 1.0f;
+        for (int k = j+1; k < D; k++) {
+            if (col_std[j] < 1e-12 || col_std[k] < 1e-12) { op[j*D+k] = op[k*D+j] = 0.0f; continue; }
+            double cov = 0.0; int cnt = 0;
+            for (int i = 0; i < N; i++) {
+                float vj = xp[i*D+j], vk = xp[i*D+k];
+                if (!_f32_is_nan(vj) && !_f32_is_nan(vk)) {
+                    cov += (vj - col_mean[j]) * (vk - col_mean[k]);
+                    cnt++;
+                }
+            }
+            float r = cnt > 1 ? (float)(cov / (cnt * col_std[j] * col_std[k])) : 0.0f;
+            op[j*D+k] = op[k*D+j] = r;
+        }
+    }
+    free(col_mean); free(col_std);
+    if (Xc != X) tensor_free(Xc);
+    return out;
+}
+
+/* 23.9  Mutual information between each column of X [N,D] and target y [N].
+ *       Uses histogram-based estimation with n_bins equal-width bins.
+ *       Returns [D] float tensor of MI values (nats). */
+Tensor* tensor_mutual_info_cols(Tensor* X, Tensor* y, int n_bins) {
+    if (!X || !y || X->ndim != 2) TENSOR_ERROR("tensor_mutual_info_cols: X must be [N,D]");
+    int N = X->shape[0], D = X->shape[1];
+    if ((int)y->total_size != N) TENSOR_ERROR("tensor_mutual_info_cols: y length mismatch");
+    if (n_bins < 2) n_bins = 32;
+    Tensor* Xc = tensor_is_contiguous(X) ? X : tensor_copy(X);
+    Tensor* yc = tensor_is_contiguous(y) ? y : tensor_copy(y);
+    Tensor* out = tensor_zeros(1, (int[]){D});
+    if (!out) { if (Xc!=X) tensor_free(Xc); if (yc!=y) tensor_free(yc); TENSOR_ERROR("OOM"); }
+    float* xp = F32(Xc);
+    float* yp = F32(yc);
+    float* op = F32(out);
+    float y_min = yp[0], y_max = yp[0];
+    for (int i = 1; i < N; i++) { if (yp[i] < y_min) y_min = yp[i]; if (yp[i] > y_max) y_max = yp[i]; }
+    float y_rng = y_max - y_min;
+    int* joint = (int*)malloc((size_t)(n_bins * n_bins) * sizeof(int));
+    int* x_hist = (int*)malloc((size_t)n_bins * sizeof(int));
+    int* y_hist = (int*)malloc((size_t)n_bins * sizeof(int));
+    if (!joint || !x_hist || !y_hist) {
+        free(joint); free(x_hist); free(y_hist);
+        if (Xc!=X) tensor_free(Xc); if (yc!=y) tensor_free(yc); tensor_free(out);
+        TENSOR_ERROR("OOM");
+    }
+    for (int j = 0; j < D; j++) {
+        float x_min = xp[0*D+j], x_max = x_min;
+        for (int i = 1; i < N; i++) { float v = xp[i*D+j]; if (v<x_min) x_min=v; if (v>x_max) x_max=v; }
+        float x_rng = x_max - x_min;
+        memset(joint, 0, (size_t)(n_bins*n_bins)*sizeof(int));
+        memset(x_hist, 0, (size_t)n_bins*sizeof(int));
+        memset(y_hist, 0, (size_t)n_bins*sizeof(int));
+        for (int i = 0; i < N; i++) {
+            float xv = xp[i*D+j], yv = yp[i];
+            if (_f32_is_nan(xv) || _f32_is_nan(yv)) continue;
+            int bx = (x_rng < 1e-12f) ? 0 : (int)((xv - x_min) / x_rng * n_bins);
+            int by = (y_rng < 1e-12f) ? 0 : (int)((yv - y_min) / y_rng * n_bins);
+            if (bx >= n_bins) bx = n_bins - 1;
+            if (by >= n_bins) by = n_bins - 1;
+            joint[bx * n_bins + by]++;
+            x_hist[bx]++;
+            y_hist[by]++;
+        }
+        double mi = 0.0;
+        for (int bx = 0; bx < n_bins; bx++) {
+            for (int by = 0; by < n_bins; by++) {
+                int pxy = joint[bx*n_bins+by];
+                if (pxy == 0) continue;
+                int px = x_hist[bx], py = y_hist[by];
+                if (px > 0 && py > 0)
+                    mi += (double)pxy / N * log((double)pxy * N / ((double)px * py));
+            }
+        }
+        op[j] = (float)mi;
+    }
+    free(joint); free(x_hist); free(y_hist);
+    if (Xc != X) tensor_free(Xc);
+    if (yc != y) tensor_free(yc);
+    return out;
+}
+
+/* 23.10  Spearman rank correlation: each column of X [N,D] vs y [N].
+ *        Returns [D] float tensor. */
+static float* _rank_vals_ptr = NULL; /* thread-unsafe helper for qsort comparator */
+static int _rank_idx_cmp(const void* a, const void* b) {
+    int ia = *(int*)a, ib = *(int*)b;
+    return (_rank_vals_ptr[ia] > _rank_vals_ptr[ib]) - (_rank_vals_ptr[ia] < _rank_vals_ptr[ib]);
+}
+static void _rank_array(float* vals, float* ranks, int n) {
+    int* idx = (int*)malloc((size_t)n * sizeof(int));
+    if (!idx) return;
+    for (int i = 0; i < n; i++) idx[i] = i;
+    _rank_vals_ptr = vals;
+    qsort(idx, (size_t)n, sizeof(int), _rank_idx_cmp);
+    int i = 0;
+    while (i < n) {
+        int j = i;
+        while (j < n - 1 && vals[idx[j]] == vals[idx[j+1]]) j++;
+        float avg_rank = ((float)i + (float)j) / 2.0f + 1.0f;
+        for (int k = i; k <= j; k++) ranks[idx[k]] = avg_rank;
+        i = j + 1;
+    }
+    free(idx);
+}
+
+Tensor* tensor_spearman_cols(Tensor* X, Tensor* y) {
+    if (!X || !y || X->ndim != 2) TENSOR_ERROR("tensor_spearman_cols: X must be [N,D]");
+    int N = X->shape[0], D = X->shape[1];
+    if ((int)y->total_size != N) TENSOR_ERROR("tensor_spearman_cols: y length mismatch");
+    Tensor* Xc = tensor_is_contiguous(X) ? X : tensor_copy(X);
+    Tensor* yc = tensor_is_contiguous(y) ? y : tensor_copy(y);
+    Tensor* out = tensor_zeros(1, (int[]){D});
+    if (!out) { if (Xc!=X) tensor_free(Xc); if (yc!=y) tensor_free(yc); TENSOR_ERROR("OOM"); }
+    float* xp = F32(Xc), *yp = F32(yc), *op = F32(out);
+    float* x_buf = (float*)malloc((size_t)N * sizeof(float));
+    float* x_rank = (float*)malloc((size_t)N * sizeof(float));
+    float* y_rank = (float*)malloc((size_t)N * sizeof(float));
+    if (!x_buf || !x_rank || !y_rank) {
+        free(x_buf); free(x_rank); free(y_rank);
+        if (Xc!=X) tensor_free(Xc); if (yc!=y) tensor_free(yc); tensor_free(out);
+        TENSOR_ERROR("OOM");
+    }
+    _rank_array(yp, y_rank, N);
+    for (int j = 0; j < D; j++) {
+        for (int i = 0; i < N; i++) x_buf[i] = xp[i*D+j];
+        _rank_array(x_buf, x_rank, N);
+        double sx=0, sy=0, sxy=0, sx2=0, sy2=0;
+        for (int i = 0; i < N; i++) {
+            double rx = x_rank[i], ry = y_rank[i];
+            sx += rx; sy += ry; sxy += rx*ry; sx2 += rx*rx; sy2 += ry*ry;
+        }
+        double num = N*sxy - sx*sy;
+        double den = sqrt((N*sx2 - sx*sx) * (N*sy2 - sy*sy));
+        op[j] = (den < 1e-12) ? 0.0f : (float)(num/den);
+    }
+    free(x_buf); free(x_rank); free(y_rank);
+    if (Xc != X) tensor_free(Xc);
+    if (yc != y) tensor_free(yc);
+    return out;
+}
+
+/* 23.11  Class imbalance ratio: max_class_count / min_class_count.
+ *        y must be integer-valued float (class labels). */
+float tensor_class_imbalance_ratio(Tensor* y) {
+    if (!y || y->total_size == 0) return 1.0f;
+    Tensor* binned = tensor_bincount(y);
+    if (!binned) return 1.0f;
+    float mn = tensor_min(binned), mx = tensor_max(binned);
+    tensor_free(binned);
+    return (mn < 1.0f) ? mx : mx / mn;
+}
+
+/* 23.12  Low-variance feature mask: returns [D] bool tensor (1 = keep, 0 = drop).
+ *        threshold: minimum variance to keep. */
+Tensor* tensor_variance_threshold_mask(Tensor* X, float threshold) {
+    if (!X || X->ndim != 2) TENSOR_ERROR("tensor_variance_threshold_mask: X must be [N,D]");
+    int N = X->shape[0], D = X->shape[1];
+    Tensor* Xc = tensor_is_contiguous(X) ? X : tensor_copy(X);
+    Tensor* out = tensor_zeros(1, (int[]){D});
+    if (!out) { if (Xc!=X) tensor_free(Xc); TENSOR_ERROR("OOM"); }
+    float* xp = F32(Xc), *op = F32(out);
+    for (int j = 0; j < D; j++) {
+        double s = 0.0, s2 = 0.0; int cnt = 0;
+        for (int i = 0; i < N; i++) {
+            float v = xp[i*D+j];
+            if (!_f32_is_nan(v)) { s += v; s2 += (double)v*v; cnt++; }
+        }
+        double var = (cnt > 1) ? s2/cnt - (s/cnt)*(s/cnt) : 0.0;
+        op[j] = (var >= threshold) ? 1.0f : 0.0f;
+    }
+    if (Xc != X) tensor_free(Xc);
+    return out;
+}
+
+/* 23.13  Redundancy clustering: returns [D] int tensor of cluster ids based on
+ *        absolute correlation threshold.  Features with |r| > threshold are
+ *        grouped into the same cluster (greedy single-linkage). */
+Tensor* tensor_redundancy_clusters(Tensor* X, float threshold) {
+    if (!X || X->ndim != 2) TENSOR_ERROR("tensor_redundancy_clusters: X must be [N,D]");
+    int D = X->shape[1];
+    Tensor* corr = tensor_correlation_matrix(X);
+    if (!corr) TENSOR_ERROR("tensor_redundancy_clusters: corr failed");
+    Tensor* out = tensor_create_dtype(1, (int[]){D}, DTYPE_INT32);
+    if (!out) { tensor_free(corr); TENSOR_ERROR("OOM"); }
+    int* op = (int*)out->data;
+    float* cp = F32(corr);
+    for (int j = 0; j < D; j++) op[j] = j; /* initial: each feature is its own cluster */
+    for (int j = 0; j < D; j++) {
+        for (int k = j+1; k < D; k++) {
+            if (fabsf(cp[j*D+k]) >= threshold) {
+                /* union: assign k's cluster to j's */
+                int old_id = op[k], new_id = op[j];
+                if (old_id != new_id)
+                    for (int m = 0; m < D; m++) if (op[m] == old_id) op[m] = new_id;
+            }
+        }
+    }
+    /* normalize cluster ids to 0..n_clusters-1 */
+    int remap[4096]; memset(remap, -1, sizeof(remap));
+    int next_id = 0;
+    for (int j = 0; j < D; j++) {
+        int cid = op[j];
+        if (cid < 4096) {
+            if (remap[cid] < 0) remap[cid] = next_id++;
+            op[j] = remap[cid];
+        }
+    }
+    tensor_free(corr);
+    return out;
+}
+
+/* 23.14  Nonlinearity score: correlation ratio eta^2 between numeric X column and target.
+ *        Measures how well target variance is explained by feature-bin means.
+ *        Returns [D] float tensor with eta^2 per feature. */
+Tensor* tensor_nonlinearity_score(Tensor* X, Tensor* y, int n_bins) {
+    if (!X || !y || X->ndim != 2) TENSOR_ERROR("tensor_nonlinearity_score: X must be [N,D]");
+    int N = X->shape[0], D = X->shape[1];
+    if ((int)y->total_size != N) TENSOR_ERROR("tensor_nonlinearity_score: y length mismatch");
+    if (n_bins < 2) n_bins = 10;
+    Tensor* Xc = tensor_is_contiguous(X) ? X : tensor_copy(X);
+    Tensor* yc = tensor_is_contiguous(y) ? y : tensor_copy(y);
+    Tensor* out = tensor_zeros(1, (int[]){D});
+    if (!out) { if (Xc!=X) tensor_free(Xc); if (yc!=y) tensor_free(yc); TENSOR_ERROR("OOM"); }
+    float* xp = F32(Xc), *yp = F32(yc), *op = F32(out);
+    double y_mean = 0.0, y_ss = 0.0;
+    for (int i = 0; i < N; i++) y_mean += yp[i];
+    y_mean /= N;
+    for (int i = 0; i < N; i++) y_ss += (yp[i]-y_mean)*(yp[i]-y_mean);
+    if (y_ss < 1e-12) { if (Xc!=X) tensor_free(Xc); if (yc!=y) tensor_free(yc); return out; }
+    double* bin_sum = (double*)malloc((size_t)n_bins * sizeof(double));
+    int*    bin_cnt = (int*)   malloc((size_t)n_bins * sizeof(int));
+    if (!bin_sum || !bin_cnt) {
+        free(bin_sum); free(bin_cnt);
+        if (Xc!=X) tensor_free(Xc); if (yc!=y) tensor_free(yc); tensor_free(out);
+        TENSOR_ERROR("OOM");
+    }
+    for (int j = 0; j < D; j++) {
+        float x_mn = xp[j], x_mx = x_mn;
+        for (int i = 0; i < N; i++) { float v=xp[i*D+j]; if(v<x_mn)x_mn=v; if(v>x_mx)x_mx=v; }
+        float x_rng = x_mx - x_mn;
+        memset(bin_sum, 0, (size_t)n_bins * sizeof(double));
+        memset(bin_cnt, 0, (size_t)n_bins * sizeof(int));
+        for (int i = 0; i < N; i++) {
+            int b = (x_rng < 1e-12f) ? 0 : (int)((xp[i*D+j]-x_mn)/x_rng*n_bins);
+            if (b >= n_bins) b = n_bins-1;
+            bin_sum[b] += yp[i]; bin_cnt[b]++;
+        }
+        double between_ss = 0.0;
+        for (int b = 0; b < n_bins; b++) {
+            if (bin_cnt[b] == 0) continue;
+            double bm = bin_sum[b] / bin_cnt[b];
+            between_ss += bin_cnt[b] * (bm - y_mean) * (bm - y_mean);
+        }
+        op[j] = (float)(between_ss / y_ss);
+    }
+    free(bin_sum); free(bin_cnt);
+    if (Xc != X) tensor_free(Xc);
+    if (yc != y) tensor_free(yc);
+    return out;
+}
+
+/* ============================================================================
+ * 24. HPC ESTIMATOR KERNELS
+ * ========================================================================== */
+
+/* 24.1  One-hot encoding: [N] float32 indices → [N,K] float32.
+ * OpenMP parallel over N; zero intermediate allocation.                     */
+Tensor* tensor_onehot(Tensor* indices, int K) {
+    if (!indices || K < 1) { tensor_set_error("tensor_onehot: invalid args"); return NULL; }
+    int N = (int)indices->total_size;
+    int shape[2] = {N, K};
+    Tensor* out = tensor_create(2, shape);   /* zero-initialized */
+    if (!out) return NULL;
+    float* ip = F32(indices);
+    float* op = F32(out);
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < N; i++) {
+        int cls = (int)ip[i];
+        if (cls >= 0 && cls < K) op[(size_t)i * K + cls] = 1.0f;
+    }
+    return out;
+}
+
+/* 24.2  KNN majority vote: [N,k] float32 label indices → [N] float32 class.
+ * Per-row bincount + argmax. alloca scratch; safe when num_classes ≤ 4096. */
+Tensor* tensor_knn_vote(Tensor* kLabels, int num_classes) {
+    if (!kLabels || kLabels->ndim != 2 || num_classes < 1) {
+        tensor_set_error("tensor_knn_vote: invalid args"); return NULL;
+    }
+    int N = kLabels->shape[0], k = kLabels->shape[1];
+    Tensor* out = tensor_create(1, &N);
+    if (!out) return NULL;
+    float* lp = F32(kLabels);
+    float* op = F32(out);
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < N; i++) {
+        int* counts = (int*)alloca((size_t)num_classes * sizeof(int));
+        memset(counts, 0, (size_t)num_classes * sizeof(int));
+        const float* row = lp + (size_t)i * k;
+        for (int j = 0; j < k; j++) {
+            int cls = (int)row[j];
+            if (cls >= 0 && cls < num_classes) counts[cls]++;
+        }
+        int best = 0, best_cnt = counts[0];
+        for (int c = 1; c < num_classes; c++)
+            if (counts[c] > best_cnt) { best_cnt = counts[c]; best = c; }
+        op[i] = (float)best;
+    }
+    return out;
+}
+
+/* 24.3  KMeans assignment: X[N,D] × centroids[K,D] → [N] cluster indices.
+ * AVX2 fused distance; OpenMP parallel over N.                              */
+Tensor* tensor_kmeans_assign(Tensor* X, Tensor* centroids) {
+    if (!X || !centroids || X->ndim != 2 || centroids->ndim != 2 ||
+        X->shape[1] != centroids->shape[1]) {
+        tensor_set_error("tensor_kmeans_assign: shape mismatch"); return NULL;
+    }
+    int N = X->shape[0], D = X->shape[1], K = centroids->shape[0];
+    Tensor* out = tensor_create(1, &N);
+    if (!out) return NULL;
+    const float* xp = F32(X);
+    const float* cp = F32(centroids);
+    float*       op = F32(out);
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < N; i++) {
+        const float* xi = xp + (size_t)i * D;
+        float best_dist = FLT_MAX;
+        int   best_k    = 0;
+        for (int c = 0; c < K; c++) {
+            const float* ck = cp + (size_t)c * D;
+            float dist = 0.0f;
+            int d = 0;
+#ifdef __AVX2__
+            __m256 vsum = _mm256_setzero_ps();
+            for (; d <= D - 8; d += 8) {
+                __m256 diff = _mm256_sub_ps(_mm256_loadu_ps(xi + d),
+                                            _mm256_loadu_ps(ck + d));
+                vsum = _mm256_fmadd_ps(diff, diff, vsum);
+            }
+            __m128 lo = _mm256_castps256_ps128(vsum);
+            __m128 hi = _mm256_extractf128_ps(vsum, 1);
+            lo = _mm_add_ps(lo, hi);
+            lo = _mm_hadd_ps(lo, lo);
+            lo = _mm_hadd_ps(lo, lo);
+            dist = _mm_cvtss_f32(lo);
+#endif
+            for (; d < D; d++) { float df = xi[d] - ck[d]; dist += df * df; }
+            if (dist < best_dist) { best_dist = dist; best_k = c; }
+        }
+        op[i] = (float)best_k;
+    }
+    return out;
+}
+
+/* 24.4  KMeans centroid update: X[N,D] × assignments[N] → [K,D].
+ * Serial accumulate (race-free); AVX2 horizontal add per sample.
+ * Empty clusters retain the corresponding row from old_centroids.           */
+Tensor* tensor_kmeans_centroids(Tensor* X, Tensor* assignments, int K,
+                                 Tensor* old_centroids) {
+    if (!X || !assignments || K < 1 || X->ndim != 2) {
+        tensor_set_error("tensor_kmeans_centroids: invalid args"); return NULL;
+    }
+    int N = X->shape[0], D = X->shape[1];
+    int shape[2] = {K, D};
+    Tensor* out = tensor_create(2, shape);   /* zero-initialized */
+    if (!out) return NULL;
+    const float* xp = F32(X);
+    const float* ap = F32(assignments);
+    float*       op = F32(out);
+    int* cnt = (int*)calloc((size_t)K, sizeof(int));
+    if (!cnt) { tensor_free(out); tensor_set_error("tensor_kmeans_centroids: OOM"); return NULL; }
+
+    /* Accumulate — serial to avoid atomic overhead on small K */
+    for (int i = 0; i < N; i++) {
+        int c = (int)ap[i];
+        if (c < 0 || c >= K) continue;
+        cnt[c]++;
+        float*       ck = op + (size_t)c * D;
+        const float* xi = xp + (size_t)i * D;
+        int d = 0;
+#ifdef __AVX2__
+        for (; d <= D - 8; d += 8)
+            _mm256_storeu_ps(ck + d, _mm256_add_ps(
+                _mm256_loadu_ps(ck + d), _mm256_loadu_ps(xi + d)));
+#endif
+        for (; d < D; d++) ck[d] += xi[d];
+    }
+
+    const float* op_old = old_centroids ? F32(old_centroids) : NULL;
+    for (int c = 0; c < K; c++) {
+        float* ck = op + (size_t)c * D;
+        if (cnt[c] == 0) {
+            if (op_old) memcpy(ck, op_old + (size_t)c * D, (size_t)D * sizeof(float));
+        } else {
+            float inv = 1.0f / cnt[c];
+            int d = 0;
+#ifdef __AVX2__
+            __m256 vinv = _mm256_set1_ps(inv);
+            for (; d <= D - 8; d += 8)
+                _mm256_storeu_ps(ck + d, _mm256_mul_ps(_mm256_loadu_ps(ck + d), vinv));
+#endif
+            for (; d < D; d++) ck[d] *= inv;
+        }
+    }
+    free(cnt);
+    return out;
+}
+
+/* 24.5  Closed-form Ridge Regression: W = (X^T X + λI)^{-1} X^T y.
+ * Uses symmetric positive-definite LAPACKE solver. Returns [D,1].          */
+Tensor* tensor_ridge_solve(Tensor* X, Tensor* y, float lambda) {
+    if (!X || !y || X->ndim != 2) {
+        tensor_set_error("tensor_ridge_solve: X must be [N,D]"); return NULL;
+    }
+    int D = X->shape[1];
+
+    /* XtX = X^T @ X  [D,D] */
+    Tensor* XtX = tensor_matmul_ex(X, X, true, false);
+    if (!XtX) return NULL;
+    float* p = F32(XtX);
+    for (int i = 0; i < D; i++) p[(size_t)i * D + i] += lambda;
+
+    /* Xty = X^T @ y  [D,1] */
+    int y_owned = (y->ndim == 1);
+    Tensor* y2  = y_owned ? tensor_expand_dims(y, 1) : y;
+    Tensor* Xty = tensor_matmul_ex(X, y2, true, false);
+    if (y_owned) tensor_free(y2);
+    if (!Xty)  { tensor_free(XtX); return NULL; }
+
+    Tensor* w = tensor_solve(XtX, Xty);
+    tensor_free(XtX);
+    tensor_free(Xty);
+    return w;   /* [D,1] */
+}
+
+/* 24.6  Copy one tree's flat node arrays into a pre-allocated ensemble buffer.
+ * dest: [T * max_nodes] tensor (feats/thresh/lefts/rights).
+ * tree_idx: 0-based tree index. max_nodes: nodes per tree.
+ * src: [max_nodes] per-tree scratch tensor.
+ * Replaces a PHP for-loop of max_nodes FFI float reads with a single memcpy. */
+void tensor_gbdt_collect_tree(Tensor* dest, int tree_idx, int max_nodes, Tensor* src) {
+    if (!dest || !src || max_nodes < 1) return;
+    float* dp = F32(dest) + (size_t)tree_idx * max_nodes;
+    memcpy(dp, F32(src), (size_t)max_nodes * sizeof(float));
+}
+
+/* 24.7  Isolation Forest batch scoring (all-C, OpenMP parallel over N).
+ * X:          [N,D]            float32 test samples
+ * feats_flat: [T * max_nodes]  float32 (feature index; -1 = leaf/sentinel)
+ * thresh_flat:[T * max_nodes]  float32 (split threshold)
+ * lefts_flat: [T * max_nodes]  float32 (left child index; -1 = leaf)
+ * rights_flat:[T * max_nodes]  float32 (right child index)
+ * lsize_flat: [T * max_nodes]  float32 (leaf sample size for c() correction)
+ * tree_sizes: [T]              float32 (nodes used per tree)
+ * c_norm:     c(sample_size)   normalising constant
+ * Returns: [N] float32 anomaly scores in [0,1].                             */
+Tensor* tensor_iforest_score(Tensor* X,
+                              Tensor* feats_flat,  Tensor* thresh_flat,
+                              Tensor* lefts_flat,  Tensor* rights_flat,
+                              Tensor* lsize_flat,  Tensor* tree_sizes,
+                              float c_norm) {
+    if (!X || X->ndim != 2 || !feats_flat) {
+        tensor_set_error("tensor_iforest_score: invalid args"); return NULL;
+    }
+    int N = X->shape[0], D = X->shape[1];
+    int T = (int)tree_sizes->total_size;
+    int max_nodes = (T > 0) ? (int)(feats_flat->total_size / T) : 1;
+    if (c_norm <= 0.0f) c_norm = 1.0f;
+
+    Tensor* out = tensor_create(1, &N);
+    if (!out) return NULL;
+    const float* xp  = F32(X);
+    const float* fp  = F32(feats_flat);
+    const float* tp  = F32(thresh_flat);
+    const float* lp  = F32(lefts_flat);
+    const float* rp  = F32(rights_flat);
+    const float* szp = F32(lsize_flat);
+    const float* tsp = F32(tree_sizes);
+    float*       op  = F32(out);
+
+#define _IF_C(n) ((n) <= 1 ? 0.0f : (n) == 2 ? 1.0f : \
+    (2.0f * ((float)log((float)((n)-1)) + 0.5772156649f) - 2.0f * (float)((n)-1) / (float)(n)))
+
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < N; i++) {
+        const float* xi = xp + (size_t)i * D;
+        float path_sum = 0.0f;
+        for (int t = 0; t < T; t++) {
+            int used = (int)tsp[t];
+            if (used <= 0) continue;
+            const float* tf  = fp  + (size_t)t * max_nodes;
+            const float* tt  = tp  + (size_t)t * max_nodes;
+            const float* tl  = lp  + (size_t)t * max_nodes;
+            const float* tr  = rp  + (size_t)t * max_nodes;
+            const float* tsz = szp + (size_t)t * max_nodes;
+            int node = 0;
+            float length = 0.0f;
+            while (node >= 0 && node < used) {
+                int feat = (int)tf[node];
+                if (feat < 0) break;                          /* leaf sentinel */
+                float val = (feat < D) ? xi[feat] : 0.0f;
+                node = (val < tt[node]) ? (int)tl[node] : (int)tr[node];
+                length += 1.0f;
+            }
+            if (node >= 0 && node < max_nodes)
+                length += _IF_C((int)szp[(size_t)t * max_nodes + (node >= 0 ? node : 0)]);
+            path_sum += length;
+        }
+        float avg = (T > 0) ? path_sum / T : 0.0f;
+        op[i] = powf(2.0f, -avg / c_norm);
+    }
+#undef _IF_C
+    return out;
+}
+
+// ============================================================================
+// 25. HPC ESTIMATOR KERNELS — BATCH 2
+// ============================================================================
+
+/* 25.1  Bootstrap sampling with replacement: returns [N] float32 indices in [0, N-1].
+ *       Replaces a PHP for-loop of N mt_rand() calls.                        */
+Tensor* tensor_bootstrap_indices(int N) {
+    if (N < 1) { tensor_set_error("tensor_bootstrap_indices: N < 1"); return NULL; }
+    Tensor* out = tensor_create(1, &N);
+    if (!out) return NULL;
+    float* op = F32(out);
+#pragma omp parallel
+    {
+        unsigned seed = (unsigned)(omp_get_thread_num() * 1234567u + 98765u + (unsigned)N);
+#pragma omp for schedule(static)
+        for (int i = 0; i < N; i++) {
+            op[i] = (float)(rand_r(&seed) % N);
+        }
+    }
+    return out;
+}
+
+/* 25.2  Majority-vote over T tree predictions.
+ *       votes: [N, T] float32 integer class labels.
+ *       Returns [N] float32 majority-class label.                            */
+Tensor* tensor_matrix_vote(Tensor* votes, int num_classes) {
+    if (!votes || votes->ndim != 2 || num_classes < 1) {
+        tensor_set_error("tensor_matrix_vote: invalid args"); return NULL;
+    }
+    int N = votes->shape[0], T = votes->shape[1];
+    Tensor* out = tensor_create(1, &N);
+    if (!out) return NULL;
+    const float* vp = F32(votes);
+    float*       op = F32(out);
+
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < N; i++) {
+        /* stack-allocate count buffer: safe for num_classes ≤ 512 */
+        int  stack_cnt[512];
+        int* cnt = (num_classes <= 512) ? stack_cnt : (int*)malloc(num_classes * sizeof(int));
+        if (!cnt) { op[i] = 0.0f; continue; }
+        memset(cnt, 0, num_classes * sizeof(int));
+        const float* row = vp + (size_t)i * T;
+        for (int t = 0; t < T; t++) {
+            int c = (int)row[t];
+            if (c >= 0 && c < num_classes) cnt[c]++;
+        }
+        int best = 0, bestC = -1;
+        for (int c = 0; c < num_classes; c++) {
+            if (cnt[c] > bestC) { bestC = cnt[c]; best = c; }
+        }
+        op[i] = (float)best;
+        if (num_classes > 512) free(cnt);
+    }
+    return out;
+}
+
+/* 25.3  All-C CART split search.
+ *       X: [N, D], y: [N] float32 integer labels, feature_indices: [F] float32.
+ *       Evaluates num_thresholds uniformly-spaced interior points per feature.
+ *       Returns [N + 2] float32:
+ *         [0]    = best feature index (-1 if no valid split found)
+ *         [1]    = best threshold
+ *         [2..N+1] = left mask (1.0 = left child, 0.0 = right child)         */
+Tensor* tensor_cart_find_split(Tensor* X, Tensor* y,
+                                Tensor* feature_indices, int num_thresholds) {
+    if (!X || X->ndim != 2 || !y || !feature_indices || num_thresholds < 1) {
+        tensor_set_error("tensor_cart_find_split: invalid args"); return NULL;
+    }
+    int N = X->shape[0], D = X->shape[1];
+    int F = (int)feature_indices->total_size;
+    const float* xp = F32(X);
+    const float* yp = F32(y);
+    const float* fp = F32(feature_indices);
+
+    /* Infer num_classes from max label */
+    int num_classes = 0;
+    for (int i = 0; i < N; i++) {
+        int c = (int)yp[i];
+        if (c + 1 > num_classes) num_classes = c + 1;
+    }
+
+    int sz = N + 2;
+    Tensor* out = tensor_create(1, &sz);
+    if (!out) return NULL;
+    float* op = F32(out);
+
+    if (num_classes < 2) {
+        op[0] = -1.0f; op[1] = 0.0f;
+        memset(op + 2, 0, (size_t)N * sizeof(float));
+        return out;
+    }
+
+    float* best_mask = (float*)malloc((size_t)N * sizeof(float));
+    float* mask_buf  = (float*)malloc((size_t)N * sizeof(float));
+    int*   cnt       = (int*)malloc((size_t)num_classes * 2 * sizeof(int));
+    if (!best_mask || !mask_buf || !cnt) {
+        free(best_mask); free(mask_buf); free(cnt);
+        tensor_set_error("tensor_cart_find_split: OOM"); tensor_free(out); return NULL;
+    }
+
+    float best_gini  = (float)INFINITY;
+    int   best_feat  = -1;
+    float best_thresh = 0.0f;
+
+    for (int fi = 0; fi < F; fi++) {
+        int feat = (int)fp[fi];
+        if (feat < 0 || feat >= D) continue;
+
+        float fmin = (float)INFINITY, fmax = -(float)INFINITY;
+        for (int i = 0; i < N; i++) {
+            float v = xp[(size_t)i * D + feat];
+            if (v < fmin) fmin = v;
+            if (v > fmax) fmax = v;
+        }
+        if (fmin >= fmax) continue;
+
+        float step = (fmax - fmin) / (float)(num_thresholds + 1);
+
+        for (int t = 1; t <= num_thresholds; t++) {
+            float thresh = fmin + step * t;
+            memset(cnt, 0, (size_t)num_classes * 2 * sizeof(int));
+            int nLeft = 0, nRight = 0;
+
+            for (int i = 0; i < N; i++) {
+                int c = (int)yp[i];
+                if (xp[(size_t)i * D + feat] < thresh) {
+                    mask_buf[i] = 1.0f; nLeft++;
+                    if (c >= 0 && c < num_classes) cnt[c]++;
+                } else {
+                    mask_buf[i] = 0.0f; nRight++;
+                    if (c >= 0 && c < num_classes) cnt[num_classes + c]++;
+                }
+            }
+            if (nLeft == 0 || nRight == 0) continue;
+
+            float ssL = 0.0f, ssR = 0.0f;
+            float invL = 1.0f / nLeft, invR = 1.0f / nRight;
+            for (int c = 0; c < num_classes; c++) {
+                float pL = cnt[c] * invL, pR = cnt[num_classes + c] * invR;
+                ssL += pL * pL; ssR += pR * pR;
+            }
+            float gini = ((float)nLeft / N) * (1.0f - ssL)
+                       + ((float)nRight / N) * (1.0f - ssR);
+
+            if (gini < best_gini) {
+                best_gini   = gini;
+                best_feat   = feat;
+                best_thresh = thresh;
+                memcpy(best_mask, mask_buf, (size_t)N * sizeof(float));
+            }
+        }
+    }
+
+    free(mask_buf); free(cnt);
+    op[0] = (float)best_feat;
+    op[1] = best_thresh;
+    if (best_feat >= 0) {
+        memcpy(op + 2, best_mask, (size_t)N * sizeof(float));
+    } else {
+        memset(op + 2, 0, (size_t)N * sizeof(float));
+    }
+    free(best_mask);
+    return out;
+}
+
+/* 25.4  Fused (Elastic)Net mini-batch SGD step.
+ *       Updates W [D,1] and bias [1] in-place.
+ *       l1_ratio = 1.0 → Lasso, 0.0 → Ridge SGD, 0.5 → ElasticNet.
+ *       Uses BLAS sgemv for the two dominant O(N*D) products.                */
+void tensor_lasso_sgd_step(Tensor* X, Tensor* y, Tensor* W, Tensor* bias_t,
+                            float alpha, float lr, float l1_ratio) {
+    if (!X || X->ndim != 2 || !y || !W || !bias_t) return;
+    int N = X->shape[0], D = X->shape[1];
+    const float* xp = F32(X);
+    const float* yp = F32(y);
+    float*       wp = F32(W);
+    float*       bp = F32(bias_t);
+    float inv_n = 1.0f / (float)N;
+
+    /* z[i] = X[i,:] · W + b − y[i]  (residuals)  */
+    float* z = (float*)malloc((size_t)N * sizeof(float));
+    if (!z) return;
+    cblas_sgemv(CblasRowMajor, CblasNoTrans, N, D, 1.0f, xp, D, wp, 1, 0.0f, z, 1);
+    for (int i = 0; i < N; i++) z[i] += bp[0] - yp[i];
+
+    /* dW = X^T · z / N  */
+    float* dw = (float*)malloc((size_t)D * sizeof(float));
+    if (!dw) { free(z); return; }
+    cblas_sgemv(CblasRowMajor, CblasTrans, N, D, inv_n, xp, D, z, 1, 0.0f, dw, 1);
+
+    /* Apply penalties and update W */
+    for (int d = 0; d < D; d++) {
+        float g = dw[d];
+        if (l1_ratio > 0.0f) g += alpha * l1_ratio * (wp[d] >= 0.0f ? 1.0f : -1.0f);
+        if (l1_ratio < 1.0f) g += alpha * (1.0f - l1_ratio) * wp[d];
+        wp[d] -= lr * g;
+    }
+    /* Bias gradient = mean(z) */
+    float db = 0.0f;
+    for (int i = 0; i < N; i++) db += z[i];
+    bp[0] -= lr * db * inv_n;
+
+    free(z); free(dw);
+}
+
+/* 25.5  Fused Gaussian Naive Bayes log-likelihood.
+ *       X: [N, D]  means_KD: [K, D]  vars_KD: [K, D]
+ *       log_norms_K: [K]  where log_norms[k] = log_prior[k] − 0.5·sum(log(2π·var[k,:]))
+ *       Out[i, k] = log_norms[k] − 0.5 · Σ_d (X[i,d]−means[k,d])² / vars[k,d]
+ *       Returns [N, K].                                                       */
+Tensor* tensor_gnb_log_likelihood(Tensor* X, Tensor* means_KD,
+                                   Tensor* vars_KD,  Tensor* log_norms_K) {
+    if (!X || X->ndim != 2 || !means_KD || means_KD->ndim != 2 ||
+        !vars_KD || !log_norms_K) {
+        tensor_set_error("tensor_gnb_log_likelihood: invalid args"); return NULL;
+    }
+    int N = X->shape[0], D = X->shape[1];
+    int K = means_KD->shape[0];
+    int out_shape[2] = {N, K};
+    Tensor* out = tensor_create(2, out_shape);
+    if (!out) return NULL;
+
+    const float* xp  = F32(X);
+    const float* mp  = F32(means_KD);
+    const float* vp  = F32(vars_KD);
+    const float* lnp = F32(log_norms_K);
+    float*       op  = F32(out);
+
+#pragma omp parallel for schedule(static) collapse(2)
+    for (int i = 0; i < N; i++) {
+        for (int k = 0; k < K; k++) {
+            const float* xi = xp + (size_t)i * D;
+            const float* mk = mp + (size_t)k * D;
+            const float* vk = vp + (size_t)k * D;
+            float sum = 0.0f;
+            int d = 0;
+#ifdef __AVX2__
+            for (; d <= D - 8; d += 8) {
+                __m256 xv   = _mm256_loadu_ps(xi + d);
+                __m256 mv   = _mm256_loadu_ps(mk + d);
+                __m256 vv   = _mm256_loadu_ps(vk + d);
+                __m256 diff = _mm256_sub_ps(xv, mv);
+                __m256 sq   = _mm256_mul_ps(diff, diff);
+                __m256 res  = _mm256_div_ps(sq, vv);
+                __m128 lo   = _mm256_extractf128_ps(res, 0);
+                __m128 hi   = _mm256_extractf128_ps(res, 1);
+                __m128 s    = _mm_add_ps(lo, hi);
+                s = _mm_hadd_ps(s, s);
+                s = _mm_hadd_ps(s, s);
+                sum += _mm_cvtss_f32(s);
+            }
+#endif
+            for (; d < D; d++) {
+                float df = xi[d] - mk[d];
+                sum += (df * df) / vk[d];
+            }
+            op[(size_t)i * K + k] = lnp[k] - 0.5f * sum;
+        }
+    }
+    return out;
+}
+
+/* 25.6  Gather: out[i] = table[floor(indices[i])].
+ *       Replaces PHP array_map label-remapping loops.
+ *       indices: [N] float32, table: [K] float32.
+ *       Returns [N].                                                          */
+Tensor* tensor_gather_indices(Tensor* indices, Tensor* table) {
+    if (!indices || !table) {
+        tensor_set_error("tensor_gather_indices: null arg"); return NULL;
+    }
+    int N = (int)indices->total_size;
+    int K = (int)table->total_size;
+    Tensor* out = tensor_create(1, &N);
+    if (!out) return NULL;
+    const float* ip = F32(indices);
+    const float* tp = F32(table);
+    float*       op = F32(out);
+
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < N; i++) {
+        int idx = (int)ip[i];
+        op[i] = (idx >= 0 && idx < K) ? tp[idx] : 0.0f;
+    }
+    return out;
 }

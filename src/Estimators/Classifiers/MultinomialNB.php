@@ -96,16 +96,7 @@ final class MultinomialNB implements Learner, Probabilistic, Persistable
 
     public function predict(Dataset $dataset): Tensor
     {
-        // proba() returns [N, K] log-probabilities; pick the class with the highest score per row.
-        $logProbs = $this->proba($dataset)->toFlatArray();
-        $n = $dataset->numRows();
-        $k = \count($this->classes);
-        $preds = [];
-        for ($i = 0; $i < $n; $i++) {
-            $row   = \array_slice($logProbs, $i * $k, $k);
-            $preds[] = (float) \array_search(\max($row), $row);
-        }
-        return Tensor::fromArray($preds);
+        return $this->proba($dataset)->argmaxAxis(1);
     }
 
     public function trained(): bool

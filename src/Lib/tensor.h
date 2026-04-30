@@ -498,4 +498,74 @@ Tensor* tensor_yj_fit(Tensor* X);
 /* Apply Yeo-Johnson column-wise [N,D] → [N,D] */
 Tensor* tensor_yj_transform(Tensor* X, Tensor* lambdas);
 
+/* 22.8  NaN utilities */
+/* Replace NaN/Inf values in a FLOAT32 tensor with fill_val (in-place). */
+void tensor_fill_nan(Tensor* t, float fill_val);
+
+/* 22.9  Pearson correlation (batch, C-level) */
+/* Compute Pearson r between each column of X [N,D] and vector y [N].
+ * Returns [D] FLOAT32; NaN pairs are skipped (pairwise-complete). */
+Tensor* tensor_pearson_cols(Tensor* X, Tensor* y);
+
+/* ============================================================================
+ * 23. ADVANCED EDA STATISTICAL FUNCTIONS
+ * ========================================================================== */
+float   tensor_percentile(Tensor* A, float p);
+float   tensor_iqr(Tensor* A);
+float   tensor_mad(Tensor* A);
+float   tensor_skewness(Tensor* A);
+float   tensor_kurtosis(Tensor* A);
+float   tensor_entropy_binned(Tensor* A, int n_bins);
+void    tensor_col_stats(Tensor* X, int col, float* out); /* out[10]: mean,std,skew,kurt,median,p25,p75,iqr,mad,nan_ratio */
+Tensor* tensor_correlation_matrix(Tensor* X);
+Tensor* tensor_mutual_info_cols(Tensor* X, Tensor* y, int n_bins);
+Tensor* tensor_spearman_cols(Tensor* X, Tensor* y);
+float   tensor_class_imbalance_ratio(Tensor* y);
+Tensor* tensor_variance_threshold_mask(Tensor* X, float threshold);
+Tensor* tensor_redundancy_clusters(Tensor* X, float threshold);
+Tensor* tensor_nonlinearity_score(Tensor* X, Tensor* y, int n_bins);
+
+/* ============================================================================
+ * 24. HPC ESTIMATOR KERNELS
+ * ========================================================================== */
+
+/* 24.1  One-hot: [N] float32 class indices → [N,K] float32 one-hot matrix */
+Tensor* tensor_onehot(Tensor* indices, int K);
+
+/* 24.2  KNN majority vote: [N,k] float32 labels → [N] float32 predicted class */
+Tensor* tensor_knn_vote(Tensor* kLabels, int num_classes);
+
+/* 24.3  KMeans assignment: X[N,D] × centroids[K,D] → [N] float32 cluster indices */
+Tensor* tensor_kmeans_assign(Tensor* X, Tensor* centroids);
+
+/* 24.4  KMeans centroid update: X[N,D] × assignments[N] → [K,D] centroids.
+ *       Empty clusters retain the corresponding row from old_centroids (nullable). */
+Tensor* tensor_kmeans_centroids(Tensor* X, Tensor* assignments, int K,
+                                 Tensor* old_centroids);
+
+/* 24.5  Closed-form Ridge: W = (X^T X + λI)^{-1} X^T y → [D,1] weights */
+Tensor* tensor_ridge_solve(Tensor* X, Tensor* y, float lambda);
+
+/* 24.6  Copy per-tree scratch into flat ensemble buffer (replaces PHP buffer loop) */
+void tensor_gbdt_collect_tree(Tensor* dest, int tree_idx, int max_nodes, Tensor* src);
+
+/* 24.7  Isolation Forest batch scoring, fully parallel over N.
+ *       Returns [N] float32 anomaly scores in [0,1]. */
+Tensor* tensor_iforest_score(Tensor* X,
+                              Tensor* feats_flat,  Tensor* thresh_flat,
+                              Tensor* lefts_flat,  Tensor* rights_flat,
+                              Tensor* lsize_flat,  Tensor* tree_sizes,
+                              float c_norm);
+
+/* ── Section 25: HPC Estimator Kernels — Batch 2 ─────────────────────────── */
+Tensor* tensor_bootstrap_indices(int N);
+Tensor* tensor_matrix_vote(Tensor* votes, int num_classes);
+Tensor* tensor_cart_find_split(Tensor* X, Tensor* y,
+                                Tensor* feature_indices, int num_thresholds);
+void    tensor_lasso_sgd_step(Tensor* X, Tensor* y, Tensor* W, Tensor* bias_t,
+                               float alpha, float lr, float l1_ratio);
+Tensor* tensor_gnb_log_likelihood(Tensor* X, Tensor* means_KD,
+                                   Tensor* vars_KD, Tensor* log_norms_K);
+Tensor* tensor_gather_indices(Tensor* indices, Tensor* table);
+
 #endif // TENSOR_H

@@ -76,6 +76,11 @@ static char *_mmap_open(const char *filepath, size_t *out_size) {
 static inline void _mmap_close(char *data, size_t size) {
     if (data && data != MAP_FAILED) munmap(data, size);
 }
+/* Bit-level NaN check — immune to -ffast-math which breaks isnan()/isfinite() */
+static inline int _f32_is_nan(float x) {
+    uint32_t bits; memcpy(&bits, &x, sizeof(bits));
+    return (bits & 0x7FFFFFFFu) > 0x7F800000u;
+}
 
 /*
  * RFC‑4180 field reader.
@@ -503,7 +508,7 @@ DataFrame *df_drop_nans(const DataFrame *df) {
         keep[r] = true;
         for (size_t c = 0; c < df->n_cols && keep[r]; c++) {
             const DFColumn *col = &df->columns[c];
-            if      (col->dtype == DF_DTYPE_FLOAT32 && isnan(DF_COL_F32(col)[r])) keep[r] = false;
+            if      (col->dtype == DF_DTYPE_FLOAT32 && _f32_is_nan(DF_COL_F32(col)[r])) keep[r] = false;
             else if (col->dtype == DF_DTYPE_INT32   && DF_COL_I32(col)[r] == INT32_MIN) keep[r] = false;
             else if (col->dtype == DF_DTYPE_STRING  && DF_COL_I32(col)[r] < 0)      keep[r] = false;
         }
@@ -1974,9 +1979,9 @@ DataFrame *df_fill_null_f32(const DataFrame *df, int col_idx, float fill_val) {
         }
     }
     float *d = (float *)out->columns[col_idx].data;
-#pragma omp parallel for simd schedule(static)
+#pragma omp parallel for schedule(static)
     for (size_t r = 0; r < df->n_rows; r++)
-        if (d[r] != d[r]) d[r] = fill_val; /* NaN check */
+        if (_f32_is_nan(d[r])) d[r] = fill_val;
     return out;
 }
 
@@ -2175,4 +2180,187 @@ DataFrame *df_sample_rows(const DataFrame *df, size_t n, bool replace, uint64_t 
     }
     free(idx);
     return out;
+}
+
+/* ============================================================================
+ * Categorical Encoding — Target & Frequency
+ * ========================================================================== */
+
+/* ── Target Encoding ─────────────────────────────────────────────────────── *
+ * Fit: compute per-category smoothed mean using additive (James-Stein) formula:
+ *   TE(cat) = (n_i * mean_i + smoothing * global_mean) / (n_i + smoothing)
+ * Missing rows (cat_idx < 0) are excluded from statistics but receive global_mean.
+ * Returns [n_cats] FLOAT32 tensor of smoothed means.
+ * ========================================================================== */
+Tensor* df_target_encode_fit(const DataFrame* df, int col_idx,
+                              const Tensor* y, float smoothing)
+{
+    if (!df || col_idx < 0 || (size_t)col_idx >= df->n_cols)
+        DF_ERR("df_target_encode_fit: invalid col_idx");
+    const DFColumn* col = &df->columns[col_idx];
+    if (col->dtype != DF_DTYPE_STRING)
+        DF_ERR("df_target_encode_fit: column must be STRING");
+    if (!y || y->ndim < 1 || (int)y->total_size != (int)df->n_rows)
+        DF_ERR("df_target_encode_fit: y size mismatch");
+
+    int N       = (int)df->n_rows;
+    int n_cats  = col->n_categories;
+    const int32_t* cat_idx = DF_COL_I32(col);
+    const float*   yp      = (const float*)y->data;
+
+    /* Global mean over all non-missing rows */
+    double gsum = 0.0; int gcnt = 0;
+    for (int i = 0; i < N; i++)
+        if (cat_idx[i] >= 0) { gsum += yp[i]; gcnt++; }
+    float global_mean = gcnt > 0 ? (float)(gsum / gcnt) : 0.0f;
+
+    /* Per-category accumulation */
+    double* cat_sum   = (double*)calloc((size_t)n_cats, sizeof(double));
+    int*    cat_count = (int*)   calloc((size_t)n_cats, sizeof(int));
+    if (!cat_sum || !cat_count) {
+        free(cat_sum); free(cat_count);
+        DF_ERR("df_target_encode_fit: OOM accumulators");
+    }
+
+    for (int i = 0; i < N; i++) {
+        int c = cat_idx[i];
+        if (c >= 0 && c < n_cats) {
+            cat_sum[c]   += yp[i];
+            cat_count[c] += 1;
+        }
+    }
+
+    /* Smoothed means */
+    int shape = n_cats;
+    Tensor* out = tensor_zeros(1, &shape);
+    if (!out) { free(cat_sum); free(cat_count); DF_ERR("OOM"); }
+    float* op = (float*)out->data;
+
+    for (int c = 0; c < n_cats; c++) {
+        float cat_mean = cat_count[c] > 0 ? (float)(cat_sum[c] / cat_count[c]) : global_mean;
+        op[c] = ((float)cat_count[c] * cat_mean + smoothing * global_mean)
+                / ((float)cat_count[c] + smoothing);
+    }
+
+    free(cat_sum); free(cat_count);
+    return out;
+}
+
+/* ── Target Encoding — Transform ─────────────────────────────────────────── *
+ * Map each row's category index → its smoothed mean from the fit step.
+ * Missing rows (cat_idx < 0) receive global_mean.
+ * Returns [N] FLOAT32 tensor.
+ * ========================================================================== */
+Tensor* df_target_encode_transform(const DataFrame* df, int col_idx,
+                                    const Tensor* cat_means, float global_mean)
+{
+    if (!df || col_idx < 0 || (size_t)col_idx >= df->n_cols)
+        DF_ERR("df_target_encode_transform: invalid col_idx");
+    const DFColumn* col = &df->columns[col_idx];
+    if (col->dtype != DF_DTYPE_STRING)
+        DF_ERR("df_target_encode_transform: column must be STRING");
+    if (!cat_means || cat_means->ndim != 1)
+        DF_ERR("df_target_encode_transform: cat_means must be [n_cats]");
+
+    int N       = (int)df->n_rows;
+    int n_cats  = (int)cat_means->total_size;
+    const int32_t* cat_idx = DF_COL_I32(col);
+    const float*   mp      = (const float*)cat_means->data;
+
+    int shape = N;
+    Tensor* out = tensor_create_uninitialized(1, &shape, DTYPE_FLOAT32);
+    if (!out) DF_ERR("df_target_encode_transform: OOM");
+    float* op = (float*)out->data;
+
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < N; i++) {
+        int c = cat_idx[i];
+        op[i] = (c >= 0 && c < n_cats) ? mp[c] : global_mean;
+    }
+    return out;
+}
+
+/* ── Frequency Encoding — Fit ────────────────────────────────────────────── *
+ * Compute fraction-of-total for each category.
+ * Missing rows (cat_idx < 0) are excluded from total.
+ * Returns [n_cats] FLOAT32 tensor of frequencies.
+ * ========================================================================== */
+Tensor* df_freq_encode_fit(const DataFrame* df, int col_idx)
+{
+    if (!df || col_idx < 0 || (size_t)col_idx >= df->n_cols)
+        DF_ERR("df_freq_encode_fit: invalid col_idx");
+    const DFColumn* col = &df->columns[col_idx];
+    if (col->dtype != DF_DTYPE_STRING)
+        DF_ERR("df_freq_encode_fit: column must be STRING");
+
+    int N      = (int)df->n_rows;
+    int n_cats = col->n_categories;
+    const int32_t* cat_idx = DF_COL_I32(col);
+
+    int* counts = (int*)calloc((size_t)n_cats, sizeof(int));
+    if (!counts) DF_ERR("df_freq_encode_fit: OOM");
+
+    int total = 0;
+    for (int i = 0; i < N; i++) {
+        int c = cat_idx[i];
+        if (c >= 0 && c < n_cats) { counts[c]++; total++; }
+    }
+
+    int shape = n_cats;
+    Tensor* out = tensor_zeros(1, &shape);
+    if (!out) { free(counts); DF_ERR("OOM"); }
+    float* op = (float*)out->data;
+    float inv = total > 0 ? 1.0f / (float)total : 0.0f;
+    for (int c = 0; c < n_cats; c++) op[c] = counts[c] * inv;
+
+    free(counts);
+    return out;
+}
+
+/* ── Frequency Encoding — Transform ─────────────────────────────────────── *
+ * Map each row's category → its frequency.  Missing → 0.
+ * Returns [N] FLOAT32 tensor.
+ * ========================================================================== */
+Tensor* df_freq_encode_transform(const DataFrame* df, int col_idx,
+                                  const Tensor* cat_freqs)
+{
+    if (!df || col_idx < 0 || (size_t)col_idx >= df->n_cols)
+        DF_ERR("df_freq_encode_transform: invalid col_idx");
+    const DFColumn* col = &df->columns[col_idx];
+    if (col->dtype != DF_DTYPE_STRING)
+        DF_ERR("df_freq_encode_transform: column must be STRING");
+    if (!cat_freqs || cat_freqs->ndim != 1)
+        DF_ERR("df_freq_encode_transform: cat_freqs must be [n_cats]");
+
+    int N      = (int)df->n_rows;
+    int n_cats = (int)cat_freqs->total_size;
+    const int32_t* cat_idx = DF_COL_I32(col);
+    const float*   fp      = (const float*)cat_freqs->data;
+
+    int shape = N;
+    Tensor* out = tensor_create_uninitialized(1, &shape, DTYPE_FLOAT32);
+    if (!out) DF_ERR("df_freq_encode_transform: OOM");
+    float* op = (float*)out->data;
+
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < N; i++) {
+        int c = cat_idx[i];
+        op[i] = (c >= 0 && c < n_cats) ? fp[c] : 0.0f;
+    }
+    return out;
+}
+
+/* ── Direct Tensor → DataFrame column add (zero-copy from tensor side) ───── *
+ * Avoids PHP-side float copies when adding an encoded tensor as a column.
+ * ========================================================================== */
+DataFrame* df_add_tensor_f32_column(const DataFrame* df, const char* name,
+                                     const Tensor* t)
+{
+    if (!t || t->dtype != DTYPE_FLOAT32)
+        DF_ERR("df_add_tensor_f32_column: tensor must be FLOAT32");
+    if (!tensor_is_contiguous(t))
+        DF_ERR("df_add_tensor_f32_column: tensor must be contiguous");
+    if ((size_t)t->total_size != df->n_rows)
+        DF_ERR("df_add_tensor_f32_column: tensor size != n_rows");
+    return df_add_f32_column(df, name, (const float*)t->data, df->n_rows);
 }

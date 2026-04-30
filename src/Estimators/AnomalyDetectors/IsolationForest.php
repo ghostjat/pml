@@ -25,8 +25,17 @@ final class IsolationForest implements Learner, Persistable
     private float $contamination;
 
     private array $trees = [];
-    private float $threshold = 0.5;
-    private int $nFeatures = 0;
+    private float $threshold  = 0.5;
+    private int   $nFeatures  = 0;
+    private float $cNorm      = 1.0;
+
+    // Flat C-resident tensors for batch scoring (built after train())
+    private ?Tensor $flatFeats  = null;
+    private ?Tensor $flatThresh = null;
+    private ?Tensor $flatLefts  = null;
+    private ?Tensor $flatRights = null;
+    private ?Tensor $flatLsizes = null;
+    private ?Tensor $treeSizes  = null;
 
     /**
      * @param int $nEstimators Number of isolation trees to build.
@@ -50,21 +59,19 @@ final class IsolationForest implements Learner, Persistable
         $maxDepth = (int) ceil(log($this->sampleSize, 2));
 
         for ($i = 0; $i < $this->nEstimators; $i++) {
-            // 1. Sub-sample the dataset (without replacement) natively in PHP
-            $currentSampleSize = min($this->sampleSize, $n);
+            $curSize = min($this->sampleSize, $n);
             $indices = range(0, $n - 1);
             shuffle($indices);
-            $indices = array_slice($indices, 0, $currentSampleSize);
-            
-            // 2. Extract zero-copy tensor block
-            $idxT = Tensor::fromArray($indices);
-            $subX = $x->take($idxT, 0);
-
-            // 3. Build Isolation Tree
+            $indices = array_slice($indices, 0, $curSize);
+            $idxT    = Tensor::fromArray($indices);
+            $subX    = $x->take($idxT, 0);
             $this->trees[] = $this->buildTree($subX, 0, $maxDepth);
         }
 
-        // 4. Calculate the threshold score based on the contamination rate
+        // Serialize PHP trees → flat C tensors for all-C batch scoring
+        $this->serializeTrees();
+
+        // Calibrate threshold from training-set scores
         $this->calibrateThreshold($dataset);
     }
 
@@ -102,7 +109,7 @@ final class IsolationForest implements Learner, Persistable
         }
 
         // Select a completely random split threshold
-        $split = $min + (lcg_value() * ($max - $min));
+        $split = $min + (mt_rand() / mt_getrandmax() * ($max - $min));
 
         // Generate SIMD boolean mask for the split
         $threshT = Tensor::zeros($n)->addScalarInplace($split);
@@ -140,64 +147,84 @@ final class IsolationForest implements Learner, Persistable
      */
     public function predict(Dataset $dataset): Tensor
     {
-        $scores = $this->anomalyScores($dataset)->toFlatArray();
-        $predictions = [];
-
-        foreach ($scores as $score) {
-            // If the score exceeds the established threshold, flag as an anomaly
-            $predictions[] = ($score > $this->threshold) ? 1.0 : 0.0;
-        }
-
-        return Tensor::fromArray($predictions);
+        // threshold in C via greaterScalar — zero PHP per-sample work
+        return $this->anomalyScores($dataset)->greaterScalar($this->threshold);
     }
 
     /**
-     * Computes the raw anomaly score between 0.0 and 1.0 for each sample.
-     * Scores > 0.5 generally indicate an anomaly.
+     * Computes the raw anomaly score in [0,1] for each sample.
+     * Delegates entirely to C (OpenMP parallel over N, zero PHP per-sample work).
      */
     public function anomalyScores(Dataset $dataset): Tensor
     {
         if (!$this->trained()) {
             throw new RuntimeException("Isolation Forest is not trained.");
         }
+        if ($this->flatFeats === null) {
+            $this->serializeTrees();
+        }
+        return Tensor::iforestScore(
+            $dataset->samples(),
+            $this->flatFeats, $this->flatThresh,
+            $this->flatLefts, $this->flatRights,
+            $this->flatLsizes, $this->treeSizes,
+            $this->cNorm
+        );
+    }
 
-        $flatX = $dataset->samples()->toFlatArray();
-        $rows = $dataset->samples()->shape()[0];
-        $cols = $this->nFeatures;
-        
-        $scores = [];
-        
-        // Denominator logic standard to Isolation Forest
-        $cVal = $this->c($this->sampleSize);
+    /**
+     * Serialize the PHP recursive tree array to flat C tensors.
+     * BFS traversal; runs once after training.
+     */
+    private function serializeTrees(): void
+    {
+        $T = $this->nEstimators;
+        if ($T === 0) return;
 
-        for ($i = 0; $i < $rows; $i++) {
-            $rowOffset = $i * $cols;
-            $pathLengths = 0.0;
+        // Compute max possible nodes per tree: 2^(maxDepth+1)
+        $maxD     = (int)ceil(log($this->sampleSize, 2));
+        $maxNodes = (1 << ($maxD + 1)) + 2;   // conservative upper bound
 
-            foreach ($this->trees as $tree) {
-                $node = $tree;
-                $length = 0.0;
+        $totalNodes = $T * $maxNodes;
+        $feats  = array_fill(0, $totalNodes, -1.0);
+        $thresh = array_fill(0, $totalNodes,  0.0);
+        $lefts  = array_fill(0, $totalNodes, -1.0);
+        $rights = array_fill(0, $totalNodes, -1.0);
+        $lsizes = array_fill(0, $totalNodes,  1.0);
+        $tsizes = array_fill(0, $T, 0.0);
 
-                while (isset($node['feature'])) {
-                    $val = $flatX[$rowOffset + $node['feature']];
-                    $node = ($val < $node['threshold']) ? $node['left'] : $node['right'];
-                    $length++;
+        foreach ($this->trees as $t => $tree) {
+            $offset = $t * $maxNodes;
+            $queue  = [[$tree, -1, false]];
+            $head   = 0;
+            $nextId = 0;
+            while ($head < count($queue)) {
+                [$node, $parentId, $isLeft] = $queue[$head++];
+                $myId = $nextId++;
+                if ($parentId >= 0) {
+                    if ($isLeft) $lefts[$offset + $parentId]  = (float)$myId;
+                    else         $rights[$offset + $parentId] = (float)$myId;
                 }
-
-                // Adjust the final path length based on the size of the terminal leaf
-                $length += $this->c($node['size']);
-                $pathLengths += $length;
+                if (isset($node['feature'])) {
+                    $feats[$offset + $myId]  = (float)$node['feature'];
+                    $thresh[$offset + $myId] = (float)$node['threshold'];
+                    $queue[] = [$node['left'],  $myId, true];
+                    $queue[] = [$node['right'], $myId, false];
+                } else {
+                    // Leaf: feature=-1 sentinel, store leaf size for c() adjustment
+                    $lsizes[$offset + $myId] = (float)($node['size'] ?? 1);
+                }
             }
-
-            // Average path length across all trees
-            $avgPathLength = $pathLengths / $this->nEstimators;
-            
-            // Core Isolation Forest Score mapping
-            $score = pow(2.0, - ($avgPathLength / $cVal));
-            $scores[] = $score;
+            $tsizes[$t] = (float)$nextId;
         }
 
-        return Tensor::fromArray($scores);
+        $this->cNorm      = $this->c($this->sampleSize);
+        $this->flatFeats  = Tensor::fromArray($feats);
+        $this->flatThresh = Tensor::fromArray($thresh);
+        $this->flatLefts  = Tensor::fromArray($lefts);
+        $this->flatRights = Tensor::fromArray($rights);
+        $this->flatLsizes = Tensor::fromArray($lsizes);
+        $this->treeSizes  = Tensor::fromArray($tsizes);
     }
 
     /**
@@ -248,6 +275,7 @@ final class IsolationForest implements Learner, Persistable
         $i->threshold = (float) $c['threshold'];
         $i->nFeatures = (int) $c['nFeatures'];
         $i->trees = json_decode(file_get_contents($dir . '/trees.json'), true);
+        $i->serializeTrees();
         return $i;
     }
 }

@@ -17,7 +17,7 @@ final class TensorEngine {
                 // Glob relative to __DIR__ — process CWD is unreliable under php-fpm.
                 $cFiles = implode(' ', array_map('escapeshellarg', glob(__DIR__ . '/*.c')));
                 $result = shell_exec(
-                    "gcc -O3 -march=native -mtune=native -mfma -ffast-math -fno-math-errno -funsafe-math-optimizations -fopenmp -funroll-loops -flto -fomit-frame-pointer -D_GNU_SOURCE -shared -fPIC -o "
+                    "gcc -O3 -march=native -mtune=native -mfma -fno-math-errno -funsafe-math-optimizations -fopenmp -funroll-loops -flto -fomit-frame-pointer -D_GNU_SOURCE -shared -fPIC -o "
                     . escapeshellarg($libPath) . " " . $cFiles
                     . " -lopenblas -llapacke -lm 2>&1"
                 );
@@ -186,6 +186,7 @@ final class TensorEngine {
                 TensorC* tensor_standardize(TensorC* A);
 
                 float tensor_dot(TensorC* A, TensorC* B);
+                float tensor_sum_squares(TensorC* A);
                 float tensor_trace(TensorC* A);
                 TensorC* tensor_matmul(TensorC* A, TensorC* B);
                 TensorC* tensor_bmm(TensorC* A, TensorC* B);
@@ -403,6 +404,54 @@ final class TensorEngine {
                 TensorC* tensor_yj_fit(TensorC* X);
                 TensorC* tensor_yj_transform(TensorC* X, TensorC* lambdas);
 
+                void     tensor_fill_nan(TensorC* t, float fill_val);
+                TensorC* tensor_pearson_cols(TensorC* X, TensorC* y);
+
+                // --- ADVANCED EDA STATISTICAL FUNCTIONS (Section 23) ---
+                float    tensor_percentile(TensorC* A, float p);
+                float    tensor_iqr(TensorC* A);
+                float    tensor_mad(TensorC* A);
+                float    tensor_skewness(TensorC* A);
+                float    tensor_kurtosis(TensorC* A);
+                float    tensor_entropy_binned(TensorC* A, int n_bins);
+                void     tensor_col_stats(TensorC* X, int col, float* out);
+                TensorC* tensor_correlation_matrix(TensorC* X);
+                TensorC* tensor_mutual_info_cols(TensorC* X, TensorC* y, int n_bins);
+                TensorC* tensor_spearman_cols(TensorC* X, TensorC* y);
+                float    tensor_class_imbalance_ratio(TensorC* y);
+                TensorC* tensor_variance_threshold_mask(TensorC* X, float threshold);
+                TensorC* tensor_redundancy_clusters(TensorC* X, float threshold);
+                TensorC* tensor_nonlinearity_score(TensorC* X, TensorC* y, int n_bins);
+
+                // ── Section 24: HPC Estimator Kernels ────────────────────────
+                TensorC* tensor_onehot(TensorC* indices, int K);
+                TensorC* tensor_knn_vote(TensorC* kLabels, int num_classes);
+                TensorC* tensor_kmeans_assign(TensorC* X, TensorC* centroids);
+                TensorC* tensor_kmeans_centroids(TensorC* X, TensorC* assignments, int K,
+                                                  TensorC* old_centroids);
+                TensorC* tensor_ridge_solve(TensorC* X, TensorC* y, float lambda);
+                void     tensor_gbdt_collect_tree(TensorC* dest, int tree_idx,
+                                                   int max_nodes, TensorC* src);
+                TensorC* tensor_iforest_score(TensorC* X,
+                                               TensorC* feats_flat,  TensorC* thresh_flat,
+                                               TensorC* lefts_flat,  TensorC* rights_flat,
+                                               TensorC* lsize_flat,  TensorC* tree_sizes,
+                                               float c_norm);
+
+                // ── Section 25: HPC Estimator Kernels — Batch 2 ──────────────
+                TensorC* tensor_bootstrap_indices(int N);
+                TensorC* tensor_matrix_vote(TensorC* votes, int num_classes);
+                TensorC* tensor_cart_find_split(TensorC* X, TensorC* y,
+                                                 TensorC* feature_indices,
+                                                 int num_thresholds);
+                void     tensor_lasso_sgd_step(TensorC* X, TensorC* y, TensorC* W,
+                                               TensorC* bias_t, float alpha,
+                                               float lr, float l1_ratio);
+                TensorC* tensor_gnb_log_likelihood(TensorC* X, TensorC* means_KD,
+                                                    TensorC* vars_KD,
+                                                    TensorC* log_norms_K);
+                TensorC* tensor_gather_indices(TensorC* indices, TensorC* table);
+
                 // ── DataFrame lifecycle (internal allocation) ─────────────────
                 DataFrame*  df_create(size_t n_rows, size_t n_cols);
 
@@ -445,6 +494,17 @@ final class TensorEngine {
                 DataFrame*  df_value_counts(const DataFrame* df, int col_idx);
                 DataFrame*  df_sample_rows(const DataFrame* df, size_t n,
                                             bool replace, uint64_t seed);
+
+                // ── Categorical Encoding ──────────────────────────────────────
+                TensorC*    df_target_encode_fit(const DataFrame* df, int col_idx,
+                                                  const TensorC* y, float smoothing);
+                TensorC*    df_target_encode_transform(const DataFrame* df, int col_idx,
+                                                        const TensorC* cat_means, float global_mean);
+                TensorC*    df_freq_encode_fit(const DataFrame* df, int col_idx);
+                TensorC*    df_freq_encode_transform(const DataFrame* df, int col_idx,
+                                                      const TensorC* cat_freqs);
+                DataFrame*  df_add_tensor_f32_column(const DataFrame* df, const char* name,
+                                                      const TensorC* t);
 
                 // ── BPE Tokenizer ─────────────────────────────────────────────
                 typedef struct Tokenizer Tokenizer;
@@ -508,6 +568,8 @@ final class TensorEngine {
                 void      inf_reset_kv(InferenceSession* sess);
 
                 int32_t   inf_sample_greedy(const TensorC* logits);
+                int32_t   tensor_sample_topk(const TensorC* logits, int k,
+                                              float temperature, uint64_t seed);
                 int32_t   inf_sample(InferenceSession* sess,
                                       const TensorC* logits,
                                       float temperature, float top_p);

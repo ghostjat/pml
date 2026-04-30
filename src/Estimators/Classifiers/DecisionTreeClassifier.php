@@ -86,10 +86,8 @@ private function buildTree(Tensor $x, Tensor $y, int $depth): array
         return ['class' => $majorityClass];
     }
 
-    // Extract the C boolean mask to a PHP array once — avoids repeated FFI
-    // round-trips during left/right routing (rule 2: no booleanIndex on 2D $x).
-    $maskArray = $split['mask']->toFlatArray();
-    unset($split['mask']);          // Immediately return mask C-memory to pool.
+    // maskArray is a plain PHP array returned directly by cartFindSplit — no Tensor to free.
+    $maskArray = $split['maskArray'];
 
     $leftIdx  = [];
     $rightIdx = [];
@@ -134,92 +132,28 @@ private function buildTree(Tensor $x, Tensor $y, int $depth): array
 
 private function findBestSplit(Tensor $x, Tensor $y): ?array
 {
-    $bestGini  = INF;
-    $bestSplit = null;
-    $n         = $y->size();
-
-    // Feature bagging (Random Forest integration).
     $features = range(0, $this->nFeatures - 1);
     if ($this->maxFeatures !== null) {
         shuffle($features);
         $features = array_slice($features, 0, $this->maxFeatures);
     }
 
-    foreach ($features as $feature) {
-        // Zero-copy column view — no C allocation, points into existing buffer.
-        $col = $x->col($feature);
-        $min = $col->min();
-        $max = $col->max();
+    // One C call replaces features×8×N individual FFI round-trips
+    $featT  = Tensor::fromArray(array_map('floatval', $features));
+    $result = Tensor::cartFindSplit($x, $y, $featT, 8);
+    unset($featT);
 
-        if ($min >= $max) {
-            unset($col);
-            continue;
-        }
+    $raw = $result->toFlatArray();
+    unset($result);
 
-        // Pure-PHP threshold arithmetic: zero C allocations (rule 1).
-        // 8 interior points uniformly spaced between min and max (excludes endpoints).
-        $step = ($max - $min) / 9.0;
+    if ((int)$raw[0] < 0) return null;
 
-        for ($t = 1; $t <= 8; $t++) {
-            $threshold = $min + $step * $t;
-
-            // O(1) scalar comparison — no threshold Tensor allocated (rule 1).
-            $mask  = $col->lessScalar($threshold);
-            $leftY = $y->booleanIndex($mask);   // Safe: $y is 1D labels.
-            $nLeft = $leftY->size();
-
-            if ($nLeft === 0 || $nLeft === $n) {
-                unset($mask, $leftY);
-                continue;
-            }
-
-            // Avoid a second C call for $nRight — pure PHP arithmetic.
-            $nRight    = $n - $nLeft;
-            $rightMask = $mask->logicalNot();
-            $rightY    = $y->booleanIndex($rightMask);
-            unset($rightMask);              // Pool immediately; not needed again.
-
-            $gini = ($nLeft  / $n) * $this->gini($leftY)
-                  + ($nRight / $n) * $this->gini($rightY);
-            unset($leftY, $rightY);         // Pool label slices the instant Gini is done.
-
-            if ($gini < $bestGini) {
-                // Explicitly free the PREVIOUS best mask before overwriting
-                // (rule 4: zero leak — PHP won't GC the old entry until later otherwise).
-                if ($bestSplit !== null) {
-                    unset($bestSplit['mask']);
-                }
-                $bestGini  = $gini;
-                $bestSplit = [
-                    'feature'   => $feature,
-                    'threshold' => $threshold,
-                    'mask'      => $mask,   // Transfer ownership; do NOT unset here.
-                ];
-            } else {
-                unset($mask);               // Not the best — return C-memory to pool now.
-            }
-        }
-
-        unset($col);                        // Pool column view after all thresholds tried.
-    }
-
-    return $bestSplit;
+    return [
+        'feature'    => (int)$raw[0],
+        'threshold'  => $raw[1],
+        'maskArray'  => array_slice($raw, 2),   // PHP array — consumed directly by buildTree
+    ];
 }
-
-    /**
-     * Gini Impurity: 1.0 - sum( (count_i / N)^2 )
-     * Calculated entirely in C-memory without loops.
-     */
-    private function gini(Tensor $y): float
-    {
-        $n = $y->size();
-        if ($n === 0) return 0.0;
-        
-        $counts = $y->bincount();
-        $sumSq = $counts->square()->sum(); // C-Level reduction
-        
-        return 1.0 - ($sumSq / ($n * $n));
-    }
 
     /**
      * Serialize the PHP tree into a flat BFS-ordered HardwareNode C array.

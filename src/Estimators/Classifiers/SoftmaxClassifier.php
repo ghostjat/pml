@@ -22,12 +22,14 @@ use RuntimeException;
  */
 final class SoftmaxClassifier implements Learner, Probabilistic, Persistable
 {
-    private ?Tensor $weights   = null;
-    private ?Tensor $bias      = null;
+    private ?Tensor $weights     = null;
+    private ?Tensor $bias        = null;
     /** @var int[] label → class index */
-    private array $classMap    = [];
+    private array $classMap      = [];
     /** @var int[] class index → label */
-    private array $indexMap    = [];
+    private array $indexMap      = [];
+    private ?Tensor $labelToIdx  = null;  // [maxLabel+1]: label → class index gather table
+    private ?Tensor $idxToLabel  = null;  // [K]:          class index → label gather table
 
     public function __construct(
         private readonly int   $epochs       = 100,
@@ -49,6 +51,7 @@ final class SoftmaxClassifier implements Learner, Probabilistic, Persistable
         sort($unique);
         $this->classMap = array_flip($unique);
         $this->indexMap = $unique;
+        $this->buildLookupTensors();
         $k = count($unique);
         $d = $dataset->numColumns();
 
@@ -56,35 +59,43 @@ final class SoftmaxClassifier implements Learner, Probabilistic, Persistable
         $this->weights = Tensor::randomNormal([$d, $k], 0.0, 0.01);
         $this->bias    = Tensor::zeros(1, $k);
 
+        // Pre-allocate gradient buffers once — reused every batch (zero-alloc hot path)
+        $dW = Tensor::zeros($d, $k);
+        $db = Tensor::zeros(1, $k);
+
+        // For small batch sizes, disable OpenMP thread spawning overhead;
+        // BLAS handles its own threading for the matmul dominants.
+        if ($this->batchSize < 2048) {
+            Tensor::configureThreading(1, 16);
+        }
+
         for ($e = 0; $e < $this->epochs; $e++) {
             $dataset->randomize();
 
             foreach ($dataset->batches($this->batchSize) as $batch) {
-                $x    = $batch->samples();                          // [N × D]
-                $n    = (float) $x->shape()[0];
+                $x = $batch->samples();                             // [N × D]
+                $n = (float) $x->shape()[0];
 
-                // Map label values → class indices (pure PHP map, no FFI)
-                $rawLabels = $batch->labels()->toFlatArray();
-                $idxArr    = array_map(fn($lbl) => (float)($this->classMap[(int)$lbl] ?? 0), $rawLabels);
-                // One-hot via broadcast equal: classIdx[N,1] == arange[1,K] → [N,K]
-                $classIdx = Tensor::fromArray($idxArr)->expandDims(1);          // [N,1]
-                $arange   = Tensor::linspace(0.0, (float)($k - 1), $k);        // [K]
-                $yOH      = $classIdx->equal($arange);                          // [N,K]
+                // Gather class indices in C — eliminates PHP array_map over batchSize
+                $classIdx = Tensor::gatherIndices($batch->labels(), $this->labelToIdx); // [N]
 
-                // Forward: logits = X*W + b  [N × K]
+                // One-hot in C: single FFI call, zero PHP loops  [N × K]
+                $yOH = Tensor::onehot($classIdx, $k);
+
+                // Forward: logits = X*W + b  [N × K] — in-place on new alloc
                 $logits = $x->matmul($this->weights)->addInplace($this->bias);
 
-                // Numerically stable softmax in-place
-                $proba  = $logits->copy()->rowSoftmaxInplace();                  // [N × K]
+                // Numerically-stable softmax in-place (no copy needed)
+                $logits->rowSoftmaxInplace();
 
-                // dL/dLogits = (P - Y) / N
-                $dLogits = $proba->sub($yOH)->mulScalarInplace(1.0 / $n);
+                // dLogits = (P − Y) / N — reuse logits buffer (sub + scale in-place)
+                $logits->subInplace($yOH)->mulScalarInplace(1.0 / $n);
 
-                // Gradients
-                $dW = $x->transpose()->matmul($dLogits);            // [D × K]
-                $db = $dLogits->sumAxis(0);                         // [1 × K]
+                // Gradients into pre-allocated buffers
+                $dW->matmulInto($x, $logits, true, false);   // X^T @ dLogits → [D,K]
+                $db->sumAxisInto($logits, 0);                // sum rows → [1,K]
 
-                // L2 regularization on weights
+                // L2 on weights (fused: dW += l2 * W)
                 if ($this->l2 > 0.0) {
                     $dW->addInplace($this->weights->mulScalar($this->l2));
                 }
@@ -93,6 +104,11 @@ final class SoftmaxClassifier implements Learner, Probabilistic, Persistable
                 $this->weights->subInplace($dW->mulScalarInplace($this->learningRate));
                 $this->bias->subInplace($db->mulScalarInplace($this->learningRate));
             }
+        }
+
+        // Restore threading to full parallel for inference and other estimators
+        if ($this->batchSize < 2048) {
+            Tensor::configureThreading(16, 16);
         }
     }
 
@@ -107,15 +123,26 @@ final class SoftmaxClassifier implements Learner, Probabilistic, Persistable
 
     public function predict(Dataset $dataset): Tensor
     {
-        // argmaxAxis(1) → [N] class indices; map through indexMap (O(N) pure PHP)
-        $classIdx = $this->proba($dataset)->argmaxAxis(1)->toFlatArray();
-        $preds    = array_map(fn($i) => (float)($this->indexMap[(int)$i] ?? 0), $classIdx);
-        return Tensor::fromArray($preds);
+        // argmaxAxis(1) → [N] class indices; gather labels in C — zero PHP per-sample
+        return Tensor::gatherIndices($this->proba($dataset)->argmaxAxis(1), $this->idxToLabel);
     }
 
     public function trained(): bool
     {
         return $this->weights !== null;
+    }
+
+    private function buildLookupTensors(): void
+    {
+        // [K] float32: class index → original label
+        $this->idxToLabel = Tensor::fromArray(array_map('floatval', $this->indexMap));
+        // [maxLabel+1] float32: label → class index (dense lookup table)
+        $maxLabel = max(array_map('intval', array_keys($this->classMap)));
+        $table = array_fill(0, $maxLabel + 1, 0.0);
+        foreach ($this->classMap as $label => $idx) {
+            $table[(int)$label] = (float)$idx;
+        }
+        $this->labelToIdx = Tensor::fromArray($table);
     }
 
     public function save(string $dir): void
@@ -131,6 +158,7 @@ final class SoftmaxClassifier implements Learner, Probabilistic, Persistable
         $i->classMap = $c['classMap'] ?? []; $i->indexMap = $c['indexMap'] ?? [];
         $stPath = $dir . '/model.safetensors';
         if (is_file($stPath)) { $t = SafeTensorsIO::load($stPath); $i->weights = $t['weights'] ?? null; $i->bias = $t['bias'] ?? null; }
+        $i->buildLookupTensors();
         return $i;
     }
 }

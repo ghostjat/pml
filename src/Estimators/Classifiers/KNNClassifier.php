@@ -23,9 +23,9 @@ final class KNNClassifier implements Learner, Persistable
 {
     private int $k;
     
-    // Cached pointers to the training data (Zero-Copy)
     private ?Tensor $fitSamples = null;
-    private ?Tensor $fitLabels = null;
+    private ?Tensor $fitLabels  = null;
+    private int     $numClasses = 0;
 
     /**
      * @param int $k The number of closest neighbors to consider for the majority vote.
@@ -46,9 +46,8 @@ final class KNNClassifier implements Learner, Persistable
             throw new \InvalidArgumentException("K-Nearest Neighbors requires a labeled dataset.");
         }
 
-        // Lazy Learning: KNN does not "build" a model, it simply memorizes the training data.
-        // We only store the references to the underlying FFI C-Pointers.
-        $this->fitSamples = $dataset->samples();
+        $this->fitSamples  = $dataset->samples();
+        $this->numClasses  = (int)($this->fitLabels->max() + 1);
     }
 
     public function predict(Dataset $dataset): Tensor
@@ -66,18 +65,11 @@ final class KNNClassifier implements Learner, Persistable
         $sortedIdx  = $distMat->argsort(1);                               // [nTest, nTrain] ascending
         $kNeighbors = $sortedIdx->slice(1, 0, $k);                       // [nTest, k]
 
-        // Majority vote per row: gather labels, bincount, argmax — all in C
-        $flat    = $kNeighbors->reshape($testX->shape()[0] * $k);           // [nTest*k]
-        $kLabels = $this->fitLabels->take($flat, 0)
-                                   ->reshape($testX->shape()[0], $k);     // [nTest, k]
-
-        // Per-row bincount + argmax — zero-copy row views, 2 C calls per row
-        $nTest = $testX->shape()[0];
-        $votes = [];
-        for ($i = 0; $i < $nTest; $i++) {
-            $votes[] = (float)$kLabels->row($i)->bincount()->argmax();
-        }
-        return Tensor::fromArray($votes);
+        // Gather neighbor labels → [nTest, k], then majority vote in C (one call)
+        $nTest   = $testX->shape()[0];
+        $flat    = $kNeighbors->reshape($nTest * $k);
+        $kLabels = $this->fitLabels->take($flat, 0)->reshape($nTest, $k);
+        return Tensor::knnVote($kLabels, $this->numClasses);
     }
 
     public function trained(): bool
@@ -94,7 +86,7 @@ final class KNNClassifier implements Learner, Persistable
         file_put_contents(
             $dir . \DIRECTORY_SEPARATOR . 'config.json',
             json_encode(
-                ['class' => self::class, 'k' => $this->k],
+                ['class' => self::class, 'k' => $this->k, 'numClasses' => $this->numClasses],
                 \JSON_PRETTY_PRINT | \JSON_UNESCAPED_SLASHES
             )
         );
@@ -116,6 +108,7 @@ final class KNNClassifier implements Learner, Persistable
         $config = json_decode($raw, true, 512, \JSON_THROW_ON_ERROR);
 
         $instance = new self((int) $config['k']);
+        $instance->numClasses = (int) ($config['numClasses'] ?? 0);
 
         $stPath = $dir . \DIRECTORY_SEPARATOR . 'model.safetensors';
         if (is_file($stPath)) {

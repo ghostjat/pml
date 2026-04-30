@@ -402,6 +402,75 @@ final class DataFrame
     }
 
     /**
+     * Add a pre-computed Tensor as a new FLOAT32 column (zero-copy from C side).
+     * Faster than withColumn() when tensor is already contiguous.
+     */
+    public function withTensorColumn(string $name, Tensor $data): self
+    {
+        $ffi = self::ffi();
+        $ptr = $ffi->df_add_tensor_f32_column($this->ptr, $name, $data->ptr);
+        self::checkError();
+        return new self($ptr);
+    }
+
+    // ── Categorical Encoding ─────────────────────────────────────────────────
+
+    /**
+     * Fit target encoding: compute per-category smoothed mean of y [N].
+     * Returns [n_cats] tensor of smoothed means.
+     * @param float $smoothing James-Stein additive smoothing weight (default 10).
+     */
+    public function targetEncodeFit(string $col, Tensor $y, float $smoothing = 10.0): Tensor
+    {
+        $ptr = self::ffi()->df_target_encode_fit(
+            $this->ptr, $this->colIdx($col), $y->ptr, $smoothing
+        );
+        self::checkError();
+        return Tensor::wrap($ptr);
+    }
+
+    /**
+     * Apply target encoding: map each row's category → smoothed mean.
+     * @param Tensor $catMeans  [n_cats] tensor from targetEncodeFit()
+     * @param float  $globalMean  Fallback for missing/unseen categories
+     * Returns [N] FLOAT32 tensor.
+     */
+    public function targetEncodeTransform(
+        string $col, Tensor $catMeans, float $globalMean
+    ): Tensor {
+        $ptr = self::ffi()->df_target_encode_transform(
+            $this->ptr, $this->colIdx($col), $catMeans->ptr, $globalMean
+        );
+        self::checkError();
+        return Tensor::wrap($ptr);
+    }
+
+    /**
+     * Fit frequency encoding: compute category fractions.
+     * Returns [n_cats] tensor of frequencies (0–1).
+     */
+    public function freqEncodeFit(string $col): Tensor
+    {
+        $ptr = self::ffi()->df_freq_encode_fit($this->ptr, $this->colIdx($col));
+        self::checkError();
+        return Tensor::wrap($ptr);
+    }
+
+    /**
+     * Apply frequency encoding: map each row's category → frequency.
+     * @param Tensor $catFreqs  [n_cats] tensor from freqEncodeFit()
+     * Returns [N] FLOAT32 tensor.
+     */
+    public function freqEncodeTransform(string $col, Tensor $catFreqs): Tensor
+    {
+        $ptr = self::ffi()->df_freq_encode_transform(
+            $this->ptr, $this->colIdx($col), $catFreqs->ptr
+        );
+        self::checkError();
+        return Tensor::wrap($ptr);
+    }
+
+    /**
      * Cast column to FLOAT32.
      * Applicable to INT32 columns; INT32_MIN → NaN.
      */

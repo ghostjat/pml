@@ -961,6 +961,61 @@ int32_t inf_sample_top_p(const Tensor *logits, float temperature, float top_p, u
     return result;
 }
 
+/* Temperature + top-k sampling directly from a raw logits tensor.
+ * No InferenceSession needed — suitable for custom autoregressive loops.
+ *
+ *   k == 0        → full-vocabulary softmax (no truncation)
+ *   temperature ≤ 0 → greedy argmax
+ *   seed == 0     → seed from tensor pointer (non-deterministic across runs)
+ */
+int32_t tensor_sample_topk(const Tensor *logits, int k, float temperature, uint64_t seed) {
+    if (!logits || logits->dtype != DTYPE_FLOAT32) return 0;
+    if (temperature <= 1e-6f) return inf_sample_greedy(logits);
+
+    int          n  = (int)logits->total_size;
+    const float *lp = (const float *)logits->data;
+
+    FloatIdx *fi = malloc((size_t)n * sizeof(FloatIdx));
+    if (!fi) return inf_sample_greedy(logits);
+
+    float scale = 1.0f / temperature;
+    float max_v = lp[0];
+    for (int i = 1; i < n; i++) if (lp[i] > max_v) max_v = lp[i];
+
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        fi[i].val = expf((lp[i] - max_v) * scale);
+        fi[i].idx = (int32_t)i;
+        sum += fi[i].val;
+    }
+    float inv = 1.0f / sum;
+    for (int i = 0; i < n; i++) fi[i].val *= inv;
+
+    int keep = n;
+    if (k > 0 && k < n) {
+        qsort(fi, (size_t)n, sizeof(FloatIdx), _cmp_fi_desc);
+        keep = k;
+        float ksum = 0.0f;
+        for (int i = 0; i < keep; i++) ksum += fi[i].val;
+        if (ksum > 0.0f) {
+            float kinv = 1.0f / ksum;
+            for (int i = 0; i < keep; i++) fi[i].val *= kinv;
+        }
+    }
+
+    uint64_t rng = seed ? seed : ((uint64_t)(uintptr_t)logits ^ 0xdeadbeefcafe1234ULL);
+    _xors64(&rng);
+    float r   = (float)((_xors64(&rng) >> 11) * (1.0 / (double)((uint64_t)1 << 53)));
+    float cum = 0.0f;
+    int32_t result = fi[0].idx;
+    for (int i = 0; i < keep; i++) {
+        cum += fi[i].val;
+        if (r < cum) { result = fi[i].idx; break; }
+    }
+    free(fi);
+    return result;
+}
+
 /* ============================================================================
  * 11. GENERATION LOOP
  * ========================================================================== */

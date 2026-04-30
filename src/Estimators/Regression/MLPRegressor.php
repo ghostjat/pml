@@ -12,6 +12,7 @@ use Pml\NeuralNetwork\Layers\Dense;
 use Pml\NeuralNetwork\Layers\ReLU;
 use Pml\NeuralNetwork\Layers\Dropout;
 use Pml\NeuralNetwork\Optimizers\Adam;
+use Pml\Losses\MeanSquaredError;
 use RuntimeException;
 
 /**
@@ -54,8 +55,8 @@ final class MLPRegressor implements Learner, Persistable
         // Linear output — no activation for regression
         $layers[] = new Dense($inSize, 1);
 
-        $this->network = new Sequential($layers, new Adam($this->learningRate));
-        $this->network->train($dataset, $this->epochs, $this->batchSize);
+        $this->network = new Sequential($layers, new MeanSquaredError(), new Adam($this->learningRate));
+        $this->network->train($dataset, epochs: $this->epochs, batchSize: $this->batchSize);
     }
 
     public function predict(Dataset $dataset): Tensor

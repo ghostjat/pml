@@ -23,7 +23,8 @@ final class RandomForestClassifier implements Learner, Persistable
     private int $nEstimators;
     private int $maxDepth;
     private int $minSamplesSplit;
-    
+    private int $numClasses = 0;
+
     /** @var DecisionTreeClassifier[] */
     private array $trees = [];
 
@@ -38,29 +39,19 @@ final class RandomForestClassifier implements Learner, Persistable
     {
         $n = $dataset->numRows();
         $features = $dataset->numColumns();
-        
-        // Feature bagging: each tree only sees a random square root subset of features
         $maxFeatures = (int) max(1, sqrt($features));
+        $this->numClasses = (int)($dataset->labels()->max() + 1);
 
         for ($i = 0; $i < $this->nEstimators; $i++) {
-            
-            // 1. Bootstrap Sampling (Random selection with replacement)
-            $indices = [];
-            for ($j = 0; $j < $n; $j++) {
-                $indices[] = mt_rand(0, $n - 1);
-            }
-            
-            // 2. Extract Bootstrap slice safely in C
-            $idxT = Tensor::fromArray($indices);
+            // Bootstrap: one C call replaces N PHP mt_rand() calls
+            $idxT  = Tensor::bootstrapIndices($n);
             $bootX = $dataset->samples()->take($idxT, 0);
             $bootY = $dataset->labels()->take($idxT, 0);
-            
-            $bootDataset = new Dataset($bootX, $bootY);
+            unset($idxT);
 
-            // 3. Train the sub-tree
             $tree = new DecisionTreeClassifier($this->maxDepth, $this->minSamplesSplit, $maxFeatures);
-            $tree->train($bootDataset);
-            
+            $tree->train(new Dataset($bootX, $bootY));
+            unset($bootX, $bootY);
             $this->trees[] = $tree;
         }
     }
@@ -71,30 +62,13 @@ final class RandomForestClassifier implements Learner, Persistable
             throw new RuntimeException("Random Forest is not trained.");
         }
 
-        $n = $dataset->numRows();
-        $treePreds = [];
-        
-        // Gather all predictions
+        // Stack T tree predictions into [N, T] then C majority-vote — zero PHP per-sample work
+        $cols = [];
         foreach ($this->trees as $tree) {
-            $treePreds[] = $tree->predict($dataset)->toFlatArray();
+            $cols[] = $tree->predict($dataset)->expandDims(1);  // [N, 1]
         }
-
-        $finalPreds = [];
-        
-        // JIT Optimized Voting Process
-        for ($i = 0; $i < $n; $i++) {
-            $votes = [];
-            foreach ($treePreds as $preds) {
-                $v = (int) $preds[$i];
-                $votes[$v] = ($votes[$v] ?? 0) + 1;
-            }
-            
-            // Sort votes descending and pick the highest
-            arsort($votes);
-            $finalPreds[] = array_key_first($votes);
-        }
-
-        return Tensor::fromArray($finalPreds);
+        $votesMatrix = Tensor::concat($cols, 1);                // [N, T]
+        return Tensor::matrixVote($votesMatrix, $this->numClasses);
     }
 
     public function trained(): bool
@@ -120,6 +94,7 @@ final class RandomForestClassifier implements Learner, Persistable
                 'nEstimators'     => $this->nEstimators,
                 'maxDepth'        => $this->maxDepth,
                 'minSamplesSplit' => $this->minSamplesSplit,
+                'numClasses'      => $this->numClasses,
             ], \JSON_PRETTY_PRINT | \JSON_UNESCAPED_SLASHES)
         );
 
@@ -148,6 +123,7 @@ final class RandomForestClassifier implements Learner, Persistable
             (int) $config['maxDepth'],
             (int) $config['minSamplesSplit']
         );
+        $instance->numClasses = (int) ($config['numClasses'] ?? 2);
 
         foreach ($treeData as $data) {
             $instance->trees[] = DecisionTreeClassifier::fromPhpTree($data);

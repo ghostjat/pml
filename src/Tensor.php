@@ -450,6 +450,14 @@ final class Tensor {
     public function topk(int $k, int $axis = -1): self { $res = self::wrap(self::ffi()->tensor_topk($this->ptr, $k, $axis === -1 ? $this->ptr->ndim - 1 : $axis)); self::checkError(); return $res; }
 
     public function sum(): float { $res = self::ffi()->tensor_sum($this->ptr); self::checkError(); return $res; }
+    /** Sum of squared elements via BLAS sdot — no intermediate tensor allocated. */
+    public function sumSquares(): float { $r = self::ffi()->tensor_sum_squares($this->ptr); self::checkError(); return (float) $r; }
+    /** Temperature + top-k multinomial sample from a 1-D logit vector (all in C). */
+    public static function sampleTopK(self $logits, int $k, float $temperature, int $seed = 0): int {
+        $r = self::ffi()->tensor_sample_topk($logits->ptr, $k, $temperature, (int) $seed);
+        self::checkError();
+        return (int) $r;
+    }
     public function product(): float { $res = self::ffi()->tensor_product($this->ptr); self::checkError(); return $res; }
     public function mean(): float { $res = self::ffi()->tensor_mean($this->ptr); self::checkError(); return $res; }
     public function min(): float { $res = self::ffi()->tensor_min($this->ptr); self::checkError(); return $res; }
@@ -1182,10 +1190,139 @@ final class Tensor {
         self::checkError(); return $res;
     }
 
+    /** Replace NaN/Inf values in-place with fill_val (FLOAT32 only). */
+    public function fillNan(float $fillVal = 0.0): self {
+        self::ffi()->tensor_fill_nan($this->ptr, $fillVal);
+        self::checkError(); return $this;
+    }
+
+    /**
+     * Compute Pearson r between each column of $this [N,D] and $y [N].
+     * Returns [D] FLOAT32 tensor. NaN pairs are skipped (pairwise-complete).
+     */
+    public function pearsonCols(self $y): self {
+        $res = self::wrap(self::ffi()->tensor_pearson_cols($this->ptr, $y->ptr));
+        self::checkError(); return $res;
+    }
+
+    // ── Section 24: HPC Estimator Kernels ────────────────────────────────────
+
+    /** [N] float32 class indices → [N, K] float32 one-hot matrix. */
+    public static function onehot(self $indices, int $numClasses): self {
+        $res = self::wrap(self::ffi()->tensor_onehot($indices->ptr, $numClasses));
+        self::checkError(); return $res;
+    }
+
+    /** KNN majority vote: [N,k] neighbor labels → [N] predicted class (float32 class index). */
+    public static function knnVote(self $kLabels, int $numClasses): self {
+        $res = self::wrap(self::ffi()->tensor_knn_vote($kLabels->ptr, $numClasses));
+        self::checkError(); return $res;
+    }
+
+    /** KMeans E-step: X[N,D] × centroids[K,D] → [N] cluster assignment indices. */
+    public static function kmeansAssign(self $X, self $centroids): self {
+        $res = self::wrap(self::ffi()->tensor_kmeans_assign($X->ptr, $centroids->ptr));
+        self::checkError(); return $res;
+    }
+
+    /** KMeans M-step: X[N,D] × assignments[N] → [K,D] new centroids.
+     *  Empty clusters retain the corresponding row of $oldCentroids (pass null to zero them). */
+    public static function kmeansCentroids(self $X, self $assignments, int $K,
+                                           ?self $oldCentroids = null): self {
+        $res = self::wrap(self::ffi()->tensor_kmeans_centroids(
+            $X->ptr, $assignments->ptr, $K, $oldCentroids?->ptr
+        ));
+        self::checkError(); return $res;
+    }
+
+    /** Closed-form Ridge Regression: W = (X^T X + λI)^{-1} X^T y → [D,1]. */
+    public static function ridgeSolve(self $X, self $y, float $lambda = 1.0): self {
+        $res = self::wrap(self::ffi()->tensor_ridge_solve($X->ptr, $y->ptr, $lambda));
+        self::checkError(); return $res;
+    }
+
+    /** Copy per-tree scratch node array into flat ensemble buffer (replaces PHP buffer copy loop). */
+    public static function gbdtCollectTree(self $dest, int $treeIdx, int $maxNodes, self $src): void {
+        self::ffi()->tensor_gbdt_collect_tree($dest->ptr, $treeIdx, $maxNodes, $src->ptr);
+        self::checkError();
+    }
+
+    /** Isolation Forest batch scoring: returns [N] anomaly scores in [0,1].
+     *  All tree arrays must be pre-flattened to [T * maxNodes] via serializeIforestTrees(). */
+    public static function iforestScore(self $X,
+                                        self $featsFlat, self $threshFlat,
+                                        self $leftsFlat, self $rightsFlat,
+                                        self $lsizeFlat, self $treeSizes,
+                                        float $cNorm): self {
+        $res = self::wrap(self::ffi()->tensor_iforest_score(
+            $X->ptr,
+            $featsFlat->ptr, $threshFlat->ptr,
+            $leftsFlat->ptr, $rightsFlat->ptr,
+            $lsizeFlat->ptr, $treeSizes->ptr,
+            $cNorm
+        ));
+        self::checkError(); return $res;
+    }
+
+    // ── Section 25: HPC Estimator Kernels — Batch 2 ─────────────────────────
+
+    /** Returns [N] float32 bootstrap indices in [0, N-1] (with replacement). */
+    public static function bootstrapIndices(int $n): self {
+        $res = self::wrap(self::ffi()->tensor_bootstrap_indices($n));
+        self::checkError(); return $res;
+    }
+
+    /** Majority vote over [N, T] integer-label matrix → [N]. */
+    public static function matrixVote(self $votes, int $numClasses): self {
+        $res = self::wrap(self::ffi()->tensor_matrix_vote($votes->ptr, $numClasses));
+        self::checkError(); return $res;
+    }
+
+    /**
+     * All-C CART split search.
+     * Returns [N+2]: [best_feature(-1=none), best_threshold, mask[0..N-1]].
+     */
+    public static function cartFindSplit(self $X, self $y, self $featureIndices,
+                                          int $numThresholds = 8): self {
+        $res = self::wrap(self::ffi()->tensor_cart_find_split(
+            $X->ptr, $y->ptr, $featureIndices->ptr, $numThresholds
+        ));
+        self::checkError(); return $res;
+    }
+
+    /** Fused (Elastic)Net SGD step: updates W [D,1] and bias [1] in-place.
+     *  l1Ratio=1.0→Lasso, 0.0→Ridge SGD, 0.5→ElasticNet. */
+    public static function lassoSgdStep(self $X, self $y, self $W, self $bias,
+                                         float $alpha, float $lr,
+                                         float $l1Ratio = 1.0): void {
+        self::ffi()->tensor_lasso_sgd_step(
+            $X->ptr, $y->ptr, $W->ptr, $bias->ptr, $alpha, $lr, $l1Ratio
+        );
+        self::checkError();
+    }
+
+    /**
+     * Fused GNB log-likelihood: returns [N, K].
+     * logNormsK[k] = log_prior[k] − 0.5·Σ_d log(2π·var[k,d])
+     */
+    public static function gnbLogLikelihood(self $X, self $meansKD,
+                                             self $varsKD, self $logNormsK): self {
+        $res = self::wrap(self::ffi()->tensor_gnb_log_likelihood(
+            $X->ptr, $meansKD->ptr, $varsKD->ptr, $logNormsK->ptr
+        ));
+        self::checkError(); return $res;
+    }
+
+    /** Gather: out[i] = table[indices[i]]. Replaces PHP array_map remapping. */
+    public static function gatherIndices(self $indices, self $table): self {
+        $res = self::wrap(self::ffi()->tensor_gather_indices($indices->ptr, $table->ptr));
+        self::checkError(); return $res;
+    }
+
     public function __destruct()
     {
         if ($this->owned && $this->ptr !== null) {
-            // Memory safe call: if this tensor was born in an Arena, 
+            // Memory safe call: if this tensor was born in an Arena,
             // tensor_free safely intercepts it and does nothing!
             $ffi = self::ffi();
             $ffi->tensor_free($this->ptr); // @phpstan-ignore-line — FFI methods are resolved at runtime

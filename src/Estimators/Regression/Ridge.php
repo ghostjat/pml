@@ -40,38 +40,22 @@ final class Ridge implements Learner, Persistable
 
     public function train(Dataset $dataset): void
     {
-        $features = $dataset->numColumns();
-        $this->weights = Tensor::randomNormal([$features, 1], 0.0, 0.01);
-        $this->bias = 0.0;
-
-        for ($e = 0; $e < $this->epochs; $e++) {
-            $dataset->randomize();
-
-            foreach ($dataset->batches($this->batchSize) as $batch) {
-                $x = $batch->samples();
-                $y = $batch->labels();
-                $y = $y->ndim() === 1 ? $y->expandDims(1) : $y;
-                $n = (float) $x->shape()[0];
-
-                // Y_pred = X * W + b
-                $predictions = $x->matmul($this->weights)->addScalarInplace($this->bias);
-
-                // dZ = Y_pred - Y
-                $dz = $predictions->sub($y);
-                
-                // dW = (X^T * dZ) / N + (alpha * W)  <- Includes L2 Penalty
-                $dw = $x->transpose()->matmul($dz)->mulScalarInplace(1.0 / $n);
-                $l2Penalty = $this->weights->mulScalar($this->alpha);
-                $dw->addInplace($l2Penalty);
-                
-                $db = $dz->mean();
-
-                // Update In-Place
-                $dw->mulScalarInplace($this->learningRate);
-                $this->weights->subInplace($dw);
-                $this->bias -= $db * $this->learningRate;
-            }
+        $x = $dataset->samples();
+        $y = $dataset->labels();
+        if ($y === null) {
+            throw new \InvalidArgumentException("Ridge requires labeled data.");
         }
+
+        // Augment X with a bias column of ones so closed-form solves bias jointly.
+        // X_aug [N, D+1]; this keeps $this->bias = 0 (absorbed into last weight).
+        $ones  = Tensor::ones($x->shape()[0])->expandDims(1);          // [N,1]
+        $xAug  = Tensor::concat([$x, $ones], 1);                        // [N, D+1]
+
+        // Closed-form: W_aug = (X_aug^T X_aug + λI)^{-1} X_aug^T y — single LAPACKE call
+        $wAug         = Tensor::ridgeSolve($xAug, $y, $this->alpha);    // [D+1, 1]
+        $d            = $x->shape()[1];
+        $this->weights = $wAug->slice(0, 0, $d);                        // [D, 1] feature weights
+        $this->bias    = $wAug->slice(0, $d, 1)->toFlatArray()[0];      // scalar bias
     }
 
     public function predict(Dataset $dataset): Tensor

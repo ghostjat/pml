@@ -40,7 +40,7 @@ final class Dropout implements Layer, HasTrainingMode
         // greaterScalar(keepProb) replaces: ones() + mulScalar(rate) + greaterEqual()
         // Saves 2 allocations (ones tensor + threshold tensor) per forward call.
         $this->mask = Tensor::randomUniform($input->shape(), 0.0, 1.0)
-            ->greaterScalar(1.0 - $this->rate)
+            ->greaterScalar($this->rate)
             ->mulScalarInplace(1.0 / (1.0 - $this->rate));
 
         return $input->mul($this->mask);

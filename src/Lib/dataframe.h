@@ -225,6 +225,17 @@ int         df_col_n_categories(const DataFrame *df, int col_idx);
 const char *df_col_category_name(const DataFrame *df,
                                   int col_idx, int cat_idx);
 
+/* ── Categorical Encoding ────────────────────────────────────────────────── */
+Tensor *df_target_encode_fit(const DataFrame *df, int col_idx,
+                              const Tensor *y, float smoothing);
+Tensor *df_target_encode_transform(const DataFrame *df, int col_idx,
+                                    const Tensor *cat_means, float global_mean);
+Tensor *df_freq_encode_fit(const DataFrame *df, int col_idx);
+Tensor *df_freq_encode_transform(const DataFrame *df, int col_idx,
+                                  const Tensor *cat_freqs);
+DataFrame *df_add_tensor_f32_column(const DataFrame *df, const char *name,
+                                     const Tensor *t);
+
 
 /* ----------------------------------------------------------------------------
  * NLP Vocabulary (opaque handle for PHP FFI)

@@ -67,17 +67,16 @@ final class GBDTClassifier implements Learner, Probabilistic, Persistable
         $maxNodes        = $maxLeaves * 2;
         $this->maxNodes  = $maxNodes;
 
-        // Reusable per-tree output tensors (reset before each call)
         $outFeats  = Tensor::zeros($maxNodes);
         $outThresh = Tensor::zeros($maxNodes);
         $outLefts  = Tensor::zeros($maxNodes);
         $outRights = Tensor::zeros($maxNodes);
 
-        $featsArr  = array_fill(0, $T * $maxNodes, -1.0);
-        $threshArr = array_fill(0, $T * $maxNodes,  0.0);
-        $leftsArr  = array_fill(0, $T * $maxNodes, -1.0);
-        $rightsArr = array_fill(0, $T * $maxNodes, -1.0);
-        $sizesArr  = array_fill(0, $T, 0.0);
+        $this->treeFeats  = Tensor::zeros($T * $maxNodes)->fill(-1.0);
+        $this->treeThresh = Tensor::zeros($T * $maxNodes);
+        $this->treeLefts  = Tensor::zeros($T * $maxNodes)->fill(-1.0);
+        $this->treeRights = Tensor::zeros($T * $maxNodes)->fill(-1.0);
+        $sizesArr         = array_fill(0, $T, 0.0);
 
         for ($t = 0; $t < $T; $t++) {
             [$g, $h] = Tensor::gbdtLogLossGradHess($preds, $y);
@@ -94,24 +93,17 @@ final class GBDTClassifier implements Learner, Probabilistic, Persistable
             );
             $sizesArr[$t] = (float)$nodesUsed;
 
-            $offset = $t * $maxNodes;
-            $fBuf   = $outFeats->buffer();
-            $tBuf   = $outThresh->buffer();
-            $lBuf   = $outLefts->buffer();
-            $rBuf   = $outRights->buffer();
-            for ($i = 0; $i < $maxNodes; $i++) {
-                $featsArr[$offset + $i]  = $fBuf[$i];
-                $threshArr[$offset + $i] = $tBuf[$i];
-                $leftsArr[$offset + $i]  = $lBuf[$i];
-                $rightsArr[$offset + $i] = $rBuf[$i];
-            }
+            Tensor::gbdtCollectTree($this->treeFeats,  $t, $maxNodes, $outFeats);
+            Tensor::gbdtCollectTree($this->treeThresh, $t, $maxNodes, $outThresh);
+            Tensor::gbdtCollectTree($this->treeLefts,  $t, $maxNodes, $outLefts);
+            Tensor::gbdtCollectTree($this->treeRights, $t, $maxNodes, $outRights);
             unset($g, $h);
         }
 
-        $this->treeFeats  = Tensor::fromArray($featsArr)->reshape($T, $maxNodes);
-        $this->treeThresh = Tensor::fromArray($threshArr)->reshape($T, $maxNodes);
-        $this->treeLefts  = Tensor::fromArray($leftsArr)->reshape($T, $maxNodes);
-        $this->treeRights = Tensor::fromArray($rightsArr)->reshape($T, $maxNodes);
+        $this->treeFeats  = $this->treeFeats->reshape($T, $maxNodes);
+        $this->treeThresh = $this->treeThresh->reshape($T, $maxNodes);
+        $this->treeLefts  = $this->treeLefts->reshape($T, $maxNodes);
+        $this->treeRights = $this->treeRights->reshape($T, $maxNodes);
         $this->treeSizes  = Tensor::fromArray($sizesArr);
     }
 

@@ -114,7 +114,7 @@ final class ExtraTreeClassifier implements Learner, Persistable
             if ($min === $max) continue;
 
             // Generate exactly ONE random threshold
-            $threshold = $min + (lcg_value() * ($max - $min));
+            $threshold = $min + (mt_rand() / mt_getrandmax() * ($max - $min));
 
             $threshT = Tensor::zeros($n)->addScalarInplace($threshold);
             $mask = $col->less($threshT);
