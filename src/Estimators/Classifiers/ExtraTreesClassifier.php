@@ -23,6 +23,8 @@ final class ExtraTreesClassifier implements Learner, Persistable
     private int $maxDepth;
     private int $minSamplesSplit;
     
+    private int $numClasses = 0;
+
     /** @var ExtraTreeClassifier[] */
     private array $trees = [];
 
@@ -37,6 +39,7 @@ final class ExtraTreesClassifier implements Learner, Persistable
     {
         $features = $dataset->numColumns();
         $maxFeatures = (int) max(1, sqrt($features));
+        $this->numClasses = (int)($dataset->labels()->max() + 1);
 
         for ($i = 0; $i < $this->nEstimators; $i++) {
             // Note: ExtraTrees uses the whole dataset by default (no bootstrapping)
@@ -54,28 +57,13 @@ final class ExtraTreesClassifier implements Learner, Persistable
             throw new RuntimeException("ExtraTrees Ensemble is not trained.");
         }
 
-        $n = $dataset->numRows();
-        $treePreds = [];
-        
+        // Stack T tree predictions into [N, T] then C majority-vote — zero PHP per-sample work
+        $cols = [];
         foreach ($this->trees as $tree) {
-            $treePreds[] = $tree->predict($dataset)->toFlatArray();
+            $cols[] = $tree->predict($dataset)->expandDims(1);  // [N, 1]
         }
-
-        $finalPreds = [];
-        
-        // JIT Optimized Majority Voting
-        for ($i = 0; $i < $n; $i++) {
-            $votes = [];
-            foreach ($treePreds as $preds) {
-                $v = (int) $preds[$i];
-                $votes[$v] = ($votes[$v] ?? 0) + 1;
-            }
-            
-            arsort($votes);
-            $finalPreds[] = array_key_first($votes);
-        }
-
-        return Tensor::fromArray($finalPreds);
+        $votesMatrix = Tensor::concat($cols, 1);                // [N, T]
+        return Tensor::matrixVote($votesMatrix, $this->numClasses);
     }
 
     public function trained(): bool
@@ -86,7 +74,7 @@ final class ExtraTreesClassifier implements Learner, Persistable
     public function save(string $dir): void
     {
         is_dir($dir) || mkdir($dir, 0755, true);
-        file_put_contents($dir . '/config.json', json_encode(['nEstimators' => $this->nEstimators, 'maxDepth' => $this->maxDepth, 'minSamplesSplit' => $this->minSamplesSplit]));
+        file_put_contents($dir . '/config.json', json_encode(['nEstimators' => $this->nEstimators, 'maxDepth' => $this->maxDepth, 'minSamplesSplit' => $this->minSamplesSplit, 'numClasses' => $this->numClasses]));
         $treeData = [];
         foreach ($this->trees as $tree) { $treeData[] = $tree->exportPhpTree(); }
         file_put_contents($dir . '/trees.json', json_encode($treeData));
@@ -96,6 +84,7 @@ final class ExtraTreesClassifier implements Learner, Persistable
     {
         $c = json_decode(file_get_contents($dir . '/config.json'), true);
         $i = new self((int) $c['nEstimators'], (int) $c['maxDepth'], (int) $c['minSamplesSplit']);
+        $i->numClasses = (int) ($c['numClasses'] ?? 2);
         foreach (json_decode(file_get_contents($dir . '/trees.json'), true) as $treeData) {
             $i->trees[] = ExtraTreeClassifier::fromPhpTree($treeData);
         }

@@ -325,6 +325,26 @@ final class Tensor {
         self::checkError();
     }
 
+    public static function fusedSgdStep(self $param, self $grad, float $lr): void {
+        self::ffi()->tensor_fused_sgd_step($param->ptr, $grad->ptr, $lr);
+        self::checkError();
+    }
+
+    public static function fusedRmsPropStep(self $param, self $grad, self $cache, float $lr, float $decay, float $eps): void {
+        self::ffi()->tensor_fused_rmsprop_step($param->ptr, $grad->ptr, $cache->ptr, $lr, $decay, $eps);
+        self::checkError();
+    }
+
+    public static function fusedAdaGradStep(self $param, self $grad, self $acc, float $lr, float $eps): void {
+        self::ffi()->tensor_fused_adagrad_step($param->ptr, $grad->ptr, $acc->ptr, $lr, $eps);
+        self::checkError();
+    }
+
+    public static function fusedAdamWStep(self $param, self $grad, self $m, self $v, float $lr, float $b1, float $b2, float $eps, int $t, float $wd): void {
+        self::ffi()->tensor_fused_adamw_step($param->ptr, $grad->ptr, $m->ptr, $v->ptr, $lr, $b1, $b2, $eps, $t, $wd);
+        self::checkError();
+    }
+
     // --- SHAPE MUTATIONS ---
     public function reshape(int ...$newShape): self {
         $ndim = count($newShape); $ffi = self::ffi();
@@ -381,6 +401,7 @@ final class Tensor {
     public function divInplace(Tensor $b): self { self::ffi()->tensor_div_inplace($this->ptr, $b->ptr); self::checkError(); return $this; }
     public function addScalarInplace(float $val): self { self::ffi()->tensor_add_scalar_inplace($this->ptr, $val); self::checkError(); return $this; }
     public function mulScalarInplace(float $val): self { self::ffi()->tensor_mul_scalar_inplace($this->ptr, $val); self::checkError(); return $this; }
+    public function clampInplace(float $lo, float $hi): self { self::ffi()->tensor_clamp_inplace($this->ptr, $lo, $hi); self::checkError(); return $this; }
 
     // --- MATH UNARY ---
     public function sqrt(): self { $res = self::wrap(self::ffi()->tensor_sqrt($this->ptr)); self::checkError(); return $res; }
@@ -736,6 +757,15 @@ final class Tensor {
         return ['U' => self::wrap($U), 'S' => self::wrap($S), 'Vt' => self::wrap($Vt)];
     }
 
+    /** Economy (thin) SVD — U=[m×min_mn], Vt=[min_mn×n]. Safe on tall matrices. */
+    public function svdEconomy(): array {
+        $ffi = self::ffi();
+        $U = $ffi->new("TensorC*"); $S = $ffi->new("TensorC*"); $Vt = $ffi->new("TensorC*");
+        $ffi->tensor_svd_economy($this->ptr, \FFI::addr($U), \FFI::addr($S), \FFI::addr($Vt));
+        self::checkError();
+        return ['U' => self::wrap($U), 'S' => self::wrap($S), 'Vt' => self::wrap($Vt)];
+    }
+
     public function eigenSym(): array {
         $ffi = self::ffi();
         $Vals = $ffi->new("TensorC*"); $Vecs = $ffi->new("TensorC*");
@@ -779,7 +809,70 @@ final class Tensor {
         $res = self::wrap(self::ffi()->tensor_embedding_lookup($this->ptr, $weights->ptr));
         self::checkError(); return $res;
     }
-    
+
+    // -------------------------------------------------------------------------
+    // GPT TRAINING PRIMITIVES
+    // -------------------------------------------------------------------------
+
+    /** GELU activation (tanh approx). Returns new tensor with same shape. */
+    public function gelu(): self {
+        $res = self::wrap(self::ffi()->tensor_gelu($this->ptr));
+        self::checkError(); return $res;
+    }
+
+    /** GELU backward: dx = $this * GELU'($x). $this=dOut, $x=original forward input. */
+    public function geluBackward(self $x): self {
+        $res = self::wrap(self::ffi()->tensor_gelu_backward($this->ptr, $x->ptr));
+        self::checkError(); return $res;
+    }
+
+    /**
+     * LayerNorm forward: out = (x − μ)/√(σ²+eps) · weight + bias.
+     * $this: [*, D],  $weight: [D],  $bias: [D]|null,  $eps: float
+     */
+    public function layernormForward(self $weight, ?self $bias, float $eps = 1e-5): self {
+        $res = self::wrap(self::ffi()->tensor_layernorm_forward(
+            $this->ptr, $weight->ptr, $bias?->ptr, $eps
+        ));
+        self::checkError(); return $res;
+    }
+
+    /**
+     * LayerNorm backward. $dWeight and $dBias must be pre-zeroed; accumulates +=.
+     * $this=dY, returns dx.
+     */
+    public function layernormBackward(self $x, self $weight, float $eps,
+                                       self $dWeight, ?self $dBias): self {
+        $res = self::wrap(self::ffi()->tensor_layernorm_backward(
+            $this->ptr, $x->ptr, $weight->ptr, $eps, $dWeight->ptr, $dBias?->ptr
+        ));
+        self::checkError(); return $res;
+    }
+
+    /**
+     * Causal masked multi-head attention forward.
+     * $this=out [nH,T,hd] pre-allocated. q,k,v: [nH,T,hd]. attn: [nH,T,T]|null.
+     */
+    public function causalAttention(self $q, self $k, self $v, ?self $attn): void {
+        self::ffi()->tensor_causal_attention(
+            $this->ptr, $q->ptr, $k->ptr, $v->ptr, $attn?->ptr
+        );
+        self::checkError();
+    }
+
+    /**
+     * Causal attention backward.
+     * $this=dOut [nH,T,hd]. dQ, dK, dV are overwritten (pre-allocated by caller).
+     */
+    public function causalAttentionBackward(self $attn, self $Q, self $K, self $V,
+                                             self $dQ,   self $dK, self $dV): void {
+        self::ffi()->tensor_causal_attention_backward(
+            $this->ptr, $attn->ptr, $Q->ptr, $K->ptr, $V->ptr,
+            $dQ->ptr, $dK->ptr, $dV->ptr
+        );
+        self::checkError();
+    }
+
     // -------------------------------------------------------------------------
     // MAMBA / SELECTIVE SSM ENGINE
     // -------------------------------------------------------------------------
@@ -1245,6 +1338,84 @@ final class Tensor {
     public static function gbdtCollectTree(self $dest, int $treeIdx, int $maxNodes, self $src): void {
         self::ffi()->tensor_gbdt_collect_tree($dest->ptr, $treeIdx, $maxNodes, $src->ptr);
         self::checkError();
+    }
+
+    // ── Section 26: Multiclass GBDT Kernels ──────────────────────────────────
+
+    /** Broadcast [K] base scores into every row of pre-allocated [N,K] preds tensor. */
+    public static function gbdtInitPredsMC(self $outNK, self $baseK): void {
+        self::ffi()->tensor_gbdt_init_preds_mc($outNK->ptr, $baseK->ptr);
+        self::checkError();
+    }
+
+    /**
+     * Softmax cross-entropy gradients/hessians for all K classes in one C call.
+     * rawNK: [N,K] FLOAT32 logits; yN: [N] INT32 or FLOAT32 class indices.
+     * Returns [outG [N,K], outH [N,K]] pre-allocated and filled by C.
+     *
+     * @return array{Tensor, Tensor}
+     */
+    public static function gbdtSoftmaxGradHess(self $rawNK, self $yN): array {
+        $shape = $rawNK->shape();
+        $outG = new self($shape);
+        $outH = new self($shape);
+        self::ffi()->tensor_gbdt_softmax_grad_hess($rawNK->ptr, $yN->ptr, $outG->ptr, $outH->ptr);
+        self::checkError();
+        return [$outG, $outH];
+    }
+
+    /**
+     * In-place variant: writes into caller-supplied $outG / $outH (same shape as $rawNK).
+     * Avoids re-allocating the gradient tensors every boosting round.
+     */
+    public static function gbdtSoftmaxGradHessInto(
+        self $rawNK, self $yN, self $outG, self $outH
+    ): void {
+        self::ffi()->tensor_gbdt_softmax_grad_hess($rawNK->ptr, $yN->ptr, $outG->ptr, $outH->ptr);
+        self::checkError();
+    }
+
+    /**
+     * Train one leaf-wise GBDT tree for class column $kc of [N,K] grad/hess tensors.
+     * Reads g_NK/h_NK/preds_NK at stride K — zero memory copies.
+     * Updates preds_NK in-place for column $kc only.
+     * Returns number of nodes used.
+     */
+    public static function gbdtTrainTreeMC(
+        self $bins, self $gNK, self $hNK,
+        int $K, int $kc,
+        int $Q, int $maxLeaves,
+        float $lambda, float $alpha, float $gamma, float $minHess, float $lr,
+        self $predsNK,
+        self $outFeats, self $outThresh, self $outLefts, self $outRights
+    ): int {
+        $n = self::ffi()->tensor_gbdt_train_tree_mc(
+            $bins->ptr, $gNK->ptr, $hNK->ptr, $K, $kc,
+            $Q, $maxLeaves, $lambda, $alpha, $gamma, $minHess, $lr,
+            $predsNK->ptr,
+            $outFeats->ptr, $outThresh->ptr, $outLefts->ptr, $outRights->ptr
+        );
+        self::checkError();
+        return (int)$n;
+    }
+
+    /**
+     * Multiclass batch prediction: one FFI call returns [N, K] raw logits.
+     * feats/thresh/lefts/rights: [T*K, maxNodes]; treeSizes: [T*K]; baseScores: [K].
+     * Apply rowSoftmaxInplace() for class probabilities.
+     */
+    public static function gbdtPredictAllMC(
+        self $bins, self $feats, self $thresholds,
+        self $lefts, self $rights, self $treeSizes,
+        self $baseScores, int $K
+    ): self {
+        $res = self::wrap(self::ffi()->tensor_gbdt_predict_all_mc(
+            $bins->ptr, $feats->ptr, $thresholds->ptr,
+            $lefts->ptr, $rights->ptr, $treeSizes->ptr,
+            $baseScores->ptr, $K
+        ));
+        self::checkError();
+        return $res;
     }
 
     /** Isolation Forest batch scoring: returns [N] anomaly scores in [0,1].

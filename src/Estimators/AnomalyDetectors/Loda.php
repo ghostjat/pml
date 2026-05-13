@@ -79,39 +79,37 @@ final class Loda implements Learner, Persistable
             throw new RuntimeException("LODA is not trained.");
         }
 
-        $x = $dataset->samples();
-        
-        // Project test dataset natively in C
-        $z = $x->matmul($this->projections);
+        $x    = $dataset->samples();
+        $z    = $x->matmul($this->projections);      // [N, P] — one BLAS call
         $rows = $z->shape()[0];
-        
-        $flatZ = $z->toFlatArray();
-        $scores = [];
+        $totalScore = Tensor::zeros($rows);
 
-        // JIT Loop: Map projections back to log-probabilities
-        for ($i = 0; $i < $rows; $i++) {
-            $rowScore = 0.0;
-            
-            for ($p = 0; $p < $this->nProjections; $p++) {
-                $val = $flatZ[$i * $this->nProjections + $p];
-                $min = $this->binEdges[$p]['min'];
-                $width = $this->binEdges[$p]['width'];
-                
-                $binIdx = (int) floor(($val - $min) / $width);
-                
-                if ($binIdx < 0 || $binIdx >= $this->bins) {
-                    // Out of bounds values are considered highly anomalous (Lowest Probability)
-                    $rowScore += -log(1e-8);
-                } else {
-                    $rowScore += $this->histograms[$p][$binIdx];
-                }
-            }
-            
-            // Average negative log-likelihood across all projections
-            $scores[] = $rowScore / $this->nProjections;
+        // O(P) loop: each iteration is O(N) in C — no PHP per-sample work
+        $sentinel = (float) $this->bins;   // index of OOB sentinel in the extended table
+        $sentinelT = Tensor::zeros($rows)->addScalarInplace($sentinel);
+        // log-prob table extended with OOB sentinel at index $bins
+        $oobCost = -log(1e-8);
+
+        for ($p = 0; $p < $this->nProjections; $p++) {
+            $min   = $this->binEdges[$p]['min'];
+            $width = $this->binEdges[$p]['width'];
+
+            $rawBin = $z->col($p)->addScalar(-$min)->mulScalar(1.0 / $width)->floor();
+
+            // OOB-high clips to sentinel naturally; OOB-low is overridden via where
+            $clipped = $rawBin->clip(0.0, $sentinel);          // [0, bins]: bins = sentinel index
+            $oobLow  = $rawBin->lessScalar(0.0);               // 1 where val < min
+            $binIdx  = $oobLow->where($sentinelT, $clipped);   // redirect below-range to sentinel
+
+            $logProbTable = Tensor::fromArray(
+                array_merge($this->histograms[$p], [$oobCost])  // append sentinel log-prob at [$bins]
+            );
+
+            $totalScore->addInplace(Tensor::gatherIndices($binIdx, $logProbTable));
+            unset($rawBin, $clipped, $oobLow, $binIdx, $logProbTable);
         }
 
-        return Tensor::fromArray($scores);
+        return $totalScore->mulScalarInplace(1.0 / $this->nProjections);
     }
 
     public function trained(): bool

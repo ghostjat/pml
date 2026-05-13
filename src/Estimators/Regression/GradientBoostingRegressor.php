@@ -72,15 +72,13 @@ final class GradientBoostingRegressor implements Learner, Persistable
             if ($this->subsample < 1.0) {
                 // Stochastic Gradient Boosting
                 $subsampleSize = (int) max(1, $n * $this->subsample);
-                
-                $indices = array_rand(range(0, $n - 1), $subsampleSize);
-                $indicesTensor = Tensor::fromArray((array) $indices);
+                $indicesTensor = Tensor::range(0, $n - 1, 1)->randomPermutation()->slice(0, 0, $subsampleSize);
 
                 // Zero-copy view extractions
                 $subX = $x->take($indicesTensor, 0);
                 $subY = $residuals->take($indicesTensor, 0);
                 
-                unset($indices, $indicesTensor);
+                unset($indicesTensor);
             } else {
                 $subX = $x;
                 $subY = $residuals;

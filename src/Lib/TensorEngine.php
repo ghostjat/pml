@@ -9,6 +9,7 @@ namespace Pml\Lib;
 final class TensorEngine {
     private static ?\FFI $ffi = null;
 
+    /** @return \TensorFFI */
     public static function get(): \FFI {
         if (self::$ffi === null) {
             $libPath = __DIR__ . '/libtensor.so';
@@ -108,6 +109,7 @@ final class TensorEngine {
                 void tensor_div_inplace(TensorC* A, TensorC* B);
                 void tensor_add_scalar_inplace(TensorC* A, float val);
                 void tensor_mul_scalar_inplace(TensorC* A, float val);
+                void tensor_clamp_inplace(TensorC* A, float lo, float hi);
 
                 TensorC* tensor_sqrt(TensorC* A);
                 TensorC* tensor_square(TensorC* A);
@@ -201,6 +203,7 @@ final class TensorEngine {
                 TensorC* tensor_cholesky(TensorC* A);
                 void tensor_lu(TensorC* A, TensorC** P_out, TensorC** L_out, TensorC** U_out);
                 void tensor_svd(TensorC* A, TensorC** U_out, TensorC** S_out, TensorC** Vt_out);
+                void tensor_svd_economy(TensorC* A, TensorC** U_out, TensorC** S_out, TensorC** Vt_out);
                 void tensor_eigen_sym(TensorC* A, TensorC** EigenVals_out, TensorC** EigenVecs_out);
                 TensorC* tensor_ref(TensorC* A);
                 TensorC* tensor_rref(TensorC* A);
@@ -215,6 +218,10 @@ final class TensorEngine {
 
                 void tensor_fused_bce_loss_and_grad(TensorC* preds, TensorC* targets, TensorC* grads, float* out_loss);
                 void tensor_fused_adam_step(TensorC* param, TensorC* grad, TensorC* m, TensorC* v, float lr, float b1, float b2, float eps, int t);
+                void tensor_fused_sgd_step(TensorC* param, TensorC* grad, float lr);
+                void tensor_fused_rmsprop_step(TensorC* param, TensorC* grad, TensorC* cache, float lr, float decay, float eps);
+                void tensor_fused_adagrad_step(TensorC* param, TensorC* grad, TensorC* acc, float lr, float eps);
+                void tensor_fused_adamw_step(TensorC* param, TensorC* grad, TensorC* m, TensorC* v, float lr, float b1, float b2, float eps, int t, float wd);
 
                 // --- FUSED NEURAL NETWORK KERNELS ---
                 // out = X @ W^T + bias  (bias may be NULL)
@@ -299,6 +306,17 @@ final class TensorEngine {
                 /* Convenience zero-allocators. */
                 TensorC* tensor_mamba_alloc_state(int batch, int d_model, int d_state);
                 TensorC* tensor_mamba_alloc_cache(int batch, int seq_len, int d_model, int d_state);
+
+                // ── Section 28: GPT Training Primitives ──────────────────────
+                TensorC* tensor_gelu(TensorC* A);
+                TensorC* tensor_gelu_backward(TensorC* dOut, TensorC* X);
+                TensorC* tensor_layernorm_forward(TensorC* x, TensorC* weight, TensorC* bias, float eps);
+                TensorC* tensor_layernorm_backward(TensorC* dY, TensorC* x, TensorC* weight, float eps,
+                                                    TensorC* dWeight, TensorC* dBias);
+                void tensor_causal_attention(TensorC* out, TensorC* q, TensorC* k, TensorC* v, TensorC* attn);
+                void tensor_causal_attention_backward(TensorC* dOut, TensorC* attn,
+                                                       TensorC* Q, TensorC* K, TensorC* V,
+                                                       TensorC* dQ, TensorC* dK, TensorC* dV);
 
                 // ---------------------------------------------------------------
                 // Columnar DataFrame + ETL  (src/Lib/dataset_io.c)
@@ -437,6 +455,29 @@ final class TensorEngine {
                                                TensorC* lefts_flat,  TensorC* rights_flat,
                                                TensorC* lsize_flat,  TensorC* tree_sizes,
                                                float c_norm);
+
+                // ── Section 26: Multiclass GBDT Kernels ──────────────────────
+                void     tensor_gbdt_init_preds_mc(TensorC* out_NK, TensorC* base_K);
+                void     tensor_gbdt_softmax_grad_hess(TensorC* raw_NK, TensorC* y_N,
+                                                        TensorC* out_g, TensorC* out_h);
+                int      tensor_gbdt_train_tree_mc(TensorC* bins,
+                                                    TensorC* g_NK, TensorC* h_NK,
+                                                    int K, int kc,
+                                                    int Q, int max_leaves,
+                                                    float lambda, float alpha, float gamma,
+                                                    float min_hess, float lr,
+                                                    TensorC* preds_NK,
+                                                    TensorC* out_feats, TensorC* out_thresholds,
+                                                    TensorC* out_lefts, TensorC* out_rights);
+                TensorC* tensor_gbdt_predict_all_mc(TensorC* X_bins,
+                                                     TensorC* feats, TensorC* thresholds,
+                                                     TensorC* lefts, TensorC* rights,
+                                                     TensorC* tree_sizes, TensorC* base_scores,
+                                                     int K);
+
+                // ── Section 27: Permutation Importance Helpers ───────────────
+                void     tensor_permute_column(TensorC* X, int col, TensorC* backup);
+                void     tensor_restore_column(TensorC* X, int col, const TensorC* backup);
 
                 // ── Section 25: HPC Estimator Kernels — Batch 2 ──────────────
                 TensorC* tensor_bootstrap_indices(int N);

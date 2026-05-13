@@ -149,8 +149,7 @@ final class GaussianMixture implements Learner, Probabilistic, Persistable
 
     public function predict(Dataset $dataset): Tensor
     {
-        // Output the Gaussian Component with the highest probability
-        return $this->proba($dataset)->argmax();
+        return $this->proba($dataset)->argmaxAxis(1);
     }
 
     public function trained(): bool

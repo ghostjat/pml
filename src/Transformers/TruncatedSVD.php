@@ -27,7 +27,7 @@ final class TruncatedSVD implements Transformer, Stateful
     {
         $x = $dataset->samples();                                  // [N × D]
 
-        ['U' => $U, 'S' => $S, 'Vt' => $Vt] = $x->svd();
+        ['Vt' => $Vt] = $x->svdEconomy();
 
         // Keep only top nComponents rows of Vt — zero-copy slice
         $nComp    = min($this->nComponents, $Vt->shape()[0]);

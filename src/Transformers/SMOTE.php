@@ -84,7 +84,7 @@ final class SMOTE implements Transformer
             $pointB = $xMin->row($idxB);
 
             // Interpolate: New = A + rand(0, 1) * (B - A)
-            $step = lcg_value();
+            $step = mt_rand() / mt_getrandmax();
             $diff = $pointB->sub($pointA)->mulScalarInplace($step);
             $synthetic[] = $pointA->addInplace($diff);
         }

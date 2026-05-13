@@ -216,24 +216,21 @@ final class Dense implements Layer, Stateful, HasTrainingMode
      */
     public function loadStateDict(array $dict, string $prefix = ''): void
     {
+        // SafeTensorsIO::load() returns mmap-backed tensors (owns_data=false).
+        // Storing a direct reference means the C struct is freed when the caller's
+        // $weights dict goes out of scope, leaving $this->weights as a dangling
+        // pointer → SIGSEGV on the first forward pass.  copyFrom() memcpy's the
+        // data into the tensor we already own, so the mmap lifetime is irrelevant.
         $wKey = $prefix . 'weight';
         if (isset($dict[$wKey])) {
-            $this->weights = $dict[$wKey];
-            // Reinitialise gradient buffer to match new weight shape
-            $outDim = $this->weights->ptr->shape[0];
-            $inDim  = $this->weights->ptr->shape[1];
-            $this->dW = Tensor::zeros($outDim, $inDim);
-            // Refresh capability flags (class is the same, but good hygiene)
-            $this->hasMatmulInto = method_exists($this->dW, 'matmulInto');
+            $this->weights->copyFrom($dict[$wKey]);
+            // dW was allocated in the constructor with the same shape — no realloc needed.
         }
 
         $bKey = $prefix . 'bias';
-        if (isset($dict[$bKey])) {
-            $this->bias   = $dict[$bKey];
-            $this->dbias  = Tensor::zeros($this->bias->ptr->shape[0]);
-            $this->hasSumInto = method_exists($this->dbias, 'sumAxisInto');
-        } elseif (!array_key_exists($bKey, $dict) && $this->bias !== null) {
-            // Key absent but layer was constructed with bias: leave existing bias
+        if (isset($dict[$bKey]) && $this->bias !== null) {
+            $this->bias->copyFrom($dict[$bKey]);
+            // dbias likewise stays correctly sized from construction.
         }
     }
 }

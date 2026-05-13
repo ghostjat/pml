@@ -51,10 +51,10 @@ final class Conv2D implements Layer, Stateful
 
         // Invokes our dedicated C-kernel that computes dX, dW, and dbias simultaneously 
         // using highly-optimized OpenBLAS GEMM operations on im2col matrices.
-        $grads = $this->input->conv2dBackward(
-            $dY, 
-            $this->weights, 
-            $this->stride, $this->stride, 
+        $grads = $dY->conv2dBackward(
+            $this->input,
+            $this->weights,
+            $this->stride, $this->stride,
             $this->padding, $this->padding
         );
 

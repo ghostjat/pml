@@ -56,7 +56,7 @@ final class PlusPlus implements Seeder
             }
 
             // 3. Roulette Wheel Selection (O(N) Sum, O(1) Search)
-            $r = lcg_value() * $sum;
+            $r = (mt_rand() / mt_getrandmax()) * $sum;
             $cumsum = 0.0;
             $selectedIndex = $n - 1;
             

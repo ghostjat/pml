@@ -28,30 +28,21 @@ final class AdaGrad implements Optimizer
     public function step(array $layers): void
     {
         foreach ($layers as $layer) {
-            foreach ($layer->getParameters() as $name => $paramTensor) {
-                $grads = $layer->getGradients();
-                
-                if (isset($grads[$name])) {
-                    $oid = spl_object_id($paramTensor);
-                    $g = $grads[$name];
+            $params = $layer->getParameters();
+            $grads  = $layer->getGradients();
 
-                    if (!isset($this->cache[$oid])) {
-                        $this->cache[$oid] = Tensor::zeros(...$paramTensor->shape());
-                    }
+            foreach ($params as $name => $param) {
+                if (!isset($grads[$name])) continue;
 
-                    $cache = $this->cache[$oid];
-
-                    // Cache += g^2
-                    $gSq = $g->square();
-                    $cache->addInplace($gSq);
-
-                    // Update = (lr / sqrt(Cache + eps)) * g
-                    $denom = $cache->addScalar($this->epsilon)->sqrt();
-                    $update = $g->divInplace($denom)->mulScalarInplace($this->learningRate);
-
-                    // Apply update In-Place
-                    $paramTensor->subInplace($update);
+                $oid = spl_object_id($param);
+                if (!isset($this->cache[$oid])) {
+                    $this->cache[$oid] = Tensor::zeros(...$param->shape());
                 }
+
+                Tensor::fusedAdaGradStep(
+                    $param, $grads[$name], $this->cache[$oid],
+                    $this->learningRate, $this->epsilon
+                );
             }
         }
     }

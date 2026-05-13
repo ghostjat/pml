@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace Pml\Serialization;
 
-use Pml\Backends\RubixBackend;
 use Pml\Backends\TorchBackend;
 use Pml\Interfaces\MLBackend;
 use RuntimeException;
@@ -14,13 +13,11 @@ use RuntimeException;
  *
  * Writes a thin `hub_meta.json` manifest alongside the model artifact
  * so that load() can reconstruct the correct backend without the caller
- * having to know whether the artifact is SafeTensors or RBX.
+ * having to know which format was used.
  *
  * Directory layout:
  *   $dir/hub_meta.json        — backend name + artifact path
  *   $dir/model/               — SafeTensors bundle (TorchBackend)
- *         OR
- *   $dir/model.rbx            — RBX file (RubixBackend)
  *
  * Usage:
  *   ModelHub::save($backend, '/checkpoints/v1');
@@ -66,10 +63,9 @@ final class ModelHub
 
         return match ($backend) {
             'torch' => TorchBackend::load($artifact),
-            'rubix' => RubixBackend::load($artifact),
             default => throw new RuntimeException(
                 "ModelHub::load — unknown backend '$backend'. "
-                . "Register a custom loader or use TorchBackend/RubixBackend::load() directly."
+                . "Register a custom loader or use TorchBackend::load() directly."
             ),
         };
     }
@@ -78,11 +74,7 @@ final class ModelHub
 
     private static function artifactPath(MLBackend $backend, string $dir): string
     {
-        return match ($backend->backendName()) {
-            'torch' => $dir . \DIRECTORY_SEPARATOR . 'model',      // directory
-            'rubix' => $dir . \DIRECTORY_SEPARATOR . 'model.rbx',  // file
-            default => $dir . \DIRECTORY_SEPARATOR . 'model',
-        };
+        return $dir . \DIRECTORY_SEPARATOR . 'model';
     }
 
     private static function relPath(string $base, string $absolute): string

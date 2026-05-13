@@ -88,6 +88,28 @@ final class MLPClassifier implements Learner, Probabilistic, Persistable
         $this->network->train($trainDataset, $this->epochs, $this->batchSize);
     }
 
+    /**
+     * Incremental update — one epoch on new data, preserving existing weights.
+     * Call train() first, then partial() for each incoming mini-batch.
+     */
+    public function partial(Dataset $dataset, int $epochs = 1): void
+    {
+        if (!$this->trained()) {
+            throw new RuntimeException("Call train() before partial().");
+        }
+        $labels = $dataset->labels();
+        if ($labels === null) {
+            throw new \InvalidArgumentException("partial() requires labeled data.");
+        }
+        $flat = $labels->toFlatArray();
+        $k    = count($this->indexMap);
+        $idxArr       = array_map(fn($l) => (float)($this->classMap[(string)$l] ?? 0), $flat);
+        $idxT         = Tensor::fromArray($idxArr);
+        $oneHot       = Tensor::onehot($idxT, $k);
+        $trainDataset = new Dataset($dataset->samples(), $oneHot);
+        $this->network->train($trainDataset, epochs: $epochs, batchSize: $this->batchSize);
+    }
+
     public function proba(Dataset $dataset): Tensor
     {
         if (!$this->trained()) {
@@ -98,15 +120,8 @@ final class MLPClassifier implements Learner, Probabilistic, Persistable
 
     public function predict(Dataset $dataset): Tensor
     {
-        $proba   = $this->proba($dataset);
-        $k       = count($this->indexMap);
-        $indices = $proba->argsort(1)->col($k - 1)->toFlatArray();
-
-        $preds = [];
-        foreach ($indices as $idx) {
-            $preds[] = $this->indexMap[(int) $idx] ?? 0;
-        }
-        return Tensor::fromArray($preds);
+        $labelTable = Tensor::fromArray(array_map('floatval', $this->indexMap));
+        return Tensor::gatherIndices($this->proba($dataset)->argmaxAxis(1), $labelTable);
     }
 
     public function trained(): bool

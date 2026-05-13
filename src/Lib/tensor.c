@@ -647,6 +647,26 @@ Tensor* tensor_mul_scalar(Tensor* A, float val) { Tensor* out = tensor_create_un
 void tensor_add_scalar_inplace(Tensor* A, float val) { TENSOR_SCALAR_IMPL(_mm256_add_ps, +, A, 1, TENSOR_ERROR_VOID); }
 void tensor_mul_scalar_inplace(Tensor* A, float val) { TENSOR_SCALAR_IMPL(_mm256_mul_ps, *, A, 1, TENSOR_ERROR_VOID); }
 
+void tensor_clamp_inplace(Tensor* A, float lo, float hi) {
+    if (!A || !A->data) return;
+    float* d = (float*)A->data;
+    size_t n = A->total_size;
+#ifdef __AVX2__
+    __m256 vlo = _mm256_set1_ps(lo);
+    __m256 vhi = _mm256_set1_ps(hi);
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_loadu_ps(d + i);
+        v = _mm256_max_ps(v, vlo);
+        v = _mm256_min_ps(v, vhi);
+        _mm256_storeu_ps(d + i, v);
+    }
+    for (; i < n; i++) { d[i] = d[i] < lo ? lo : (d[i] > hi ? hi : d[i]); }
+#else
+    for (size_t i = 0; i < n; i++) { d[i] = d[i] < lo ? lo : (d[i] > hi ? hi : d[i]); }
+#endif
+}
+
 // ============================================================================
 // 5. UNARY MATH & LOGICAL
 // ============================================================================
@@ -2410,17 +2430,49 @@ void tensor_svd(Tensor* A, Tensor** U_out, Tensor** S_out, Tensor** Vt_out) {
     Tensor* S = tensor_create(1, &min_mn);
     Tensor* U = tensor_create(2, (int[]){m, m});
     Tensor* Vt = tensor_create(2, (int[]){n, n});
-    Tensor* copyA = tensor_copy(A); 
-    
+    Tensor* copyA = tensor_copy(A);
+
     int info = LAPACKE_sgesdd(LAPACK_ROW_MAJOR, 'A', m, n, F32(copyA), n, F32(S), F32(U), m, F32(Vt), n);
     if (info != 0) {
         tensor_free(S); tensor_free(U); tensor_free(Vt); tensor_free(copyA);
         TENSOR_ERROR_VOID("FATAL [SVD]: SVD convergence failed.");
     }
     tensor_free(copyA);
-    
+
     if(U_out) *U_out = U; else tensor_free(U);
     if(S_out) *S_out = S; else tensor_free(S);
+    if(Vt_out) *Vt_out = Vt; else tensor_free(Vt);
+}
+
+/* Economy (thin) SVD — jobz='S':
+ *   U  = [m × min_mn]  instead of [m × m]
+ *   Vt = [min_mn × n]  instead of [n × n]
+ *   S  = [min_mn]      (identical to full SVD)
+ *
+ * Avoids the O(m²) U allocation that causes SIGSEGV on tall matrices
+ * (e.g. [100k × 2879] → U=[100k×100k] = 40 GB with full SVD).
+ * Safe for TruncatedSVD callers that only read the top-k rows of Vt.
+ * tensor_svd() is unchanged to preserve pinv(), tests, and all other callers. */
+void tensor_svd_economy(Tensor* A, Tensor** U_out, Tensor** S_out, Tensor** Vt_out) {
+    if(A->ndim != 2 || A->dtype != DTYPE_FLOAT32) TENSOR_ERROR_VOID("FATAL [SVD_ECO]: Must be 2D FLOAT32.");
+    int m = A->shape[0]; int n = A->shape[1]; int min_mn = MIN(m, n);
+    Tensor* S   = tensor_create(1, &min_mn);
+    Tensor* U   = tensor_create(2, (int[]){m, min_mn});        /* [m × min_mn] */
+    Tensor* Vt  = tensor_create(2, (int[]){min_mn, n});        /* [min_mn × n] */
+    Tensor* copyA = tensor_copy(A);
+
+    /* ldu = min_mn  (columns per row of U in row-major)
+     * ldvt = n      (columns per row of Vt in row-major) */
+    int info = LAPACKE_sgesdd(LAPACK_ROW_MAJOR, 'S', m, n, F32(copyA), n,
+                              F32(S), F32(U), min_mn, F32(Vt), n);
+    if (info != 0) {
+        tensor_free(S); tensor_free(U); tensor_free(Vt); tensor_free(copyA);
+        TENSOR_ERROR_VOID("FATAL [SVD_ECO]: SVD convergence failed.");
+    }
+    tensor_free(copyA);
+
+    if(U_out)  *U_out  = U;  else tensor_free(U);
+    if(S_out)  *S_out  = S;  else tensor_free(S);
     if(Vt_out) *Vt_out = Vt; else tensor_free(Vt);
 }
 
@@ -3250,6 +3302,102 @@ void tensor_fused_adam_step(Tensor* param, Tensor* grad, Tensor* m, Tensor* v, f
     #pragma omp parallel for simd
     for (int i = 0; i < size; i++) {
         float g = F32(grad)[i];
+        F32(m)[i] = b1 * F32(m)[i] + (1.0f - b1) * g;
+        F32(v)[i] = b2 * F32(v)[i] + (1.0f - b2) * g * g;
+        float v_hat_sqrt = sqrtf(fmaxf(0.0f, F32(v)[i] / bias_correction2)) + eps;
+        F32(param)[i] -= step_size * (F32(m)[i] / v_hat_sqrt);
+    }
+}
+
+// ── Fused SGD step ────────────────────────────────────────────────────────────
+// param -= lr * grad  (no momentum, no state)
+void tensor_fused_sgd_step(Tensor* param, Tensor* grad, float lr) {
+    if (!_tensor_shape_assert(param, grad, "fused_sgd")) return;
+    if (!tensor_is_contiguous(param) || !tensor_is_contiguous(grad))
+        TENSOR_ERROR_VOID("FATAL [Fused SGD]: Tensors must be contiguous.");
+
+    float* p = F32(param);
+    const float* g = F32(grad);
+    int n = (int)param->total_size;
+
+    #pragma omp parallel for simd schedule(static)
+    for (int i = 0; i < n; i++) p[i] -= lr * g[i];
+}
+
+// ── Fused RMSProp step ────────────────────────────────────────────────────────
+// cache = decay * cache + (1 - decay) * g^2
+// param -= lr * g / (sqrt(cache) + eps)
+void tensor_fused_rmsprop_step(Tensor* param, Tensor* grad, Tensor* cache,
+                                float lr, float decay, float eps) {
+    if (!_tensor_shape_assert(param, grad, "fused_rmsprop") ||
+        !_tensor_shape_assert(param, cache, "fused_rmsprop")) return;
+    if (!tensor_is_contiguous(param) || !tensor_is_contiguous(grad) ||
+        !tensor_is_contiguous(cache))
+        TENSOR_ERROR_VOID("FATAL [Fused RMSProp]: Tensors must be contiguous.");
+
+    float* p = F32(param);
+    const float* g = F32(grad);
+    float* c = F32(cache);
+    int n = (int)param->total_size;
+    float one_minus_decay = 1.0f - decay;
+
+    #pragma omp parallel for simd schedule(static)
+    for (int i = 0; i < n; i++) {
+        c[i] = decay * c[i] + one_minus_decay * g[i] * g[i];
+        p[i] -= lr * g[i] / (sqrtf(c[i]) + eps);
+    }
+}
+
+// ── Fused AdaGrad step ────────────────────────────────────────────────────────
+// acc += g^2
+// param -= lr * g / (sqrt(acc) + eps)
+void tensor_fused_adagrad_step(Tensor* param, Tensor* grad, Tensor* acc,
+                                float lr, float eps) {
+    if (!_tensor_shape_assert(param, grad, "fused_adagrad") ||
+        !_tensor_shape_assert(param, acc, "fused_adagrad")) return;
+    if (!tensor_is_contiguous(param) || !tensor_is_contiguous(grad) ||
+        !tensor_is_contiguous(acc))
+        TENSOR_ERROR_VOID("FATAL [Fused AdaGrad]: Tensors must be contiguous.");
+
+    float* p = F32(param);
+    const float* g = F32(grad);
+    float* a = F32(acc);
+    int n = (int)param->total_size;
+
+    #pragma omp parallel for simd schedule(static)
+    for (int i = 0; i < n; i++) {
+        a[i] += g[i] * g[i];
+        p[i] -= lr * g[i] / (sqrtf(a[i]) + eps);
+    }
+}
+
+// ── Fused AdamW step ──────────────────────────────────────────────────────────
+// Weight decay applied directly to weights (decoupled from gradient):
+//   param *= (1 - lr * wd)
+//   m = b1*m + (1-b1)*g
+//   v = b2*v + (1-b2)*g^2
+//   param -= step_size * m_hat / (sqrt(v_hat) + eps)
+void tensor_fused_adamw_step(Tensor* param, Tensor* grad, Tensor* m, Tensor* v,
+                              float lr, float b1, float b2, float eps, int t, float wd) {
+    if (t <= 0)
+        TENSOR_ERROR_VOID("FATAL [Fused AdamW]: Step t must be >= 1, got %d.", t);
+    if (!_tensor_shape_assert(param, grad, "fused_adamw") ||
+        !_tensor_shape_assert(param, m, "fused_adamw") ||
+        !_tensor_shape_assert(param, v, "fused_adamw")) return;
+    if (!tensor_is_contiguous(param) || !tensor_is_contiguous(grad) ||
+        !tensor_is_contiguous(m)     || !tensor_is_contiguous(v))
+        TENSOR_ERROR_VOID("FATAL [Fused AdamW]: Tensors must be contiguous.");
+
+    float bias_correction1 = 1.0f - powf(b1, (float)t);
+    float bias_correction2 = 1.0f - powf(b2, (float)t);
+    float step_size = lr / bias_correction1;
+    float decay_factor = 1.0f - lr * wd;
+    int n = (int)param->total_size;
+
+    #pragma omp parallel for simd schedule(static)
+    for (int i = 0; i < n; i++) {
+        float g = F32(grad)[i];
+        F32(param)[i] *= decay_factor;
         F32(m)[i] = b1 * F32(m)[i] + (1.0f - b1) * g;
         F32(v)[i] = b2 * F32(v)[i] + (1.0f - b2) * g * g;
         float v_hat_sqrt = sqrtf(fmaxf(0.0f, F32(v)[i] / bias_correction2)) + eps;
@@ -6538,11 +6686,36 @@ float tensor_entropy_binned(Tensor* A, int n_bins) {
     if (!hist) { TENSOR_ERROR_VAL(0.0f, "OOM"); }
     float* d = F32(A);
     size_t n = A->total_size;
-    for (size_t i = 0; i < n; i++) {
-        int bin = (int)((d[i] - mn) / rng * (float)n_bins);
-        if (bin >= n_bins) bin = n_bins - 1;
-        hist[bin]++;
+    size_t valid_n = 0;
+    if (tensor_is_contiguous(A)) {
+        for (size_t i = 0; i < n; i++) {
+            if (isnanf(d[i])) continue;
+            int bin = (int)((d[i] - mn) / rng * (float)n_bins);
+            if (bin < 0) bin = 0;
+            if (bin >= n_bins) bin = n_bins - 1;
+            hist[bin]++;
+            valid_n++;
+        }
+    } else {
+        int idx[8] = {0};
+        for (size_t i = 0; i < n; i++) {
+            size_t offset = 0;
+            for (int dim = 0; dim < A->ndim; dim++) offset += (size_t)idx[dim] * A->stride[dim];
+            float val = d[offset];
+            if (!isnanf(val)) {
+                int bin = (int)((val - mn) / rng * (float)n_bins);
+                if (bin < 0) bin = 0;
+                if (bin >= n_bins) bin = n_bins - 1;
+                hist[bin]++;
+                valid_n++;
+            }
+            for (int dim = A->ndim - 1; dim >= 0; dim--) {
+                idx[dim]++; if (idx[dim] < A->shape[dim]) break; idx[dim] = 0;
+            }
+        }
     }
+    if (valid_n == 0) { free(hist); return 0.0f; }
+    n = valid_n;
     double entropy = 0.0;
     for (int b = 0; b < n_bins; b++) {
         if (hist[b] > 0) {
@@ -7429,6 +7602,436 @@ Tensor* tensor_gnb_log_likelihood(Tensor* X, Tensor* means_KD,
     return out;
 }
 
+// ─── Section 26: Multiclass GBDT Kernels ─────────────────────────────────────
+// Zero-copy multiclass extension of the binary GBDT engine.
+// All per-sample math stays in C; PHP outer loop calls one C function per tree.
+
+/* 26.1  Broadcast [K] base scores into every row of a pre-allocated [N,K] tensor.
+ *       Used to initialise the prediction matrix before boosting rounds. */
+void tensor_gbdt_init_preds_mc(Tensor* out_NK, Tensor* base_K) {
+    if (!out_NK || !base_K || out_NK->ndim != 2) return;
+    int N = out_NK->shape[0], K = out_NK->shape[1];
+    if ((int)base_K->total_size != K) return;
+    float* op = F32(out_NK);
+    const float* bp = F32(base_K);
+    #pragma omp parallel for schedule(static) if(N > 4096)
+    for (int i = 0; i < N; i++) {
+        float* row = op + (size_t)i * K;
+        for (int k = 0; k < K; k++) row[k] = bp[k];
+    }
+}
+
+/* 26.2  Softmax cross-entropy gradients and hessians for multiclass GBDT.
+ *
+ * raw_NK : [N, K] FLOAT32 — raw logit scores (current predictions)
+ * y_N    : [N]   INT32    — integer class labels in [0, K)
+ * out_g  : [N, K] FLOAT32 — output gradients  (pre-allocated by caller)
+ * out_h  : [N, K] FLOAT32 — output hessians   (pre-allocated by caller)
+ *
+ * For sample i, class k:
+ *   p_k = softmax(raw[i, :])_k
+ *   g[i,k] = p_k - (y[i] == k)
+ *   h[i,k] = max(p_k * (1 - p_k), 1e-16)              */
+void tensor_gbdt_softmax_grad_hess(Tensor* raw_NK, Tensor* y_N,
+                                   Tensor* out_g, Tensor* out_h) {
+    if (!raw_NK || !y_N || !out_g || !out_h) return;
+    if (raw_NK->ndim != 2) return;
+    int N = raw_NK->shape[0], K = raw_NK->shape[1];
+    const float*   rp = F32(raw_NK);
+    const int32_t* yp = (const int32_t*)raw_NK->data; /* overridden below */
+    /* y_N may be FLOAT32 (class-index float) or INT32 */
+    bool y_is_f32 = (y_N->dtype == DTYPE_FLOAT32);
+    const float*   yf = y_is_f32 ? F32(y_N)  : NULL;
+    const int32_t* yi = y_is_f32 ? NULL       : (const int32_t*)y_N->data;
+    float* gp = F32(out_g);
+    float* hp = F32(out_h);
+
+    #pragma omp parallel for schedule(static) if(N > 512)
+    for (int i = 0; i < N; i++) {
+        const float* row = rp + (size_t)i * K;
+        float* grow = gp + (size_t)i * K;
+        float* hrow = hp + (size_t)i * K;
+
+        /* numerically stable softmax: subtract row max */
+        float mx = row[0];
+        for (int k = 1; k < K; k++) if (row[k] > mx) mx = row[k];
+
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++) { grow[k] = expf(row[k] - mx); sum += grow[k]; }
+        float inv_sum = 1.0f / sum;
+        for (int k = 0; k < K; k++) grow[k] *= inv_sum;  /* grow[] now = p_k */
+
+        int yi_val = y_is_f32 ? (int)yf[i] : (int)yi[i];
+        for (int k = 0; k < K; k++) {
+            float pk = grow[k];
+            grow[k] = pk - (k == yi_val ? 1.0f : 0.0f);
+            hrow[k] = fmaxf(pk * (1.0f - pk), 1e-16f);
+        }
+    }
+}
+
+/* 26.3  Multiclass GBDT tree training — column k of the [N,K] gradient matrix.
+ *
+ * Identical algorithm to tensor_gbdt_train_tree but reads g/h/preds at stride K.
+ * No copies — reads directly from the interleaved [N,K] gradient tensor.
+ *
+ * bins   : [N, D] INT32
+ * g_NK   : [N, K] FLOAT32 gradients (all classes, interleaved)
+ * h_NK   : [N, K] FLOAT32 hessians
+ * K      : number of classes
+ * kc     : class column index to train (0 .. K-1)
+ * preds_NK: [N, K] FLOAT32 — updated in-place for column kc only
+ * Returns number of nodes used.                                               */
+
+/* Internal histogram builders that stride by K (multiclass column slice). */
+static void _build_hist_mc_serial(
+    const int32_t* bins_flat, const float* gp, const float* hp,
+    const int* indices, int count, int D, int Q, int K, int kc,
+    float* hist_g, float* hist_h)
+{
+    memset(hist_g, 0, (size_t)D * Q * sizeof(float));
+    memset(hist_h, 0, (size_t)D * Q * sizeof(float));
+    for (int idx = 0; idx < count; idx++) {
+        int si = indices[idx];
+        float gi = gp[(size_t)si * K + kc];
+        float hi = hp[(size_t)si * K + kc];
+        const int32_t* bi = bins_flat + (size_t)si * D;
+        for (int d = 0; d < D; d++) {
+            size_t pos = (size_t)d * Q + bi[d];
+            hist_g[pos] += gi;
+            hist_h[pos] += hi;
+        }
+    }
+}
+
+static void _build_hist_mc_par(
+    const int32_t* bins_flat, const float* gp, const float* hp,
+    const int* indices, int count, int D, int Q, int K, int kc,
+    float* thr_bufs, int max_threads,
+    float* hist_g, float* hist_h)
+{
+    size_t DQ = (size_t)D * Q;
+    if (count <= 8 * D) {
+        _build_hist_mc_serial(bins_flat, gp, hp, indices, count, D, Q, K, kc, hist_g, hist_h);
+        return;
+    }
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        if (tid >= max_threads) tid = max_threads - 1;
+        float* lg = thr_bufs + (size_t)tid * 2 * DQ;
+        float* lh = lg + DQ;
+        memset(lg, 0, 2 * DQ * sizeof(float));
+        #pragma omp for schedule(static)
+        for (int idx = 0; idx < count; idx++) {
+            int si = indices[idx];
+            float gi = gp[(size_t)si * K + kc];
+            float hi = hp[(size_t)si * K + kc];
+            const int32_t* bi = bins_flat + (size_t)si * D;
+            for (int d = 0; d < D; d++) {
+                size_t pos = (size_t)d * Q + bi[d];
+                lg[pos] += gi;
+                lh[pos] += hi;
+            }
+        }
+    }
+    memset(hist_g, 0, DQ * sizeof(float));
+    memset(hist_h, 0, DQ * sizeof(float));
+    for (int t = 0; t < max_threads; t++) {
+        float* lg = thr_bufs + (size_t)t * 2 * DQ;
+        float* lh = lg + DQ;
+        for (size_t j = 0; j < DQ; j++) { hist_g[j] += lg[j]; hist_h[j] += lh[j]; }
+    }
+}
+
+int tensor_gbdt_train_tree_mc(
+    Tensor* bins, Tensor* g_NK, Tensor* h_NK, int K, int kc,
+    int Q, int max_leaves,
+    float lambda, float alpha, float gamma, float min_hess, float lr,
+    Tensor* preds_NK,
+    Tensor* out_feats, Tensor* out_thresholds,
+    Tensor* out_lefts,  Tensor* out_rights)
+{
+    if (!bins || !g_NK || !h_NK || !preds_NK ||
+        !out_feats || !out_thresholds || !out_lefts || !out_rights)
+        return 0;
+    if (bins->ndim != 2 || bins->dtype != DTYPE_INT32) return 0;
+    if (kc < 0 || kc >= K) return 0;
+    if (max_leaves < 1) max_leaves = 1;
+
+    int N = bins->shape[0], D = bins->shape[1];
+    int max_nodes = (int)out_feats->total_size;
+    size_t DQ = (size_t)D * Q;
+    int n_slots = max_leaves + 2;
+    int max_threads = omp_get_max_threads();
+
+    size_t hist_bytes = (size_t)n_slots * 2 * DQ * sizeof(float);
+    size_t thr_bytes  = (size_t)max_threads * 2 * DQ * sizeof(float);
+    float*    hist_pool  = (float*)safe_memalign(64, hist_bytes);
+    float*    thr_bufs   = (float*)safe_memalign(64, thr_bytes);
+    int*      sample_idx = (int*)calloc((size_t)N, sizeof(int));
+    int*      tmp_idx    = (int*)calloc((size_t)N, sizeof(int));
+    int*      slot_used  = (int*)calloc((size_t)n_slots, sizeof(int));
+    _GBDTLeaf* pq        = (_GBDTLeaf*)calloc((size_t)(max_leaves + 1), sizeof(_GBDTLeaf));
+
+    int ret = 0;
+    if (!hist_pool || !thr_bufs || !sample_idx || !tmp_idx || !slot_used || !pq) {
+        if (hist_pool) safe_free_size(hist_pool, hist_bytes);
+        if (thr_bufs)  safe_free_size(thr_bufs,  thr_bytes);
+        free(sample_idx); free(tmp_idx); free(slot_used); free(pq);
+        return 0;
+    }
+
+    for (int i = 0; i < N; i++) sample_idx[i] = i;
+
+#define _MC_HS_G(s)   (hist_pool + (size_t)(s) * 2 * DQ)
+#define _MC_HS_H(s)   (hist_pool + (size_t)(s) * 2 * DQ + DQ)
+#define _MC_ALLOC_SLOT(out) do {                                              \
+    (out) = -1;                                                                \
+    for (int _s = 0; _s < n_slots; _s++) {                                    \
+        if (!slot_used[_s]) { slot_used[_s] = 1; (out) = _s; break; }        \
+    }                                                                          \
+} while(0)
+#define _MC_FREE_SLOT(s)  (slot_used[(s)] = 0)
+
+    float* fp = F32(out_feats); float* tp = F32(out_thresholds);
+    float* lp = F32(out_lefts); float* rp = F32(out_rights);
+    for (int i = 0; i < max_nodes; i++) { fp[i]=-1.0f; tp[i]=0.0f; lp[i]=-1.0f; rp[i]=-1.0f; }
+
+    const int32_t* bp = I32(bins);
+    const float*   gp = F32(g_NK);
+    const float*   hp2 = F32(h_NK);
+    float*         pp = F32(preds_NK);
+
+    int root_slot; _MC_ALLOC_SLOT(root_slot);
+    _build_hist_mc_par(bp, gp, hp2, sample_idx, N, D, Q, K, kc,
+                       thr_bufs, max_threads, _MC_HS_G(root_slot), _MC_HS_H(root_slot));
+
+    float root_sg = 0.0f, root_sh = 0.0f;
+    for (int i = 0; i < N; i++) {
+        root_sg += gp[(size_t)i * K + kc];
+        root_sh += hp2[(size_t)i * K + kc];
+    }
+
+    int next_node = 1, pq_sz = 0, splits_done = 0;
+    int max_splits = max_leaves - 1;
+
+    int rf = -1, rb = -1; float rg_gain = -1.0f;
+    if (root_sh >= min_hess)
+        _best_split_raw(_MC_HS_G(root_slot), _MC_HS_H(root_slot), D, Q,
+                        root_sg, root_sh, lambda, alpha, gamma, &rf, &rb, &rg_gain);
+
+    if (rf < 0 || rg_gain <= 0.0f || max_splits == 0) {
+        float lv    = _gbdt_leaf_val_l1(root_sg, root_sh, lambda, alpha);
+        tp[0]       = lr * lv; fp[0] = -1.0f;
+        float delta = lr * lv;
+        for (int i = 0; i < N; i++) pp[(size_t)i * K + kc] += delta;
+        _MC_FREE_SLOT(root_slot);
+        ret = 1;
+    } else {
+        _GBDTLeaf root_entry = {0, root_slot, 0, N, root_sg, root_sh, rg_gain, rf, rb};
+        _pq_push(pq, &pq_sz, root_entry);
+
+        while (pq_sz > 0 && splits_done < max_splits) {
+            _GBDTLeaf leaf = _pq_pop(pq, &pq_sz);
+            splits_done++;
+
+            int feat = leaf.best_feat, split_bin = leaf.best_bin;
+            int start = leaf.idx_start, count = leaf.idx_count;
+            const int* cur = sample_idx + start;
+
+            int l_count = 0, r_tail = count - 1;
+            for (int ci = 0; ci < count; ci++) {
+                int si = cur[ci];
+                if (bp[(size_t)si * D + feat] <= split_bin)
+                    tmp_idx[l_count++] = si;
+                else
+                    tmp_idx[r_tail--] = si;
+            }
+            int r_count = count - l_count;
+            memcpy(sample_idx + start, tmp_idx, (size_t)count * sizeof(int));
+
+            int l_start = start, r_start = start + l_count;
+            int left_nid = next_node++, right_nid = next_node++;
+
+            fp[leaf.node_id] = (float)feat;
+            tp[leaf.node_id] = (float)split_bin;
+            lp[leaf.node_id] = (float)left_nid;
+            rp[leaf.node_id] = (float)right_nid;
+
+            float l_sg = 0.0f, l_sh = 0.0f;
+            for (int ci = 0; ci < l_count; ci++) {
+                int si = sample_idx[l_start + ci];
+                l_sg += gp[(size_t)si * K + kc];
+                l_sh += hp2[(size_t)si * K + kc];
+            }
+            float r_sg = leaf.sum_g - l_sg, r_sh = leaf.sum_h - l_sh;
+
+            int s_slot, o_slot;
+            _MC_ALLOC_SLOT(s_slot); _MC_ALLOC_SLOT(o_slot);
+
+            int  small_nid, large_nid, small_sl, large_sl;
+            int  small_start, small_count, large_start, large_count;
+            float small_sg, small_sh, large_sg, large_sh;
+
+            if (l_count <= r_count) {
+                _build_hist_mc_par(bp, gp, hp2, sample_idx + l_start, l_count,
+                                   D, Q, K, kc, thr_bufs, max_threads,
+                                   _MC_HS_G(s_slot), _MC_HS_H(s_slot));
+                _hist_subtract_raw(_MC_HS_G(leaf.hist_slot), _MC_HS_H(leaf.hist_slot),
+                                   _MC_HS_G(s_slot), _MC_HS_H(s_slot),
+                                   _MC_HS_G(o_slot), _MC_HS_H(o_slot), DQ);
+                small_nid = left_nid;  small_sl = s_slot; small_start = l_start; small_count = l_count; small_sg = l_sg; small_sh = l_sh;
+                large_nid = right_nid; large_sl = o_slot; large_start = r_start; large_count = r_count; large_sg = r_sg; large_sh = r_sh;
+            } else {
+                _build_hist_mc_par(bp, gp, hp2, sample_idx + r_start, r_count,
+                                   D, Q, K, kc, thr_bufs, max_threads,
+                                   _MC_HS_G(s_slot), _MC_HS_H(s_slot));
+                _hist_subtract_raw(_MC_HS_G(leaf.hist_slot), _MC_HS_H(leaf.hist_slot),
+                                   _MC_HS_G(s_slot), _MC_HS_H(s_slot),
+                                   _MC_HS_G(o_slot), _MC_HS_H(o_slot), DQ);
+                small_nid = right_nid; small_sl = s_slot; small_start = r_start; small_count = r_count; small_sg = r_sg; small_sh = r_sh;
+                large_nid = left_nid;  large_sl = o_slot; large_start = l_start; large_count = l_count; large_sg = l_sg; large_sh = l_sh;
+            }
+            _MC_FREE_SLOT(leaf.hist_slot);
+
+            int   child_nid[2]   = {small_nid,   large_nid};
+            int   child_sl[2]    = {small_sl,     large_sl};
+            int   child_start[2] = {small_start,  large_start};
+            int   child_count[2] = {small_count,  large_count};
+            float child_sg[2]    = {small_sg,     large_sg};
+            float child_sh[2]    = {small_sh,     large_sh};
+
+            for (int ci = 0; ci < 2; ci++) {
+                int   cnid = child_nid[ci];
+                int   csl  = child_sl[ci];
+                int   cs   = child_start[ci];
+                int   cc   = child_count[ci];
+                float csg  = child_sg[ci], csh = child_sh[ci];
+
+                if (csh < min_hess || cc <= 0 || splits_done >= max_splits) {
+                    float lv    = _gbdt_leaf_val_l1(csg, csh, lambda, alpha);
+                    fp[cnid] = -1.0f; tp[cnid] = lr * lv;
+                    float delta = lr * lv;
+                    for (int ck = 0; ck < cc; ck++)
+                        pp[(size_t)sample_idx[cs + ck] * K + kc] += delta;
+                    _MC_FREE_SLOT(csl);
+                    continue;
+                }
+                int cf = -1, cb = -1; float cg_gain = -1.0f;
+                _best_split_raw(_MC_HS_G(csl), _MC_HS_H(csl), D, Q,
+                                csg, csh, lambda, alpha, gamma, &cf, &cb, &cg_gain);
+                if (cf < 0 || cg_gain <= 0.0f) {
+                    float lv    = _gbdt_leaf_val_l1(csg, csh, lambda, alpha);
+                    fp[cnid] = -1.0f; tp[cnid] = lr * lv;
+                    float delta = lr * lv;
+                    for (int ck = 0; ck < cc; ck++)
+                        pp[(size_t)sample_idx[cs + ck] * K + kc] += delta;
+                    _MC_FREE_SLOT(csl);
+                } else {
+                    _GBDTLeaf cl = {cnid, csl, cs, cc, csg, csh, cg_gain, cf, cb};
+                    _pq_push(pq, &pq_sz, cl);
+                }
+            }
+        }
+
+        while (pq_sz > 0) {
+            _GBDTLeaf leaf = _pq_pop(pq, &pq_sz);
+            float lv    = _gbdt_leaf_val_l1(leaf.sum_g, leaf.sum_h, lambda, alpha);
+            tp[leaf.node_id] = lr * lv; fp[leaf.node_id] = -1.0f;
+            float delta = lr * lv;
+            const int* idx = sample_idx + leaf.idx_start;
+            for (int ck = 0; ck < leaf.idx_count; ck++)
+                pp[(size_t)idx[ck] * K + kc] += delta;
+            _MC_FREE_SLOT(leaf.hist_slot);
+        }
+
+        ret = next_node;
+    }
+
+#undef _MC_HS_G
+#undef _MC_HS_H
+#undef _MC_ALLOC_SLOT
+#undef _MC_FREE_SLOT
+
+    safe_free_size(hist_pool, hist_bytes);
+    safe_free_size(thr_bufs,  thr_bytes);
+    free(sample_idx); free(tmp_idx); free(slot_used); free(pq);
+    return ret;
+}
+
+/* 26.4  Multiclass GBDT batch prediction.
+ *
+ * X_bins      : [N, D]         INT32  — pre-binned samples
+ * feats       : [T*K, maxNodes] FLOAT32
+ * thresholds  : [T*K, maxNodes] FLOAT32
+ * lefts       : [T*K, maxNodes] FLOAT32
+ * rights      : [T*K, maxNodes] FLOAT32
+ * tree_sizes  : [T*K]          FLOAT32
+ * base_scores : [K]            FLOAT32 — initial logit per class
+ * K           : number of classes
+ *
+ * Trees are stored round-major: tree index tk belongs to class (tk % K),
+ * round (tk / K).  This matches the order they are built in PHP.
+ *
+ * Returns [N, K] FLOAT32 raw logit scores (apply softmax for probabilities). */
+Tensor* tensor_gbdt_predict_all_mc(
+    Tensor* X_bins, Tensor* feats, Tensor* thresholds,
+    Tensor* lefts,  Tensor* rights, Tensor* tree_sizes,
+    Tensor* base_scores, int K)
+{
+    if (!X_bins || !feats || !thresholds || !lefts || !rights || !tree_sizes || !base_scores)
+        return NULL;
+    if (X_bins->ndim != 2 || K < 2) return NULL;
+
+    int N  = X_bins->shape[0], D = X_bins->shape[1];
+    int TK = feats->shape[0],  M = feats->shape[1];
+
+    Tensor* xb_c = tensor_is_contiguous(X_bins) ? X_bins : tensor_copy(X_bins);
+    Tensor* out  = tensor_create_uninitialized(2, (int[]){N, K}, DTYPE_FLOAT32);
+    if (!out) { if (xb_c != X_bins) tensor_free(xb_c); return NULL; }
+
+    /* Initialise each row with base_scores */
+    float* op = F32(out);
+    const float* bs = F32(base_scores);
+    for (int i = 0; i < N; i++) {
+        float* row = op + (size_t)i * K;
+        for (int k = 0; k < K; k++) row[k] = bs[k];
+    }
+
+    const int32_t* bp = I32(xb_c);
+    const float*   fp = F32(feats);
+    const float*   tp = F32(thresholds);
+    const float*   lp = F32(lefts);
+    const float*   rp = F32(rights);
+    const float*   sp = F32(tree_sizes);
+
+    #pragma omp parallel for schedule(static) if(N > 1000)
+    for (int i = 0; i < N; i++) {
+        const int32_t* xi  = bp + (size_t)i * D;
+        float*         oi  = op + (size_t)i * K;
+        for (int tk = 0; tk < TK; tk++) {
+            int kc = tk % K;
+            const float* tf = fp + (size_t)tk * M;
+            const float* tt = tp + (size_t)tk * M;
+            const float* tl = lp + (size_t)tk * M;
+            const float* tr = rp + (size_t)tk * M;
+            int sz   = (int)sp[tk];
+            int node = 0;
+            while (node < sz) {
+                int feat = (int)tf[node];
+                if (feat < 0) { oi[kc] += tt[node]; break; }
+                int bin_split = (int)tt[node];
+                node = (xi[feat] <= bin_split) ? (int)tl[node] : (int)tr[node];
+                if (node < 0) break;
+            }
+        }
+    }
+
+    if (xb_c != X_bins) tensor_free(xb_c);
+    return out;
+}
+
 /* 25.6  Gather: out[i] = table[floor(indices[i])].
  *       Replaces PHP array_map label-remapping loops.
  *       indices: [N] float32, table: [K] float32.
@@ -7451,4 +8054,405 @@ Tensor* tensor_gather_indices(Tensor* indices, Tensor* table) {
         op[i] = (idx >= 0 && idx < K) ? tp[idx] : 0.0f;
     }
     return out;
+}
+
+
+/* ── Section 27: Column permutation for permutation importance ───────────── */
+
+void tensor_permute_column(Tensor* X, int col, Tensor* backup) {
+    if (!X || !backup) { tensor_set_error("tensor_permute_column: null arg"); return; }
+    int N = X->shape[0], D = X->shape[1];
+    if (col < 0 || col >= D) { tensor_set_error("tensor_permute_column: col out of range"); return; }
+    float* xp = (float*)X->data;
+    float* bp = (float*)backup->data;
+    for (int i = 0; i < N; i++) bp[i] = xp[i*D + col];
+    for (int i = N-1; i > 0; i--) {
+        int j = (int)((double)rand() / ((double)RAND_MAX+1.0) * (i+1));
+        float tmp = xp[i*D + col]; xp[i*D + col] = xp[j*D + col]; xp[j*D + col] = tmp;
+    }
+}
+
+void tensor_restore_column(Tensor* X, int col, const Tensor* backup) {
+    if (!X || !backup) return;
+    int N = X->shape[0], D = X->shape[1];
+    float* xp = (float*)X->data;
+    const float* bp = (const float*)backup->data;
+    for (int i = 0; i < N; i++) xp[i*D + col] = bp[i];
+}
+
+/* ============================================================================
+ * 28. GPT TRAINING PRIMITIVES
+ *   - GELU activation (tanh approx, forward + backward)
+ *   - LayerNorm with learnable γ/β (forward + backward)
+ *   - Causal masked multi-head attention (forward + backward)
+ * ============================================================================ */
+
+#define GELU_SQRT_2_PI  0.7978845608028654f
+#define GELU_COEFF      0.044715f
+
+/* ---------------------------------------------------------------------------
+ * GELU forward: GELU(x) = 0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))
+ * ------------------------------------------------------------------------- */
+Tensor* tensor_gelu(Tensor* A) {
+    if (!A || A->dtype != DTYPE_FLOAT32)
+        TENSOR_ERROR("FATAL [GELU]: Requires FLOAT32.");
+    if (!tensor_is_contiguous(A))
+        TENSOR_ERROR("FATAL [GELU]: Input must be contiguous.");
+
+    Tensor* out = tensor_create_uninitialized(A->ndim, A->shape, DTYPE_FLOAT32);
+    if (!out) return NULL;
+
+    size_t n = A->total_size;
+    const float* __restrict src = (const float*)__builtin_assume_aligned(F32(A), 64);
+    float*       __restrict dst = (float*)__builtin_assume_aligned(F32(out), 64);
+
+#pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < n; i++) {
+        float x  = src[i];
+        float u  = GELU_SQRT_2_PI * (x + GELU_COEFF * x * x * x);
+        float th = tanhf(u);
+        dst[i]   = 0.5f * x * (1.0f + th);
+    }
+    return out;
+}
+
+/* ---------------------------------------------------------------------------
+ * GELU backward: dx = dout * GELU'(x)
+ * GELU'(x) = 0.5*(1+tanh(u)) + 0.5*x*sech²(u)*√(2/π)*(1+3·c·x²)
+ * ------------------------------------------------------------------------- */
+Tensor* tensor_gelu_backward(Tensor* dOut, Tensor* X) {
+    if (!dOut || !X || dOut->dtype != DTYPE_FLOAT32 || X->dtype != DTYPE_FLOAT32)
+        TENSOR_ERROR("FATAL [GELUBwd]: Requires FLOAT32.");
+    if (!tensor_is_contiguous(dOut) || !tensor_is_contiguous(X))
+        TENSOR_ERROR("FATAL [GELUBwd]: Inputs must be contiguous.");
+    if (dOut->total_size != X->total_size)
+        TENSOR_ERROR("FATAL [GELUBwd]: Shape mismatch.");
+
+    Tensor* dx = tensor_create_uninitialized(X->ndim, X->shape, DTYPE_FLOAT32);
+    if (!dx) return NULL;
+
+    size_t n = X->total_size;
+    const float* __restrict dp = (const float*)__builtin_assume_aligned(F32(dOut), 64);
+    const float* __restrict xp = (const float*)__builtin_assume_aligned(F32(X),    64);
+    float*       __restrict op = (float*)__builtin_assume_aligned(F32(dx),   64);
+
+#pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < n; i++) {
+        float x    = xp[i];
+        float u    = GELU_SQRT_2_PI * (x + GELU_COEFF * x * x * x);
+        float th   = tanhf(u);
+        float sech2 = 1.0f - th * th;
+        float du_dx = GELU_SQRT_2_PI * (1.0f + 3.0f * GELU_COEFF * x * x);
+        float gelu_prime = 0.5f * (1.0f + th) + 0.5f * x * sech2 * du_dx;
+        op[i] = dp[i] * gelu_prime;
+    }
+    return dx;
+}
+
+/* ---------------------------------------------------------------------------
+ * LayerNorm forward
+ * x:      [*, D]  FLOAT32   (rows = total_size / D)
+ * weight: [D]     FLOAT32   learnable γ
+ * bias:   [D]     FLOAT32   learnable β (NULL = no bias)
+ * Returns new [*, D] FLOAT32 tensor
+ * ------------------------------------------------------------------------- */
+Tensor* tensor_layernorm_forward(Tensor* x, Tensor* weight, Tensor* bias, float eps) {
+    if (!x || !weight) TENSOR_ERROR("FATAL [LNFwd]: x and weight must not be NULL.");
+    if (x->dtype != DTYPE_FLOAT32 || weight->dtype != DTYPE_FLOAT32)
+        TENSOR_ERROR("FATAL [LNFwd]: Requires FLOAT32.");
+    if (!tensor_is_contiguous(x) || !tensor_is_contiguous(weight))
+        TENSOR_ERROR("FATAL [LNFwd]: x and weight must be contiguous.");
+    if (bias && (!tensor_is_contiguous(bias) || bias->dtype != DTYPE_FLOAT32))
+        TENSOR_ERROR("FATAL [LNFwd]: bias must be contiguous FLOAT32.");
+
+    int D    = x->shape[x->ndim - 1];
+    int rows = (int)(x->total_size / (size_t)D);
+
+    if ((int)weight->total_size != D)
+        TENSOR_ERROR("FATAL [LNFwd]: weight size must match last dim of x.");
+    if (bias && (int)bias->total_size != D)
+        TENSOR_ERROR("FATAL [LNFwd]: bias size must match last dim of x.");
+
+    Tensor* out = tensor_create_uninitialized(x->ndim, x->shape, DTYPE_FLOAT32);
+    if (!out) return NULL;
+
+    const float* __restrict xp  = (const float*)__builtin_assume_aligned(F32(x), 64);
+    const float* __restrict wp  = (const float*)__builtin_assume_aligned(F32(weight), 64);
+    const float* __restrict bp  = bias ? (const float*)F32(bias) : NULL;
+    float*       __restrict op  = (float*)__builtin_assume_aligned(F32(out), 64);
+
+#pragma omp parallel for schedule(static)
+    for (int r = 0; r < rows; r++) {
+        const float* __restrict row_x = xp + (size_t)r * D;
+        float*       __restrict row_o = op + (size_t)r * D;
+
+        /* mean */
+        float sum = 0.0f;
+        for (int j = 0; j < D; j++) sum += row_x[j];
+        float mean = sum / (float)D;
+
+        /* variance */
+        float var = 0.0f;
+        for (int j = 0; j < D; j++) {
+            float d = row_x[j] - mean;
+            var += d * d;
+        }
+        float rstd = 1.0f / sqrtf(var / (float)D + eps);
+
+        /* normalize + scale + shift */
+        for (int j = 0; j < D; j++) {
+            float xhat = (row_x[j] - mean) * rstd;
+            row_o[j]   = wp[j] * xhat + (bp ? bp[j] : 0.0f);
+        }
+    }
+    return out;
+}
+
+/* ---------------------------------------------------------------------------
+ * LayerNorm backward
+ * dY:      [*, D]  upstream gradient
+ * x:       [*, D]  original forward input
+ * weight:  [D]     forward γ
+ * eps:     float   same as forward
+ * dWeight: [D]     gradient accumulator for γ (caller must zero first; +=)
+ * dBias:   [D]     gradient accumulator for β (caller must zero first; +=; NULL ok)
+ * Returns: [*, D]  gradient w.r.t. x
+ * ------------------------------------------------------------------------- */
+Tensor* tensor_layernorm_backward(Tensor* dY, Tensor* x, Tensor* weight, float eps,
+                                   Tensor* dWeight, Tensor* dBias) {
+    if (!dY || !x || !weight || !dWeight)
+        TENSOR_ERROR("FATAL [LNBwd]: NULL pointer.");
+    if (dY->dtype != DTYPE_FLOAT32 || x->dtype != DTYPE_FLOAT32 ||
+        weight->dtype != DTYPE_FLOAT32 || dWeight->dtype != DTYPE_FLOAT32)
+        TENSOR_ERROR("FATAL [LNBwd]: All tensors must be FLOAT32.");
+    if (!tensor_is_contiguous(dY) || !tensor_is_contiguous(x) ||
+        !tensor_is_contiguous(weight) || !tensor_is_contiguous(dWeight))
+        TENSOR_ERROR("FATAL [LNBwd]: All tensors must be contiguous.");
+    if (dY->total_size != x->total_size)
+        TENSOR_ERROR("FATAL [LNBwd]: dY and x shape mismatch.");
+
+    int D    = x->shape[x->ndim - 1];
+    int rows = (int)(x->total_size / (size_t)D);
+
+    Tensor* dx = tensor_create_uninitialized(x->ndim, x->shape, DTYPE_FLOAT32);
+    if (!dx) return NULL;
+
+    const float* __restrict dyp = (const float*)__builtin_assume_aligned(F32(dY), 64);
+    const float* __restrict xp  = (const float*)__builtin_assume_aligned(F32(x), 64);
+    const float* __restrict wp  = (const float*)__builtin_assume_aligned(F32(weight), 64);
+    float*       __restrict dxp = (float*)__builtin_assume_aligned(F32(dx), 64);
+    float*       __restrict dwp = (float*)__builtin_assume_aligned(F32(dWeight), 64);
+    float*       __restrict dbp = dBias ? (float*)F32(dBias) : NULL;
+
+    /* Serial over rows; dWeight/dBias accumulate without races.
+     * dx per row is independent → can be parallelized separately if needed. */
+    for (int r = 0; r < rows; r++) {
+        const float* __restrict dy = dyp + (size_t)r * D;
+        const float* __restrict xr = xp  + (size_t)r * D;
+        float*       __restrict dxr= dxp + (size_t)r * D;
+
+        /* recompute mean and rstd */
+        float sum = 0.0f;
+        for (int j = 0; j < D; j++) sum += xr[j];
+        float mean = sum / (float)D;
+
+        float var = 0.0f;
+        for (int j = 0; j < D; j++) { float d = xr[j] - mean; var += d * d; }
+        float rstd = 1.0f / sqrtf(var / (float)D + eps);
+
+        /* c1 = Σ(dxhat·xhat)/D,  c2 = Σ(dxhat)/D  where dxhat = dy·w */
+        float c1 = 0.0f, c2 = 0.0f;
+        for (int j = 0; j < D; j++) {
+            float xhat  = (xr[j] - mean) * rstd;
+            float dxhat = dy[j] * wp[j];
+            c1 += dxhat * xhat;
+            c2 += dxhat;
+            dwp[j] += dy[j] * xhat;
+            if (dbp) dbp[j] += dy[j];
+        }
+        c1 /= (float)D;
+        c2 /= (float)D;
+
+        /* dx[j] = rstd * (dxhat[j] - c1·xhat[j] - c2) */
+        for (int j = 0; j < D; j++) {
+            float xhat  = (xr[j] - mean) * rstd;
+            float dxhat = dy[j] * wp[j];
+            dxr[j] = rstd * (dxhat - c1 * xhat - c2);
+        }
+    }
+
+    return dx;
+}
+
+/* ---------------------------------------------------------------------------
+ * Causal masked scaled-dot-product attention (multi-head, training)
+ * q, k, v: [nH, T, hd]  FLOAT32
+ * out:      [nH, T, hd]  FLOAT32 pre-allocated output
+ * attn:     [nH, T, T]   FLOAT32 pre-allocated (NULL = don't save weights)
+ *
+ * Per head h:
+ *   S[i,j] = Q[h,i,:] · K[h,j,:] / sqrt(hd),  causal mask: j > i → −∞
+ *   A[h]   = softmax(S)
+ *   out[h] = A[h] @ V[h]
+ * ------------------------------------------------------------------------- */
+void tensor_causal_attention(Tensor* out, Tensor* q, Tensor* k, Tensor* v, Tensor* attn) {
+    if (!out || !q || !k || !v)  { tensor_set_error("FATAL [CausalAttn]: NULL pointer."); return; }
+    if (q->ndim != 3 || k->ndim != 3 || v->ndim != 3 || out->ndim != 3)
+        { tensor_set_error("FATAL [CausalAttn]: Expects 3D [nH, T, hd]."); return; }
+
+    int nH = q->shape[0], T = q->shape[1], hd = q->shape[2];
+    if (k->shape[0] != nH || k->shape[1] != T || k->shape[2] != hd ||
+        v->shape[0] != nH || v->shape[1] != T || v->shape[2] != hd ||
+        out->shape[0] != nH || out->shape[1] != T || out->shape[2] != hd)
+        { tensor_set_error("FATAL [CausalAttn]: Shape mismatch."); return; }
+    if (attn && (attn->shape[0] != nH || attn->shape[1] != T || attn->shape[2] != T))
+        { tensor_set_error("FATAL [CausalAttn]: attn must be [nH, T, T]."); return; }
+
+    float scale = 1.0f / sqrtf((float)hd);
+    const float NEG_INF = -1e9f;
+
+    const float* Qp  = F32(q);
+    const float* Kp  = F32(k);
+    const float* Vp  = F32(v);
+    float*       Op  = F32(out);
+    float*       Ap  = attn ? F32(attn) : NULL;
+
+    /* Allocate per-thread scratch for S [T×T] */
+    size_t TT = (size_t)T * T;
+
+#pragma omp parallel
+    {
+        float* S = (float*)malloc(TT * sizeof(float));
+        if (!S) { tensor_set_error("FATAL [CausalAttn]: OOM for S."); }
+
+        if (S) {
+#pragma omp for schedule(static)
+            for (int h = 0; h < nH; h++) {
+                const float* Qh = Qp + (size_t)h * T * hd;
+                const float* Kh = Kp + (size_t)h * T * hd;
+                const float* Vh = Vp + (size_t)h * T * hd;
+                float*       Oh = Op + (size_t)h * T * hd;
+
+                /* S = Q @ K.T * scale */
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            T, T, hd, scale,
+                            Qh, hd, Kh, hd,
+                            0.0f, S, T);
+
+                /* Causal mask + softmax per row */
+                for (int i = 0; i < T; i++) {
+                    float* row = S + (size_t)i * T;
+                    /* mask future */
+                    for (int j = i + 1; j < T; j++) row[j] = NEG_INF;
+                    /* stable softmax */
+                    float m = row[0];
+                    for (int j = 1; j <= i; j++) if (row[j] > m) m = row[j];
+                    float s = 0.0f;
+                    for (int j = 0; j <= i; j++) { row[j] = fast_expf(row[j] - m); s += row[j]; }
+                    float inv_s = 1.0f / s;
+                    for (int j = 0; j <= i; j++) row[j] *= inv_s;
+                    /* Zero masked future positions so BLAS matmul is correct */
+                    for (int j = i + 1; j < T; j++) row[j] = 0.0f;
+                }
+
+                /* Save attention weights if requested */
+                if (Ap) {
+                    float* Ah = Ap + (size_t)h * TT;
+                    memcpy(Ah, S, TT * sizeof(float));
+                }
+
+                /* out = S @ V */
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            T, hd, T, 1.0f,
+                            S, T, Vh, hd,
+                            0.0f, Oh, hd);
+            }
+            free(S);
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Causal attention backward
+ * dOut: [nH, T, hd]  upstream gradient
+ * attn: [nH, T, T]   softmax weights saved from forward
+ * Q, K, V: [nH, T, hd]  from forward
+ * dQ, dK, dV: [nH, T, hd]  pre-allocated gradient outputs (overwritten, not +=)
+ * ------------------------------------------------------------------------- */
+void tensor_causal_attention_backward(Tensor* dOut, Tensor* attn,
+                                       Tensor* Q, Tensor* K, Tensor* V,
+                                       Tensor* dQ, Tensor* dK, Tensor* dV) {
+    if (!dOut || !attn || !Q || !K || !V || !dQ || !dK || !dV)
+        { tensor_set_error("FATAL [CausalAttnBwd]: NULL pointer."); return; }
+
+    int nH = Q->shape[0], T = Q->shape[1], hd = Q->shape[2];
+    float scale = 1.0f / sqrtf((float)hd);
+    size_t TT = (size_t)T * T;
+
+    const float* dOp = F32(dOut);
+    const float* Ap  = F32(attn);
+    const float* Qp  = F32(Q);
+    const float* Kp  = F32(K);
+    const float* Vp  = F32(V);
+    float*       dQp = F32(dQ);
+    float*       dKp = F32(dK);
+    float*       dVp = F32(dV);
+
+#pragma omp parallel
+    {
+        float* dA = (float*)malloc(TT * sizeof(float));
+        float* dS = (float*)malloc(TT * sizeof(float));
+
+        if (dA && dS) {
+#pragma omp for schedule(static)
+            for (int h = 0; h < nH; h++) {
+                const float* dOh = dOp + (size_t)h * T * hd;
+                const float* Ah  = Ap  + (size_t)h * TT;
+                const float* Qh  = Qp  + (size_t)h * T * hd;
+                const float* Kh  = Kp  + (size_t)h * T * hd;
+                const float* Vh  = Vp  + (size_t)h * T * hd;
+                float*       dQh = dQp + (size_t)h * T * hd;
+                float*       dKh = dKp + (size_t)h * T * hd;
+                float*       dVh = dVp + (size_t)h * T * hd;
+
+                /* dV = A.T @ dOut : [T,T].T @ [T,hd] → [T,hd] */
+                cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                            T, hd, T, 1.0f,
+                            Ah, T, dOh, hd,
+                            0.0f, dVh, hd);
+
+                /* dA = dOut @ V.T : [T,hd] @ [T,hd].T → [T,T] */
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            T, T, hd, 1.0f,
+                            dOh, hd, Vh, hd,
+                            0.0f, dA, T);
+
+                /* dS = softmax_backward(dA, A):  dS[i,j] = A[i,j]*(dA[i,j] - rowdot[i]) */
+                memset(dS, 0, TT * sizeof(float));
+                for (int i = 0; i < T; i++) {
+                    const float* Ai  = Ah + (size_t)i * T;
+                    const float* dAi = dA + (size_t)i * T;
+                    float*       dSi = dS + (size_t)i * T;
+                    float rdot = 0.0f;
+                    for (int j = 0; j <= i; j++) rdot += Ai[j] * dAi[j];
+                    for (int j = 0; j <= i; j++) dSi[j] = Ai[j] * (dAi[j] - rdot);
+                }
+
+                /* dQ = dS @ K * scale : [T,T] @ [T,hd] → [T,hd] */
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            T, hd, T, scale,
+                            dS, T, Kh, hd,
+                            0.0f, dQh, hd);
+
+                /* dK = dS.T @ Q * scale : [T,T].T @ [T,hd] → [T,hd] */
+                cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                            T, hd, T, scale,
+                            dS, T, Qh, hd,
+                            0.0f, dKh, hd);
+            }
+        }
+
+        free(dA);
+        free(dS);
+    }
 }

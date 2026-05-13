@@ -8,7 +8,7 @@ use InvalidArgumentException;
 use RuntimeException;
 
 /**
- * High-Performance Dataset — RubixML-style API backed by C-level memory.
+ * High-Performance Dataset backed by C-level memory.
  *
  * ─── Two internal modes ──────────────────────────────────────────────────────
  *

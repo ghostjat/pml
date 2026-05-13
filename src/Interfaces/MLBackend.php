@@ -18,7 +18,6 @@ use Pml\Tensor;
  *
  * Implementations:
  *   - TorchBackend  — wraps Sequential (FFI / C-native tensors)
- *   - RubixBackend  — wraps classic Learner estimators (PHP-native)
  */
 interface MLBackend
 {

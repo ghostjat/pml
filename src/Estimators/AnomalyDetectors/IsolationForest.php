@@ -60,11 +60,8 @@ final class IsolationForest implements Learner, Persistable
 
         for ($i = 0; $i < $this->nEstimators; $i++) {
             $curSize = min($this->sampleSize, $n);
-            $indices = range(0, $n - 1);
-            shuffle($indices);
-            $indices = array_slice($indices, 0, $curSize);
-            $idxT    = Tensor::fromArray($indices);
-            $subX    = $x->take($idxT, 0);
+            $idxT = Tensor::range(0, $n - 1, 1)->randomPermutation()->slice(0, 0, $curSize);
+            $subX = $x->take($idxT, 0);
             $this->trees[] = $this->buildTree($subX, 0, $maxDepth);
         }
 

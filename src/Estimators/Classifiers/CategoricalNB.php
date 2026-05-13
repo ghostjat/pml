@@ -120,7 +120,7 @@ final class CategoricalNB implements Learner, Probabilistic, Persistable
 
     public function predict(Dataset $dataset): Tensor
     {
-        return $this->proba($dataset)->argmax();
+        return $this->proba($dataset)->argmaxAxis(1);
     }
 
     public function trained(): bool

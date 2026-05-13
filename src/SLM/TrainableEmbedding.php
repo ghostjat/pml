@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Pml\SLM;
 
 use Pml\Interfaces\Stateful;
-use Pml\Lib\TensorEngine;
 use Pml\NeuralNetwork\Layers\Layer;
 use Pml\Tensor;
 
@@ -130,13 +129,20 @@ final class TrainableEmbedding implements Layer, Stateful
     public function loadStateDict(array $dict, string $prefix = ''): void
     {
         $key = $prefix . 'weights';
-        if (isset($dict[$key])) {
-            $this->weights  = $dict[$key];
-            // Re-initialise gradient buffer to match loaded weight shape.
-            $V = $this->weights->ptr->shape[0];
-            $D = $this->weights->ptr->shape[1];
-            $this->dWeights = Tensor::zeros($V, $D);
+        if (!isset($dict[$key])) return;
+
+        $src = $dict[$key];
+        if ($src->size() === $this->weights->size()) {
+            // Same shape: copy into existing owned tensor (safe against mmap PROT_READ).
+            $this->weights->copyFrom($src);
+        } else {
+            // Shape changed (architecture switch): make an owned copy of the source.
+            $this->weights = $src->copy();
         }
+
+        $V = $this->weights->ptr->shape[0];
+        $D = $this->weights->ptr->shape[1];
+        $this->dWeights = Tensor::zeros($V, $D);
     }
 
     public function getConfig(): array

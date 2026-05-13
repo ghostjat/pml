@@ -117,6 +117,7 @@ void tensor_mul_inplace(Tensor* A, Tensor* B);
 void tensor_div_inplace(Tensor* A, Tensor* B);
 void tensor_add_scalar_inplace(Tensor* A, float val);
 void tensor_mul_scalar_inplace(Tensor* A, float val);
+void tensor_clamp_inplace(Tensor* A, float lo, float hi);
 
 // ============================================================================
 // 7. UNARY MATH & TRIGONOMETRY
@@ -231,9 +232,12 @@ Tensor* tensor_solve(Tensor* A, Tensor* B);
 Tensor* tensor_cholesky(Tensor* A);
 void tensor_lu(Tensor* A, Tensor** P_out, Tensor** L_out, Tensor** U_out);
 void tensor_svd(Tensor* A, Tensor** U_out, Tensor** S_out, Tensor** Vt_out);
+void tensor_svd_economy(Tensor* A, Tensor** U_out, Tensor** S_out, Tensor** Vt_out);
 void tensor_eigen_sym(Tensor* A, Tensor** EigenVals_out, Tensor** EigenVecs_out);
 Tensor* tensor_ref(Tensor* A);
 Tensor* tensor_rref(Tensor* A);
+float tensor_sum_squares(Tensor* A);
+
 
 // ============================================================================
 // 13. DEEP LEARNING (CNNs & LLMs)
@@ -250,6 +254,10 @@ Tensor* tensor_embedding_lookup(Tensor* tokens, Tensor* embedding_weights);
 // --- NEW: FUSED KERNELS & HARDWARE INFERENCE ---
 void tensor_fused_bce_loss_and_grad(Tensor* preds, Tensor* targets, Tensor* grads, float* out_loss);
 void tensor_fused_adam_step(Tensor* param, Tensor* grad, Tensor* m, Tensor* v, float lr, float b1, float b2, float eps, int t);
+void tensor_fused_sgd_step(Tensor* param, Tensor* grad, float lr);
+void tensor_fused_rmsprop_step(Tensor* param, Tensor* grad, Tensor* cache, float lr, float decay, float eps);
+void tensor_fused_adagrad_step(Tensor* param, Tensor* grad, Tensor* acc, float lr, float eps);
+void tensor_fused_adamw_step(Tensor* param, Tensor* grad, Tensor* m, Tensor* v, float lr, float b1, float b2, float eps, int t, float wd);
 
 typedef struct __attribute__((packed)) {
     int feature_idx;
@@ -567,5 +575,77 @@ void    tensor_lasso_sgd_step(Tensor* X, Tensor* y, Tensor* W, Tensor* bias_t,
 Tensor* tensor_gnb_log_likelihood(Tensor* X, Tensor* means_KD,
                                    Tensor* vars_KD, Tensor* log_norms_K);
 Tensor* tensor_gather_indices(Tensor* indices, Tensor* table);
+
+/* ── Section 26: Multiclass GBDT Kernels ─────────────────────────────────── */
+
+/* 26.1  Broadcast [K] base scores → every row of [N,K] predictions tensor. */
+void     tensor_gbdt_init_preds_mc(Tensor* out_NK, Tensor* base_K);
+
+/* 26.2  Softmax cross-entropy gradients and hessians for all K classes.
+ *       raw_NK [N,K], y_N [N] INT32/FLOAT32 → out_g [N,K], out_h [N,K]. */
+void     tensor_gbdt_softmax_grad_hess(Tensor* raw_NK, Tensor* y_N,
+                                       Tensor* out_g, Tensor* out_h);
+
+/* 26.3  Train one leaf-wise GBDT tree for class column kc of the [N,K]
+ *       gradient matrix. Zero-copy: reads g_NK/h_NK/preds_NK at stride K.
+ *       Returns number of nodes used. */
+int      tensor_gbdt_train_tree_mc(Tensor* bins, Tensor* g_NK, Tensor* h_NK,
+                                   int K, int kc,
+                                   int Q, int max_leaves,
+                                   float lambda, float alpha, float gamma,
+                                   float min_hess, float lr,
+                                   Tensor* preds_NK,
+                                   Tensor* out_feats, Tensor* out_thresholds,
+                                   Tensor* out_lefts, Tensor* out_rights);
+
+/* 26.4  Multiclass batch prediction.
+ *       feats/thresh/lefts/rights: [T*K, maxNodes]; tree_sizes: [T*K];
+ *       base_scores: [K].  Returns [N, K] raw logits. */
+Tensor*  tensor_gbdt_predict_all_mc(Tensor* X_bins,
+                                     Tensor* feats, Tensor* thresholds,
+                                     Tensor* lefts,  Tensor* rights,
+                                     Tensor* tree_sizes, Tensor* base_scores,
+                                     int K);
+
+/* ── Section 27: Permutation importance helpers ─────────────────────────── */
+
+/* Fisher-Yates in-place column shuffle for permutation importance.
+ * backup [N] must be pre-allocated by the caller (tensor_create_uninitialized).
+ * Call tensor_restore_column() to undo the shuffle after scoring.         */
+void tensor_permute_column(Tensor* X, int col, Tensor* backup);
+void tensor_restore_column(Tensor* X, int col, const Tensor* backup);
+
+/* ── Section 28: GPT Training Primitives ─────────────────────────────────── */
+
+/* GELU activation (tanh approximation — GPT-2 style).
+ * Returns new FLOAT32 tensor with same shape as A.                         */
+Tensor* tensor_gelu(Tensor* A);
+
+/* GELU backward: dx = dOut * GELU'(X).
+ * Both dOut and X must have the same shape.  Returns new [*, D] tensor.   */
+Tensor* tensor_gelu_backward(Tensor* dOut, Tensor* X);
+
+/* LayerNorm forward: out = (x − μ) / √(σ²+eps) · weight + bias.
+ * x: [*, D], weight: [D], bias: [D] (NULL to skip).  Returns [*, D].      */
+Tensor* tensor_layernorm_forward(Tensor* x, Tensor* weight, Tensor* bias, float eps);
+
+/* LayerNorm backward.  dWeight and dBias must be pre-allocated and zeroed
+ * by the caller — this function accumulates (+=) into them.
+ * dBias may be NULL when the layer has no bias.  Returns dx [*, D].       */
+Tensor* tensor_layernorm_backward(Tensor* dY, Tensor* x, Tensor* weight, float eps,
+                                   Tensor* dWeight, Tensor* dBias);
+
+/* Causal masked multi-head scaled-dot-product attention (training forward).
+ * q, k, v: [nH, T, hd]  FLOAT32   nH = num_heads, T = seq_len, hd = head_dim
+ * out:      [nH, T, hd]  pre-allocated output
+ * attn:     [nH, T, T]   pre-allocated; receives softmax weights (pass NULL
+ *                         to skip saving — e.g. during inference).         */
+void tensor_causal_attention(Tensor* out, Tensor* q, Tensor* k, Tensor* v, Tensor* attn);
+
+/* Causal attention backward.  dQ, dK, dV are overwritten (not accumulated).
+ * dOut, attn, Q, K, V, dQ, dK, dV: all [nH, T, hd] FLOAT32.              */
+void tensor_causal_attention_backward(Tensor* dOut, Tensor* attn,
+                                       Tensor* Q,    Tensor* K,  Tensor* V,
+                                       Tensor* dQ,   Tensor* dK, Tensor* dV);
 
 #endif // TENSOR_H

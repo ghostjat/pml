@@ -21,8 +21,9 @@ use RuntimeException;
 final class RadiusNeighborsClassifier implements Learner, Persistable
 {
     private float $radius;
+    private int $numClasses = 0;
     private ?Tensor $fitSamples = null;
-    private ?Tensor $fitLabels = null;
+    private ?Tensor $fitLabels  = null;
 
     public function __construct(float $radius = 1.0)
     {
@@ -31,41 +32,32 @@ final class RadiusNeighborsClassifier implements Learner, Persistable
 
     public function train(Dataset $dataset): void
     {
-        $this->fitSamples = $dataset->samples();
-        $this->fitLabels = $dataset->labels();
+        $this->fitSamples  = $dataset->samples();
+        $this->fitLabels   = $dataset->labels();
+        $this->numClasses  = (int)($this->fitLabels->max() + 1);
     }
 
     public function predict(Dataset $dataset): Tensor
     {
         if (!$this->trained()) throw new RuntimeException("RadiusNeighbors is not trained.");
 
-        $testX = $dataset->samples();
-        $nTest = $testX->shape()[0];
-        $preds = [];
-        
-        $radiusSq = Tensor::zeros(1)->addScalarInplace($this->radius * $this->radius);
+        $testX   = $dataset->samples();
+        $nTest   = $testX->shape()[0];
+        $radiusSq = $this->radius * $this->radius;
 
-        for ($i = 0; $i < $nTest; $i++) {
-            $x = $testX->row($i);
-            
-            // Broadcast squared Euclidean distance
-            $sqDist = $this->fitSamples->sub($x)->square()->sumAxis(1);
-            
-            // Mask points STRICTLY within the radius natively in C
-            $inRadiusMask = $sqDist->less($radiusSq);
-            $neighbors = $this->fitLabels->booleanIndex($inRadiusMask);
-            
-            if ($neighbors->size() === 0) {
-                // Outlier fallback: Predict 0 or handle globally
-                $preds[] = 0.0;
-                continue;
-            }
-            
-            // Majority vote natively in C
-            $preds[] = $neighbors->bincount()->argmax();
-        }
+        // [nTest, nTrain] pairwise squared distances — one BLAS call
+        $distMat  = Tensor::pairwiseSqL2($testX, $this->fitSamples);
+        $inRadius = $distMat->lessScalar($radiusSq);              // [nTest, nTrain] bool
 
-        return Tensor::fromArray($preds);
+        // [nTrain, K] one-hot labels → matmul → [nTest, K] vote counts (one GEMM call)
+        $labelOneHot = Tensor::onehot($this->fitLabels, $this->numClasses);
+        $voteCounts  = $inRadius->matmul($labelOneHot);
+        $preds       = $voteCounts->argmaxAxis(1);                // [nTest]
+
+        // Outlier mask: no in-radius neighbors → predict 0
+        $noNeighbor = $inRadius->sumAxis(1)->lessScalar(1.0);
+        $zeroVec    = Tensor::zeros($nTest);
+        return $noNeighbor->where($zeroVec, $preds);
     }
 
     public function trained(): bool
@@ -76,13 +68,14 @@ final class RadiusNeighborsClassifier implements Learner, Persistable
     public function save(string $dir): void
     {
         is_dir($dir) || mkdir($dir, 0755, true);
-        file_put_contents($dir . '/config.json', json_encode(['radius' => $this->radius]));
+        file_put_contents($dir . '/config.json', json_encode(['radius' => $this->radius, 'numClasses' => $this->numClasses]));
         if ($this->fitSamples !== null) SafeTensorsIO::save($dir . '/model.safetensors', ['fit_samples' => $this->fitSamples, 'fit_labels' => $this->fitLabels]);
     }
     public static function load(string $dir): self
     {
         $c = json_decode(file_get_contents($dir . '/config.json'), true);
         $i = new self((float)$c['radius']);
+        $i->numClasses = (int)($c['numClasses'] ?? 2);
         $stPath = $dir . '/model.safetensors';
         if (is_file($stPath)) { $t = SafeTensorsIO::load($stPath); $i->fitSamples = $t['fit_samples'] ?? null; $i->fitLabels = $t['fit_labels'] ?? null; }
         return $i;

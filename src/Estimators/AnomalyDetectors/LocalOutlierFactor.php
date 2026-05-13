@@ -40,35 +40,21 @@ final class LocalOutlierFactor implements Learner, Persistable
             throw new RuntimeException("LOF is not trained.");
         }
 
-        $testX = $dataset->samples();
-        $nTest = $testX->shape()[0];
+        $testX  = $dataset->samples();
+        $nTest  = $testX->shape()[0];
         $nTrain = $this->fitSamples->shape()[0];
-        
-        $k = min($this->k, $nTrain - 1);
-        $scores = [];
+        $k      = min($this->k, $nTrain - 1);
 
-        // JIT Loop: Iterates over test samples
-        for ($i = 0; $i < $nTest; $i++) {
-            $x = $testX->row($i);
+        // One BLAS call: [nTest, nTrain] pairwise squared L2 distances
+        $distMat    = Tensor::pairwiseSqL2($testX, $this->fitSamples);
+        $sortedDist = $distMat->sort(1);                    // [nTest, nTrain] ascending
+        $kDists     = $sortedDist->slice(1, 0, $k);         // [nTest, k] nearest distances
+        $meanDists  = $kDists->meanAxis(1);                 // [nTest] mean k-nn sq distance
 
-            // Distance to all training points: sum((X_train - x)^2, axis=1)
-            $sqDist = $this->fitSamples->sub($x)->square()->sumAxis(1);
-            
-            // Extract K-nearest indices and distances using C-Level Sort
-            $sortedIndices = $sqDist->argsort();
-            $kIndices = $sortedIndices->slice(0, 0, $k);
-            
-            // The local density is inversely proportional to the mean distance of the K neighbors
-            $kDistances = $sqDist->take($kIndices, 0);
-            $meanDist = $kDistances->mean();
-
-            // Lower density (higher distance) = Higher Anomaly Score
-            // Normal points hover around 1.0, outliers are > 1.5
-            $scores[] = $meanDist > 1e-8 ? $meanDist : 1.0;
-        }
-
-        // Return continuous anomaly scores (Higher = more anomalous)
-        return Tensor::fromArray($scores);
+        // Near-zero mean distance (self-match) → return 1.0 (normal density baseline)
+        $nearZero = $meanDists->lessScalar(1e-8);
+        $ones     = Tensor::ones($nTest);
+        return $nearZero->where($ones, $meanDists);
     }
 
     public function trained(): bool

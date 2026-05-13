@@ -156,34 +156,22 @@ final class DBSCAN implements Learner, Persistable
         $testX = $dataset->samples();
         $nTest = $testX->shape()[0];
 
-        // If no dense regions were found during training, everything is noise (-1.0)
         if ($this->coreSamples === null) {
             return Tensor::zeros($nTest)->addScalarInplace(-1.0);
         }
 
-        $preds = [];
-        $flatCoreLabels = $this->coreLabels->toFlatArray();
-        $maxDistSq = $this->epsilon * $this->epsilon;
+        // One BLAS call: [nTest, nCore] pairwise squared distances
+        $distMat  = Tensor::pairwiseSqL2($testX, $this->coreSamples);
+        $nnIdx    = $distMat->argsort(1)->slice(1, 0, 1)->squeeze();   // [nTest] nearest core index
+        $minDist  = $distMat->minAxis(1);                               // [nTest] min sq distance
 
-        // JIT prediction loop mapping to cached Core Points
-        for ($i = 0; $i < $nTest; $i++) {
-            $point = $testX->row($i);
-            
-            // Distance to all core samples natively in C
-            $sqDist = $this->coreSamples->sub($point)->square()->sumAxis(1);
-            $minIdx = $sqDist->argmin();
-            
-            // Extract the single minimum distance
-            $minDist = $sqDist->toFlatArray()[$minIdx];
+        // Gather each test point's nearest core label
+        $assigned  = Tensor::gatherIndices($nnIdx, $this->coreLabels);  // [nTest]
 
-            if ($minDist <= $maxDistSq) {
-                $preds[] = $flatCoreLabels[$minIdx];
-            } else {
-                $preds[] = -1.0; // Point is too far from any cluster
-            }
-        }
-
-        return Tensor::fromArray($preds);
+        // Points farther than ε² get -1 (noise); closer points keep the core's label
+        $noiseVec  = Tensor::zeros($nTest)->addScalarInplace(-1.0);
+        $noiseMask = $minDist->greaterScalar($this->epsilon * $this->epsilon);
+        return $noiseMask->where($noiseVec, $assigned);
     }
 
     public function trained(): bool

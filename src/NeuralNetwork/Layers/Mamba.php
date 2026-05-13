@@ -79,15 +79,20 @@ final class Mamba implements Layer, Stateful, HasTrainingMode, Verbose {
         $this->A_log->fill(-1.0);
         $this->D_skip->fill(1.0);
 
-        // Standard Xavier initialization using Tensor methods
         $stddev = sqrt(2.0 / $this->dModel);
-        $this->W_B = Tensor::randomNormal([$this->dState, $this->dModel], 0.0, $stddev);
-        $this->W_C = Tensor::randomNormal([$this->dState, $this->dModel], 0.0, $stddev);
-        $this->W_delta = Tensor::randomNormal([$this->dModel, $this->dModel], 0.0, $stddev);
+        $this->W_B     = Tensor::randomNormal([$this->dState, $this->dModel], 0.0, $stddev);
+        $this->W_C     = Tensor::randomNormal([$this->dState, $this->dModel], 0.0, $stddev);
+        // Tiny stddev keeps delta near b_delta. Xavier stddev ≈ 0.072 produces
+        // σ(delta) ≈ 1.4 after RMSNorm, pushing almost all values outside the
+        // C-kernel clamp range [1e-4, 1.0] where ∂clamp/∂delta = 0, zeroing
+        // every W_delta gradient from step 1.
+        $this->W_delta = Tensor::randomNormal([$this->dModel, $this->dModel], 0.0, 0.01);
 
         $this->b_B->fill(0.0);
         $this->b_C->fill(0.0);
-        $this->b_delta->fill(0.0);
+        // 0.3 puts initial delta in the middle of [1e-4, 1.0] → Ā = exp(-0.3) ≈ 0.74,
+        // giving real state decay and non-trivial input contribution from step 1.
+        $this->b_delta->fill(0.3);
     }
 
     /**
@@ -105,6 +110,19 @@ final class Mamba implements Layer, Stateful, HasTrainingMode, Verbose {
      * @param bool $mode
      * @return void
      */
+    /**
+     * Project A_log back into (-20, 0] after each optimizer step.
+     *
+     * Ā = exp(delta × A_log).  If Adam pushes A_log positive, Ā > 1 and the
+     * SSM state grows exponentially over T timesteps.  The backward gradient
+     * accumulates Ā^(T-t) factors → gradient norm explodes to 10^16+.
+     * Clamping to [-20, 0] keeps Ā ∈ (2×10⁻⁹, 1] — always a stable decay.
+     */
+    public function enforceStability(): void
+    {
+        $this->A_log->clampInplace(-20.0, 0.0);
+    }
+
     public function setTraining(bool $mode): void {
         $this->isTraining = $mode;
         if ($this->logger) {

@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Pml\NeuralNetwork\Optimizers;
 
-use Pml\NeuralNetwork\Layers\Layer;
+use Pml\Tensor;
 
 /**
  * Stochastic Gradient Descent (SGD) with In-Place C Mutations.
@@ -22,20 +22,11 @@ final class SGD implements Optimizer
     {
         foreach ($layers as $layer) {
             $params = $layer->getParameters();
-            $grads = $layer->getGradients();
+            $grads  = $layer->getGradients();
 
-            foreach ($params as $name => $paramTensor) {
+            foreach ($params as $name => $param) {
                 if (isset($grads[$name])) {
-                    // W = W - (dW * lr)
-                    // 1. Scale gradient by learning rate (Creates temporary C-Tensor)
-                    $scaledGradient = $grads[$name]->mulScalar($this->learningRate);
-                    
-                    // 2. Subtract directly from the active Weight matrix IN-PLACE
-                    // This guarantees zero PHP heap fragmentation during millions of training steps.
-                    $paramTensor->subInplace($scaledGradient);
-                    
-                    // The temporary $scaledGradient tensor falls out of scope here 
-                    // and its C-memory is instantly freed by __destruct().
+                    Tensor::fusedSgdStep($param, $grads[$name], $this->learningRate);
                 }
             }
         }

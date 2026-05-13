@@ -69,22 +69,20 @@ final class MeanShift implements Learner, Persistable
             if ($maxShift < $this->tolerance) break;
         }
 
-        // 3. Merge identical/overlapping centroids natively
+        // 3. Merge overlapping centroids: precompute [N,N] distances once, then
+        //    PHP-loop only for the greedy union-find (O(N) iterations, O(1) lookups).
+        $tolSq    = $this->tolerance * $this->tolerance;
+        $distMat  = Tensor::pairwiseSqL2($centroids, $centroids);      // [N, N]
+        $closeMat = $distMat->lessScalar($tolSq)->toFlatArray();        // [N*N] flat bool
+
+        $merged = [];
         $unique = [];
-        $mergedMap = [];
-        
         for ($i = 0; $i < $n; $i++) {
-            if (isset($mergedMap[$i])) continue;
-            
-            $c1 = $centroids->row($i);
-            $unique[] = $c1;
-            
+            if (isset($merged[$i])) continue;
+            $unique[] = $centroids->row($i);
             for ($j = $i + 1; $j < $n; $j++) {
-                if (isset($mergedMap[$j])) continue;
-                $c2 = $centroids->row($j);
-                
-                if ($c1->sub($c2)->abs()->max() < $this->tolerance) {
-                    $mergedMap[$j] = true;
+                if (!isset($merged[$j]) && $closeMat[$i * $n + $j]) {
+                    $merged[$j] = true;
                 }
             }
         }
@@ -96,17 +94,9 @@ final class MeanShift implements Learner, Persistable
     {
         if (!$this->trained()) throw new RuntimeException("MeanShift is not trained.");
 
-        $testX = $dataset->samples();
-        $nTest = $testX->shape()[0];
-        $preds = [];
-
-        // Assign to nearest converged centroid
-        for ($i = 0; $i < $nTest; $i++) {
-            $x = $testX->row($i);
-            $preds[] = $this->centroids->sub($x)->square()->sumAxis(1)->argmin();
-        }
-
-        return Tensor::fromArray($preds);
+        // One BLAS call: [nTest, K] pairwise distances → nearest centroid per row
+        $distMat = Tensor::pairwiseSqL2($dataset->samples(), $this->centroids);
+        return $distMat->argsort(1)->slice(1, 0, 1)->squeeze();
     }
 
     public function trained(): bool
