@@ -61,5 +61,5 @@ find examples -name "*.php" ! -name "bootstrap.php" | sort | xargs -I{} php {}
 ## Requirements
 
 - PHP 8.1+
-- `src/Lib/libtensor.so` compiled (see CLAUDE.md)
+- `src/Lib/libtensor.so` compile first
 - `composer install`
