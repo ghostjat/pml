@@ -15,27 +15,33 @@ use Pml\Tensor;
  * Run with:
  *   vendor/bin/phpbench run benchmarks/TensorBench.php --report=aggregate
  */
+#[Bench\BeforeMethods('setUp')]
 #[Bench\Groups(['tensor', 'ffi', 'simd', 'linalg'])]
 final class TensorBench
 {
     // Pre-allocated shared tensors (avoid constructor cost inside hot loops)
-    private Tensor $vec1M;
-    private Tensor $mat512;
-    private Tensor $matA;
-    private Tensor $matB;
-    private Tensor $mat100;
-    private Tensor $batch;
-    private Tensor $vec1k;
+    private static Tensor $vec1M;
+    private static Tensor $mat512;
+    private static Tensor $matA;
+    private static Tensor $matB;
+    private static Tensor $mat100;
+    private static Tensor $batch;
+    private static Tensor $vec1k;
+    private static bool $initialized = false;
 
-    public function __construct()
+    public function setUp(): void
     {
-        $this->vec1M  = Tensor::randomNormal([1_000_000]);
-        $this->mat512 = Tensor::randomNormal([512, 512]);
-        $this->matA   = Tensor::randomNormal([256, 256]);
-        $this->matB   = Tensor::randomNormal([256, 256]);
-        $this->mat100 = Tensor::randomNormal([100, 100]);
-        $this->batch  = Tensor::randomNormal([1000, 128]);
-        $this->vec1k  = Tensor::randomNormal([1000]);
+        if (self::$initialized) return;
+        
+        self::$vec1M  = Tensor::randomNormal([1_000_000]);
+        self::$mat512 = Tensor::randomNormal([512, 512]);
+        self::$matA   = Tensor::randomNormal([256, 256]);
+        self::$matB   = Tensor::randomNormal([256, 256]);
+        self::$mat100 = Tensor::randomNormal([100, 100]);
+        self::$batch  = Tensor::randomNormal([1000, 128]);
+        self::$vec1k  = Tensor::randomNormal([1000]);
+        
+        self::$initialized = true;
     }
 
     // =========================================================================
@@ -71,21 +77,21 @@ final class TensorBench
     #[Bench\Iterations(5), Bench\Revs(20)]
     public function benchAdd1M(): void
     {
-        $r = $this->vec1M->add($this->vec1M);
+        $r = self::$vec1M->add(self::$vec1M);
         unset($r);
     }
 
     #[Bench\Iterations(5), Bench\Revs(20)]
     public function benchMul1M(): void
     {
-        $r = $this->vec1M->mul($this->vec1M);
+        $r = self::$vec1M->mul(self::$vec1M);
         unset($r);
     }
 
     #[Bench\Iterations(5), Bench\Revs(20)]
     public function benchAddScalar1M(): void
     {
-        $r = $this->vec1M->addScalar(1.0);
+        $r = self::$vec1M->addScalar(1.0);
         unset($r);
     }
 
@@ -93,7 +99,7 @@ final class TensorBench
     public function benchMulScalarInplace1M(): void
     {
         // in-place avoids allocation — measures pure AVX2 throughput
-        $t = $this->vec1M->copy();
+        $t = self::$vec1M->copy();
         $t->mulScalarInplace(2.0);
         unset($t);
     }
@@ -101,7 +107,7 @@ final class TensorBench
     #[Bench\Iterations(5), Bench\Revs(20)]
     public function benchDiv1M(): void
     {
-        $r = $this->vec1M->div($this->vec1M);
+        $r = self::$vec1M->div(self::$vec1M);
         unset($r);
     }
 
@@ -112,28 +118,28 @@ final class TensorBench
     #[Bench\Iterations(5), Bench\Revs(20)]
     public function benchRelu1M(): void
     {
-        $r = $this->vec1M->relu();
+        $r = self::$vec1M->relu();
         unset($r);
     }
 
     #[Bench\Iterations(5), Bench\Revs(20)]
     public function benchSigmoid1M(): void
     {
-        $r = $this->vec1M->sigmoid();
+        $r = self::$vec1M->sigmoid();
         unset($r);
     }
 
     #[Bench\Iterations(5), Bench\Revs(10)]
     public function benchExp1M(): void
     {
-        $r = $this->vec1M->exp();
+        $r = self::$vec1M->exp();
         unset($r);
     }
 
     #[Bench\Iterations(5), Bench\Revs(10)]
     public function benchSqrt1M(): void
     {
-        $r = $this->vec1M->sqrt();
+        $r = self::$vec1M->sqrt();
         unset($r);
     }
 
@@ -152,33 +158,33 @@ final class TensorBench
     #[Bench\Iterations(5), Bench\Revs(50)]
     public function benchSum1M(): void
     {
-        $this->vec1M->sum();
+        self::$vec1M->sum();
     }
 
     #[Bench\Iterations(5), Bench\Revs(50)]
     public function benchMean1M(): void
     {
-        $this->vec1M->mean();
+        self::$vec1M->mean();
     }
 
     #[Bench\Iterations(5), Bench\Revs(20)]
     public function benchVarianceStd1M(): void
     {
-        $this->vec1M->variance();
-        $this->vec1M->std();
+        self::$vec1M->variance();
+        self::$vec1M->std();
     }
 
     #[Bench\Iterations(5), Bench\Revs(20)]
     public function benchSumAxis512(): void
     {
-        $r = $this->mat512->sumAxis(0);
+        $r = self::$mat512->sumAxis(0);
         unset($r);
     }
 
     #[Bench\Iterations(5), Bench\Revs(20)]
     public function benchMeanAxis512(): void
     {
-        $r = $this->mat512->meanAxis(1);
+        $r = self::$mat512->meanAxis(1);
         unset($r);
     }
 
@@ -189,21 +195,21 @@ final class TensorBench
     #[Bench\Iterations(5), Bench\Revs(50)]
     public function benchReshape1M(): void
     {
-        $r = $this->vec1M->reshape(1000, 1000);
+        $r = self::$vec1M->reshape(1000, 1000);
         unset($r);
     }
 
     #[Bench\Iterations(5), Bench\Revs(50)]
     public function benchTranspose512(): void
     {
-        $r = $this->mat512->transpose();
+        $r = self::$mat512->transpose();
         unset($r);
     }
 
     #[Bench\Iterations(5), Bench\Revs(50)]
     public function benchFlatten512(): void
     {
-        $r = $this->mat512->flatten();
+        $r = self::$mat512->flatten();
         unset($r);
     }
 
@@ -214,35 +220,35 @@ final class TensorBench
     #[Bench\Iterations(5), Bench\Revs(10)]
     public function benchMatmul256(): void
     {
-        $r = $this->matA->matmul($this->matB);
+        $r = self::$matA->matmul(self::$matB);
         unset($r);
     }
 
     #[Bench\Iterations(5), Bench\Revs(5)]
     public function benchMatmul512(): void
     {
-        $r = $this->mat512->matmul($this->mat512);
+        $r = self::$mat512->matmul(self::$mat512);
         unset($r);
     }
 
     #[Bench\Iterations(3), Bench\Revs(5)]
     public function benchInverse100(): void
     {
-        $r = $this->mat100->inverse();
+        $r = self::$mat100->inverse();
         unset($r);
     }
 
     #[Bench\Iterations(3), Bench\Revs(3)]
     public function benchSvd100(): void
     {
-        $svd = $this->mat100->svd();
+        $svd = self::$mat100->svd();
         unset($svd);
     }
 
     #[Bench\Iterations(3), Bench\Revs(5)]
     public function benchPinv100(): void
     {
-        $r = $this->mat100->pinv();
+        $r = self::$mat100->pinv();
         unset($r);
     }
 
@@ -262,21 +268,21 @@ final class TensorBench
     #[Bench\Iterations(5), Bench\Revs(20)]
     public function benchSort1k(): void
     {
-        $r = $this->vec1k->sort(0);
+        $r = self::$vec1k->sort(0);
         unset($r);
     }
 
     #[Bench\Iterations(5), Bench\Revs(20)]
     public function benchArgsort1k(): void
     {
-        $r = $this->vec1k->argsort(0);
+        $r = self::$vec1k->argsort(0);
         unset($r);
     }
 
     #[Bench\Iterations(5), Bench\Revs(20)]
     public function benchTopk100of1k(): void
     {
-        $r = $this->vec1k->topk(100, 0);
+        $r = self::$vec1k->topk(100, 0);
         unset($r);
     }
 
@@ -287,8 +293,8 @@ final class TensorBench
     #[Bench\Iterations(5), Bench\Revs(20)]
     public function benchBooleanIndex(): void
     {
-        $mask = $this->vec1k->greaterScalar(0.0);
-        $r    = $this->vec1k->booleanIndex($mask);
+        $mask = self::$vec1k->greaterScalar(0.0);
+        $r    = self::$vec1k->booleanIndex($mask);
         unset($mask, $r);
     }
 
@@ -314,14 +320,14 @@ final class TensorBench
     #[Bench\Iterations(5), Bench\Revs(20)]
     public function benchCopy512(): void
     {
-        $r = $this->mat512->copy();
+        $r = self::$mat512->copy();
         unset($r);
     }
 
     #[Bench\Iterations(5), Bench\Revs(50)]
     public function benchView512(): void
     {
-        $r = $this->mat512->view();
+        $r = self::$mat512->view();
         unset($r);
     }
 
@@ -333,7 +339,7 @@ final class TensorBench
     public function benchSaveLoad512(): void
     {
         $path = \sys_get_temp_dir() . '/bench_tensor.bin';
-        $this->mat512->save($path);
+        self::$mat512->save($path);
         $loaded = Tensor::load($path);
         unset($loaded);
         @\unlink($path);

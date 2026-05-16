@@ -1,5 +1,4 @@
 <?php
-
 declare(strict_types=1);
 
 namespace Pml\Benchmarks;
@@ -18,51 +17,62 @@ use Pml\NeuralNetwork\Optimizers\Adam;
 use Pml\Transformers\WordCountVectorizer;
 use Pml\Transformers\ImageResizer;
 
-/**
- * PML Framework Throughput Benchmark.
- * Measures the computational efficiency of each major subsystem.
- * Optimized to prevent process timeouts in restricted environments.
- */
 #[Bench\BeforeMethods('setUp')]
 #[Bench\Warmup(1)]
 #[Bench\Iterations(3)]
 final class PmlFrameworkBench
 {
-    private Dataset $nnDataset;
-    private Dataset $rfDataset;
-    private Dataset $imgDataset;
-    private array $texts;
-    private Sequential $nn;
+    private static Dataset $nnDataset;
+    private static Dataset $rfDataset;
+    private static Dataset $imgDataset;
+    private static Dataset $textDataset;
+    private static Tensor $matA;
+    private static Tensor $matB;
+    private static Sequential $nn;
+    private static RandomForestClassifier $rf;
+    private static WordCountVectorizer $wordVectorizer;
+    private static ImageResizer $imageResizer;
+    private static bool $initialized = false;
 
     public function setUp(): void
     {
-        // 1. Tabular Data Generation
+        if (self::$initialized) {
+            return;
+        }
+
+        self::$matA = Tensor::randomUniform([1000, 1000]);
+        self::$matB = Tensor::randomUniform([1000, 1000]);
+
         $samples = Tensor::randomNormal([10000, 50]);
         $rawLabels = Tensor::randomUniform([10000], 0, 1)->round();
+        self::$rfDataset = new Dataset($samples, $rawLabels);
 
-        // 2. Random Forest Dataset (Uses full 10k set for slicing)
-        $this->rfDataset = new Dataset($samples, $rawLabels);
-
-        // 3. Neural Network Dataset (Optimized size to 2048 to prevent timeouts)
         $nnRows = 2048;
         $nnSamples = $samples->slice(0, 0, $nnRows);
         $oneHotLabels = Tensor::zeros($nnRows, 2);
-        $flatLabels = $rawLabels->slice(0, 0, $nnRows)->toFlatArray();
-        $buffer = $oneHotLabels->buffer();
-        
-        foreach ($flatLabels as $i => $val) {
-            $buffer[$i * 2 + (int)$val] = 1.0;
+        $labelBuffer = $oneHotLabels->buffer();
+        $rawBuffer = $rawLabels->slice(0, 0, $nnRows)->buffer();
+        for ($i = 0; $i < $nnRows; $i++) {
+            $labelBuffer[$i * 2 + (int)$rawBuffer[$i]] = 1.0;
         }
-        $this->nnDataset = new Dataset($nnSamples, $oneHotLabels);
+        self::$nnDataset = new Dataset($nnSamples, $oneHotLabels);
 
-        // 4. Image Dataset: 8 Images (Reduced batch for speed), 3 Channels, 224x224
-        $this->imgDataset = new Dataset(Tensor::randomUniform([8, 3, 224, 224], 0, 255));
+        self::$imgDataset = new Dataset(Tensor::randomUniform([8, 3, 224, 224], 0, 255));
 
-        // 5. NLP Corpus: 500 Documents
-        $this->texts = array_fill(0, 500, "The quick brown hardware accelerated PML engine jumps over the slow PHP loops.");
+        $textFile = sys_get_temp_dir() . '/pml_bench_text_dataset.csv';
+        if (!file_exists($textFile)) {
+            $handle = fopen($textFile, 'w');
+            fputcsv($handle, ['text', 'label']);
+            for ($i = 0; $i < 500; $i++) {
+                fputcsv($handle, ["The quick brown hardware accelerated PML engine jumps over the slow PHP loops.", $i % 2]);
+            }
+            fclose($handle);
+        }
+        self::$textDataset = Dataset::load($textFile, true);
+        self::$wordVectorizer = new WordCountVectorizer(1000);
+        self::$wordVectorizer->fit(self::$textDataset);
 
-        // 6. Neural Network: 1M Parameters (Binary Classifier)
-        $this->nn = new Sequential([
+        self::$nn = new Sequential([
             new Dense(50, 512),
             new ReLU(),
             new Dense(512, 512),
@@ -70,63 +80,49 @@ final class PmlFrameworkBench
             new Dense(512, 2),
             new Softmax()
         ], new CategoricalCrossEntropy(), new Adam(0.001));
+
+        self::$rf = new RandomForestClassifier(nEstimators: 10, maxDepth: 5);
+        self::$rf->train(self::$rfDataset->slice(0, 1000));
+
+        self::$imageResizer = new ImageResizer(112, 112);
+        self::$initialized = true;
     }
 
-    /**
-     * Measure OpenBLAS matrix multiplication throughput.
-     */
     #[Bench\Groups(['tensor', 'linalg'])]
     #[Bench\Revs(5)]
     public function benchMatrixMatmul1000(): void
     {
-        $a = Tensor::randomUniform([1000, 1000]);
-        $b = Tensor::randomUniform([1000, 1000]);
-        $a->matmul($b);
+        $result = self::$matA->matmul(self::$matB);
+        unset($result);
     }
 
-    /**
-     * Measure Deep Learning Training Speed (Backprop + Adam).
-     * Now processes 32 batches of 64 per iteration.
-     */
     #[Bench\Groups(['nn', 'training'])]
     #[Bench\Revs(1)]
     public function benchNeuralNetworkEpoch(): void
     {
-        $this->nn->train($this->nnDataset, epochs: 1, batchSize: 64);
+        self::$nn->train(self::$nnDataset, epochs: 1, batchSize: 64);
     }
 
-    /**
-     * Measure Random Forest Inference Latency.
-     */
     #[Bench\Groups(['ensembles', 'inference'])]
     #[Bench\Revs(1)]
     public function benchRandomForestPredict(): void
     {
-        $rf = new RandomForestClassifier(nEstimators: 10, maxDepth: 5);
-        $rf->train($this->rfDataset->slice(0, 500));
-        $rf->predict($this->rfDataset->slice(0, 1000));
+        self::$rf->predict(self::$rfDataset->slice(0, 1000));
     }
 
-    /**
-     * Measure NLP Vectorization Speed.
-     */
     #[Bench\Groups(['nlp', 'vectorizer'])]
     #[Bench\Revs(2)]
     public function benchNLPVectorizationThroughput(): void
     {
-        $vec = new WordCountVectorizer(maxFeatures: 1000);
-        $vec->fit($this->texts);
-        $vec->transform($this->texts);
+        $result = self::$wordVectorizer->transform(self::$textDataset);
+        unset($result);
     }
 
-    /**
-     * Measure Image Processing Throughput.
-     */
     #[Bench\Groups(['images', 'resizer'])]
     #[Bench\Revs(2)]
     public function benchImageResizing8Batch(): void
     {
-        $resizer = new ImageResizer(112, 112);
-        $resizer->transform($this->imgDataset);
+        $result = self::$imageResizer->transform(self::$imgDataset);
+        unset($result);
     }
 }

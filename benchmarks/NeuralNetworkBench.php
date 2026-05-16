@@ -95,14 +95,8 @@ final class NeuralNetworkBench
     #[Bench\Groups(['nn', 'optimizer'])]
     public function benchAdamStepThroughput(): void
     {
-        $x = $this->dataset->samples();
-        $y = $this->dataset->labels();
-
-        $preds = $this->model->forward($x);
-        $dY = $this->cce->differentiate($preds, $y);
-        $this->model->backward($dY);
-        
-        // This is the core bottleneck: Updating millions of momenta in C-memory
+        // One full epoch: forward + backward + Adam update for all parameters.
+        // Bottleneck: updating millions of momentum/variance accumulators in C-memory.
         $this->model->train($this->dataset, epochs: 1, batchSize: 128);
     }
 
