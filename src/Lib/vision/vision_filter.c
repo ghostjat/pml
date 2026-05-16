@@ -21,7 +21,7 @@ VisionImage *vision_convolve2d(const VisionImage *src, const VisionKernel *kerne
     if (!src || !kernel) { VISION_ERR("convolve2d: null"); return NULL; }
     if (src->format != VISION_FMT_FLOAT32) { VISION_ERR("convolve2d: needs float32"); return NULL; }
     int W=src->width,H=src->height,C=src->channels;
-    int KH=kernel->height,KW=kernel->width;
+    int KH=kernel->kh,KW=kernel->kw;
     int padY=KH/2, padX=KW/2;
     VisionImage *dst=vision_image_create(W,H,C,src->format,src->layout,src->color_space);
     if(!dst)return NULL;
@@ -275,7 +275,7 @@ VisionImage *vision_canny(const VisionImage *src,
     int free_gray=0;
     if(src->channels>1){gray=vision_to_grayscale(src);free_gray=1;}
     else if(src->format!=VISION_FMT_FLOAT32){
-        gray=vision_to_float32(src);free_gray=1;
+        gray=vision_to_float32(src,1.0f/255.0f);free_gray=1;
     } else {gray=(VisionImage*)src;}
 
     VisionImage *blurred=vision_gaussian_blur(gray,gaussian_radius,gaussian_sigma);

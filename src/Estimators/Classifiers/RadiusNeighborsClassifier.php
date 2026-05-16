@@ -30,7 +30,7 @@ final class RadiusNeighborsClassifier implements Learner, Persistable
         $this->radius = $radius;
     }
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         $this->fitSamples  = $dataset->samples();
         $this->fitLabels   = $dataset->labels();

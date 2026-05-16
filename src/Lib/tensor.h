@@ -342,6 +342,68 @@ void     kvcache_append(KVCache* cache, const Tensor* k, const Tensor* v);
  * No O(seq²) scores buffer; O(head_dim) working memory per thread. */
 void tensor_attention_kv(Tensor* out, Tensor* q, const KVCache* cache);
 
+/* Multi-head KV cache: nLayers × nHeads individual KVCaches.
+ * One alloc per session; O(1) reset between requests.
+ *
+ * mkvca_prefill  — k,v: [nH, T, hd]  fills T prompt tokens for a layer
+ * mkvca_append   — k,v: [nH, hd]     appends one decode token for a layer
+ * mkvca_attend   — q:   [nH, 1, hd]  → new Tensor [nH, 1, hd] (OpenMP over heads) */
+typedef struct {
+    KVCache **caches;   /* flat [nLayers * nHeads] array of KVCache*          */
+    int       nLayers;
+    int       nHeads;
+    int       maxSeqLen;
+    int       headDim;
+} MultiKVCache;
+
+MultiKVCache* mkvca_create (int nLayers, int nHeads, int maxSeqLen, int headDim);
+void          mkvca_free   (MultiKVCache* c);
+void          mkvca_reset  (MultiKVCache* c);
+void          mkvca_prefill(MultiKVCache* c, int layer, const Tensor* k, const Tensor* v);
+void          mkvca_append (MultiKVCache* c, int layer, const Tensor* k, const Tensor* v);
+Tensor*       mkvca_attend (MultiKVCache* c, int layer, const Tensor* q);
+
+// ============================================================================
+// 20. INT8 WEIGHT QUANTIZATION
+// ============================================================================
+
+/* Symmetric INT8 block quantization of a 2-D weight matrix.
+ *
+ * Layout: the weight matrix W[rows, cols] is divided into non-overlapping
+ * groups of `group_size` consecutive columns within each row.  Each group
+ * has one float scale:
+ *
+ *   scale[i][g] = max(|W[i, g*gs : (g+1)*gs]|) / 127
+ *   data[i][j]  = clamp(round(W[i][j] / scale[i][j/gs]), -127, 127)
+ *
+ * group_size = 32  → Q8_0-class (good quality, 4× compression vs fp32)
+ * group_size = cols → per-row (slightly lower quality, same compression)
+ *
+ * qweight_linear: X [batch, cols] → Y [batch, rows]
+ *   batch == 1 (decode hot-path): AVX2 fused int8→fp32 dot per output row.
+ *   batch  > 1 (prefill)        : outer batch loop, same kernel per batch row.
+ *   Both paths are OpenMP-parallel over output rows.
+ *   No temporary fp32 weight allocation — reads directly from INT8 buffer. */
+typedef struct {
+    int8_t  *data;      /* [rows × cols]  64-byte aligned INT8 weights */
+    float   *scales;    /* [rows × num_groups] float32 scale per group  */
+    int      rows;
+    int      cols;
+    int      group_size;
+    int      num_groups; /* = ceil(cols / group_size)                   */
+} QuantizedWeight;
+
+/* Quantize a contiguous fp32 [rows, cols] Tensor to INT8 block format. */
+QuantizedWeight* qweight_quantize  (const Tensor* w, int group_size);
+/* Dequantize back to a heap-allocated fp32 [rows, cols] Tensor. */
+Tensor*          qweight_dequantize(const QuantizedWeight* q);
+/* Quantized linear: Y = X @ W^T + bias (bias may be NULL).
+ * X: [batch, cols]  →  Y: [batch, rows]  (new Tensor). */
+Tensor*          qweight_linear    (const Tensor* X, const QuantizedWeight* q, const Tensor* bias);
+/* Bytes used by data + scales buffers (excludes struct header). */
+size_t           qweight_memory    (const QuantizedWeight* q);
+void             qweight_free      (QuantizedWeight* q);
+
 // ============================================================================
 // 14. I/O SERIALIZATION
 // ============================================================================
@@ -647,5 +709,23 @@ void tensor_causal_attention(Tensor* out, Tensor* q, Tensor* k, Tensor* v, Tenso
 void tensor_causal_attention_backward(Tensor* dOut, Tensor* attn,
                                        Tensor* Q,    Tensor* K,  Tensor* V,
                                        Tensor* dQ,   Tensor* dK, Tensor* dV);
+
+/* LSTM forward — input[B,T,D], W_ih[D,4H], W_hh[H,4H], b_ih[4H], b_hh[4H] → [B,T,H] */
+Tensor* tensor_lstm_forward(Tensor* input, Tensor* W_ih, Tensor* W_hh,
+                             Tensor* b_ih, Tensor* b_hh);
+
+/* RF batch predict — single C call for all T trees (§29) */
+void tensor_rf_predict_batch(Tensor* X, HardwareNode* nodes_flat,
+                              int T, int maxNodes, Tensor* out);
+
+/* LSTM train forward — like tensor_lstm_forward but writes gate + cell caches */
+Tensor* tensor_lstm_forward_train(Tensor* input,  Tensor* W_ih, Tensor* W_hh,
+                                   Tensor* b_ih,   Tensor* b_hh,
+                                   Tensor* cache_acts, Tensor* cache_cell);
+
+/* LSTM BPTT backward — returns malloc'd [5]={dX, dW_ih, dW_hh, db_ih, db_hh} */
+Tensor** tensor_lstm_backward(Tensor* dY,   Tensor* input,  Tensor* output,
+                               Tensor* W_ih, Tensor* W_hh,
+                               Tensor* cache_acts, Tensor* cache_cell);
 
 #endif // TENSOR_H

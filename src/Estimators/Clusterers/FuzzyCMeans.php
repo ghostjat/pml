@@ -42,7 +42,7 @@ final class FuzzyCMeans implements Learner, Probabilistic, Persistable
         $this->tolerance = $tolerance;
     }
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         $x = $dataset->samples();
         $n = $x->shape()[0];

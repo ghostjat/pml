@@ -38,7 +38,7 @@ final class SoftmaxClassifier implements Learner, Probabilistic, Persistable
         private readonly int   $batchSize    = 32
     ) {}
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         $labels = $dataset->labels();
         if ($labels === null) {

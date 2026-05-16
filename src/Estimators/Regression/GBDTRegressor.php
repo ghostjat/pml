@@ -5,7 +5,9 @@ namespace Pml\Estimators\Regression;
 
 use Pml\Interfaces\Learner;
 use Pml\Interfaces\Persistable;
+use Pml\Interfaces\Scoring;
 use Pml\Lib\SafeTensorsIO;
+use Pml\Traits\GBDTCore;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -16,15 +18,9 @@ use RuntimeException;
  * Uses MSE loss. All per-sample work runs in C. PHP manages the O(T * 2^depth)
  * BFS node loop only.
  */
-final class GBDTRegressor implements Learner, Persistable
+final class GBDTRegressor implements Learner, Persistable, Scoring
 {
-    private ?Tensor $boundaries  = null;
-    private ?Tensor $treeFeats   = null;
-    private ?Tensor $treeThresh  = null;
-    private ?Tensor $treeLefts   = null;
-    private ?Tensor $treeRights  = null;
-    private ?Tensor $treeSizes   = null;
-    private float   $baseScore   = 0.0;
+    use GBDTCore;
 
     public function __construct(
         private readonly int   $nEstimators = 100,
@@ -37,7 +33,7 @@ final class GBDTRegressor implements Learner, Persistable
         private readonly float $minChildW   = 1.0
     ) {}
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         $y = $dataset->labels();
         if ($y === null) {
@@ -46,11 +42,9 @@ final class GBDTRegressor implements Learner, Persistable
 
         $X  = $dataset->samples();
         $N  = $X->shape()[0];
-        $Q  = $this->numBins;
         $T  = $this->nEstimators;
 
-        $this->boundaries = Tensor::gbdtComputeBoundaries($X, $Q);
-        $bins             = Tensor::gbdtBinSamples($X, $this->boundaries, $Q);
+        $bins = $this->gbdtInitBins($X);
 
         $this->baseScore = $y->sum() / $N;
         $preds           = Tensor::zeros($N)->addScalarInplace($this->baseScore);
@@ -58,18 +52,9 @@ final class GBDTRegressor implements Learner, Persistable
         $maxLeaves = 1 << $this->maxDepth;
         $maxNodes  = $maxLeaves * 2;
 
-        // Per-tree scratch tensors (reused each iteration)
-        $outFeats  = Tensor::zeros($maxNodes);
-        $outThresh = Tensor::zeros($maxNodes);
-        $outLefts  = Tensor::zeros($maxNodes);
-        $outRights = Tensor::zeros($maxNodes);
-
-        // Flat pre-allocated storage for all trees — no PHP arrays, no fromArray() at end
-        $this->treeFeats  = Tensor::zeros($T * $maxNodes)->fill(-1.0);
-        $this->treeThresh = Tensor::zeros($T * $maxNodes);
-        $this->treeLefts  = Tensor::zeros($T * $maxNodes)->fill(-1.0);
-        $this->treeRights = Tensor::zeros($T * $maxNodes)->fill(-1.0);
-        $sizesArr         = array_fill(0, $T, 0.0);
+        [$outFeats, $outThresh, $outLefts, $outRights] = $this->gbdtAllocateScratch($maxNodes);
+        $this->gbdtAllocateForest($T, $maxNodes);
+        $sizesArr = array_fill(0, $T, 0.0);
 
         for ($t = 0; $t < $T; $t++) {
             [$g, $h] = Tensor::gbdtMseGradHess($preds, $y);
@@ -80,25 +65,17 @@ final class GBDTRegressor implements Learner, Persistable
             $outRights->fill(-1.0);
 
             $nodesUsed = Tensor::gbdtTrainTree(
-                $bins, $g, $h, $Q, $maxLeaves,
+                $bins, $g, $h, $this->numBins, $maxLeaves,
                 $this->lambda, $this->alpha, $this->gamma, $this->minChildW, $this->lr,
                 $preds, $outFeats, $outThresh, $outLefts, $outRights
             );
-            $sizesArr[$t] = (float)$nodesUsed;
+            $sizesArr[$t] = (float) $nodesUsed;
 
-            // Single C memcpy per array instead of maxNodes PHP float reads
-            Tensor::gbdtCollectTree($this->treeFeats,  $t, $maxNodes, $outFeats);
-            Tensor::gbdtCollectTree($this->treeThresh, $t, $maxNodes, $outThresh);
-            Tensor::gbdtCollectTree($this->treeLefts,  $t, $maxNodes, $outLefts);
-            Tensor::gbdtCollectTree($this->treeRights, $t, $maxNodes, $outRights);
+            $this->gbdtStoreTree($t, $maxNodes, $outFeats, $outThresh, $outLefts, $outRights);
             unset($g, $h);
         }
 
-        $this->treeFeats  = $this->treeFeats->reshape($T, $maxNodes);
-        $this->treeThresh = $this->treeThresh->reshape($T, $maxNodes);
-        $this->treeLefts  = $this->treeLefts->reshape($T, $maxNodes);
-        $this->treeRights = $this->treeRights->reshape($T, $maxNodes);
-        $this->treeSizes  = Tensor::fromArray($sizesArr);
+        $this->gbdtReshapeForest($T, $maxNodes, $sizesArr);
     }
 
     public function predict(Dataset $dataset): Tensor
@@ -106,25 +83,34 @@ final class GBDTRegressor implements Learner, Persistable
         if (!$this->trained()) {
             throw new RuntimeException("GBDTRegressor is not trained.");
         }
-        $bins = Tensor::gbdtBinSamples($dataset->samples(), $this->boundaries, $this->numBins);
-        // lr already baked into stored leaf values by tensor_gbdt_train_tree
-        return Tensor::gbdtPredictAll(
-            $bins,
-            $this->treeFeats, $this->treeThresh,
-            $this->treeLefts, $this->treeRights,
-            $this->treeSizes, $this->baseScore
-        );
+        return $this->gbdtRunForest($dataset);
     }
 
-    public function trained(): bool
+    /**
+     * R² coefficient of determination — 1 - SS_res/SS_tot.
+     * All arithmetic delegated to C via Tensor ops; one PHP float extracted at the end.
+     */
+    public function score(Dataset $dataset): float
     {
-        return $this->treeFeats !== null;
+        $pred   = $this->predict($dataset);
+        $labels = $dataset->labels();
+        $res    = $pred->sub($labels);
+        $ssRes  = $res->sumSquares();
+        unset($res);
+        $ssTot  = $labels->variance() * $labels->size();
+        return $ssTot > 0.0 ? 1.0 - $ssRes / $ssTot : 1.0;
     }
 
     public function save(string $dir): void
     {
         is_dir($dir) || mkdir($dir, 0755, true);
-        file_put_contents($dir . '/config.json', json_encode(['nEstimators'=>$this->nEstimators,'maxDepth'=>$this->maxDepth,'numBins'=>$this->numBins,'lr'=>$this->lr,'lambda'=>$this->lambda,'alpha'=>$this->alpha,'gamma'=>$this->gamma,'minChildW'=>$this->minChildW,'baseScore'=>$this->baseScore]));
+        file_put_contents($dir . '/config.json', json_encode([
+            'nEstimators' => $this->nEstimators, 'maxDepth'  => $this->maxDepth,
+            'numBins'     => $this->numBins,      'lr'        => $this->lr,
+            'lambda'      => $this->lambda,        'alpha'     => $this->alpha,
+            'gamma'       => $this->gamma,         'minChildW' => $this->minChildW,
+            'baseScore'   => $this->baseScore,
+        ]));
         if ($this->treeFeats !== null) {
             SafeTensorsIO::save($dir . '/model.safetensors', [
                 'boundaries'  => $this->boundaries,
@@ -136,11 +122,16 @@ final class GBDTRegressor implements Learner, Persistable
             ]);
         }
     }
+
     public static function load(string $dir): self
     {
         $c = json_decode(file_get_contents($dir . '/config.json'), true);
-        $i = new self((int)$c['nEstimators'],(int)$c['maxDepth'],(int)$c['numBins'],(float)$c['lr'],(float)$c['lambda'],(float)($c['alpha']??0.0),(float)$c['gamma'],(float)$c['minChildW']);
-        $i->baseScore = (float)$c['baseScore'];
+        $i = new self(
+            (int)$c['nEstimators'], (int)$c['maxDepth'],   (int)$c['numBins'],
+            (float)$c['lr'],        (float)$c['lambda'],    (float)($c['alpha'] ?? 0.0),
+            (float)$c['gamma'],     (float)$c['minChildW']
+        );
+        $i->baseScore = (float) $c['baseScore'];
         $stPath = $dir . '/model.safetensors';
         if (is_file($stPath)) {
             $t = SafeTensorsIO::load($stPath);

@@ -49,7 +49,7 @@ final class IsolationForest implements Learner, Persistable
         $this->contamination = $contamination;
     }
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         $x = $dataset->samples();
         $n = $x->shape()[0];

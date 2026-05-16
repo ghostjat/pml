@@ -4,16 +4,21 @@ declare(strict_types=1);
 
 namespace Pml\Interfaces;
 
-use Psr\Log\LoggerInterface;
+use Psr\Log\LoggerAwareInterface;
 
 /**
- * Interface for estimators that emit training progress logs.
+ * @deprecated Use Psr\Log\LoggerAwareInterface directly (§19).
+ *
+ * Verbose is a thin re-declaration of the PSR-3 LoggerAwareInterface.
+ * It is kept as a deprecated transparent alias so existing code that
+ * type-checks for Verbose keeps working.  It will be removed in the
+ * next major version.
+ *
+ * Replacement:
+ *   - Interface: implements \Psr\Log\LoggerAwareInterface
+ *   - Trait:     use \Psr\Log\LoggerAwareTrait
  */
-interface Verbose
+interface Verbose extends LoggerAwareInterface
 {
-    /**
-     * Attach a PSR-3 compliant logger to the model.
-     * * @param LoggerInterface $logger
-     */
-    public function setLogger(LoggerInterface $logger): void;
+    // Intentionally empty — all semantics are in LoggerAwareInterface::setLogger().
 }

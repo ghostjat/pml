@@ -34,7 +34,7 @@ final class BootstrapAggregator implements Learner
         private readonly bool    $regression = false
     ) {}
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         $n       = $dataset->numRows();
         $bagSize = max(1, (int) round($n * $this->ratio));

@@ -43,7 +43,7 @@ final class MLPClassifier implements Learner, Probabilistic, Persistable
         private readonly float $dropout      = 0.0
     ) {}
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         $labels = $dataset->labels();
         if ($labels === null) {

@@ -40,7 +40,7 @@ final class AdaBoostClassifier implements Learner, Persistable
         $this->learningRate = $learningRate;
     }
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         $n = $dataset->numRows();
         $y = $dataset->labels();

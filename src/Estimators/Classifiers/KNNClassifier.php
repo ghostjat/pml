@@ -38,7 +38,7 @@ final class KNNClassifier implements Learner, Persistable
         $this->k = $k;
     }
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         $this->fitLabels = $dataset->labels();
         

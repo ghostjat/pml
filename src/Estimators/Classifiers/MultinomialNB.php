@@ -32,7 +32,7 @@ final class MultinomialNB implements Learner, Probabilistic, Persistable
         $this->alpha = $alpha;
     }
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         $x = $dataset->samples();
         $y = $dataset->labels();

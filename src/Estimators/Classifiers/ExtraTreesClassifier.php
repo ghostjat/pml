@@ -6,6 +6,7 @@ namespace Pml\Estimators\Classifiers;
 
 use Pml\Interfaces\Learner;
 use Pml\Interfaces\Persistable;
+use Pml\Interfaces\RanksFeatures;
 use Pml\Tensor;
 use Pml\Dataset;
 use Pml\Estimators\Trees\ExtraTreeClassifier;
@@ -17,13 +18,14 @@ use RuntimeException;
  * - Trades exhaustive optimization for extreme speed and higher variance.
  * - Bypasses bootstrap sampling to feed the whole dataset instantly to each weak learner.
  */
-final class ExtraTreesClassifier implements Learner, Persistable
+final class ExtraTreesClassifier implements Learner, Persistable, RanksFeatures
 {
     private int $nEstimators;
     private int $maxDepth;
     private int $minSamplesSplit;
     
     private int $numClasses = 0;
+    private int $nFeatures  = 0;
 
     /** @var ExtraTreeClassifier[] */
     private array $trees = [];
@@ -35,9 +37,10 @@ final class ExtraTreesClassifier implements Learner, Persistable
         $this->minSamplesSplit = $minSamplesSplit;
     }
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         $features = $dataset->numColumns();
+        $this->nFeatures  = $features;
         $maxFeatures = (int) max(1, sqrt($features));
         $this->numClasses = (int)($dataset->labels()->max() + 1);
 
@@ -71,10 +74,28 @@ final class ExtraTreesClassifier implements Learner, Persistable
         return !empty($this->trees);
     }
 
+    public function featureImportances(): Tensor
+    {
+        if (!$this->trained()) {
+            throw new RuntimeException("ExtraTrees Ensemble is not trained.");
+        }
+        $agg = array_fill(0, $this->nFeatures, 0.0);
+        foreach ($this->trees as $tree) {
+            foreach ($tree->featureSplitCounts() as $f => $c) {
+                $agg[$f] += $c;
+            }
+        }
+        $total = array_sum($agg);
+        if ($total > 0.0) {
+            foreach ($agg as &$v) { $v /= $total; }
+        }
+        return Tensor::fromArray($agg);
+    }
+
     public function save(string $dir): void
     {
         is_dir($dir) || mkdir($dir, 0755, true);
-        file_put_contents($dir . '/config.json', json_encode(['nEstimators' => $this->nEstimators, 'maxDepth' => $this->maxDepth, 'minSamplesSplit' => $this->minSamplesSplit, 'numClasses' => $this->numClasses]));
+        file_put_contents($dir . '/config.json', json_encode(['nEstimators' => $this->nEstimators, 'maxDepth' => $this->maxDepth, 'minSamplesSplit' => $this->minSamplesSplit, 'numClasses' => $this->numClasses, 'nFeatures' => $this->nFeatures]));
         $treeData = [];
         foreach ($this->trees as $tree) { $treeData[] = $tree->exportPhpTree(); }
         file_put_contents($dir . '/trees.json', json_encode($treeData));
@@ -85,6 +106,7 @@ final class ExtraTreesClassifier implements Learner, Persistable
         $c = json_decode(file_get_contents($dir . '/config.json'), true);
         $i = new self((int) $c['nEstimators'], (int) $c['maxDepth'], (int) $c['minSamplesSplit']);
         $i->numClasses = (int) ($c['numClasses'] ?? 2);
+        $i->nFeatures  = (int) ($c['nFeatures']  ?? 0);
         foreach (json_decode(file_get_contents($dir . '/trees.json'), true) as $treeData) {
             $i->trees[] = ExtraTreeClassifier::fromPhpTree($treeData);
         }

@@ -34,7 +34,7 @@ final class GaussianNB implements Learner, Probabilistic, Persistable, Saveable,
     private ?Tensor $varsMatrix   = null;   // [K, D]
     private ?Tensor $logNormsVec  = null;   // [K]
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         $x = $dataset->samples();
         $y = $dataset->labels();

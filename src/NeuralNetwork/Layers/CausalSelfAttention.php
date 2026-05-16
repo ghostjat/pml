@@ -4,6 +4,7 @@ declare(strict_types=1);
 namespace Pml\NeuralNetwork\Layers;
 
 use Pml\Interfaces\Stateful;
+use Pml\KVCache;
 use Pml\Tensor;
 
 /**
@@ -56,41 +57,72 @@ final class CausalSelfAttention implements Layer, Stateful
         $this->Wo = new Dense($dModel, $dModel);
     }
 
-    public function forward(Tensor $input): Tensor
+    /**
+     * Forward pass.
+     *
+     * Training / prefill (kv = null):
+     *   Full O(T²) causal attention; saves activations for backward().
+     *
+     * KV-cached prefill (kv != null, T > 1):
+     *   Full causal attention for the prompt, populates cache — no extra cost
+     *   vs. the training path, and the cache is ready for decode steps.
+     *
+     * KV-cached decode (kv != null, T = 1):
+     *   Appends the new token's K/V to the cache then runs Milakov O(seq_cache)
+     *   streaming attention — 2 FFI crossings total (append + attend).
+     *
+     * @param Tensor        $input    [T, D]
+     * @param KVCache|null  $kv       Multi-head cache; null for training
+     * @param int           $layerIdx Layer index passed to the cache
+     */
+    public function forward(Tensor $input, ?KVCache $kv = null, int $layerIdx = 0): Tensor
     {
-        // $input: [T, D]
         $T  = $input->shape()[0];
         $nH = $this->nHeads;
         $hd = $this->headDim;
         $D  = $this->dModel;
 
-        // Project: [T, D] × W^T → [T, D]
         $Q = $this->Wq->forward($input);  // [T, D]
         $K = $this->Wk->forward($input);
         $V = $this->Wv->forward($input);
 
-        // Reshape to [nH, T, hd]
-        $Qr = $Q->reshape($T, $nH, $hd)->transposeNd([1, 0, 2])->contiguous();
-        $Kr = $K->reshape($T, $nH, $hd)->transposeNd([1, 0, 2])->contiguous();
-        $Vr = $V->reshape($T, $nH, $hd)->transposeNd([1, 0, 2])->contiguous();
+        if ($kv === null || $T > 1) {
+            // Training path or prefill: full causal attention
+            $Qr = $Q->reshape($T, $nH, $hd)->transposeNd([1, 0, 2])->contiguous(); // [nH,T,hd]
+            $Kr = $K->reshape($T, $nH, $hd)->transposeNd([1, 0, 2])->contiguous();
+            $Vr = $V->reshape($T, $nH, $hd)->transposeNd([1, 0, 2])->contiguous();
 
-        // Pre-allocate attention output + weights
-        $out  = Tensor::zeros($nH, $T, $hd);
-        $attn = Tensor::zeros($nH, $T, $T);
+            $out  = Tensor::zeros($nH, $T, $hd);
+            $attn = Tensor::zeros($nH, $T, $T);
+            $out->causalAttention($Qr, $Kr, $Vr, $attn);
 
-        $out->causalAttention($Qr, $Kr, $Vr, $attn);
+            if ($kv !== null) {
+                // Populate cache from prompt K/V so decode steps can use it
+                $kv->prefill($layerIdx, $Kr, $Vr);  // 1 FFI call, fills all nH heads
+            } else {
+                // Save activations only when training (backward needed)
+                $this->savedX    = $input;
+                $this->savedQ    = $Qr;
+                $this->savedK    = $Kr;
+                $this->savedV    = $Vr;
+                $this->savedAttn = $attn;
+            }
 
-        // Save for backward
-        $this->savedX    = $input;
-        $this->savedQ    = $Qr;
-        $this->savedK    = $Kr;
-        $this->savedV    = $Vr;
-        $this->savedAttn = $attn;
+            $merged = $out->transposeNd([1, 0, 2])->contiguous()->reshape($T, $D);
+            return $this->Wo->forward($merged);
+        }
 
-        // Merge heads: [nH, T, hd] → [T, D]
-        $merged = $out->transposeNd([1, 0, 2])->contiguous()->reshape($T, $D);
+        // KV-cached decode: T == 1
+        // Squeeze T dim: [1, D] → reshape directly to [nH, hd]
+        $Kr = $K->reshape($nH, $hd)->contiguous();  // [nH, hd]
+        $Vr = $V->reshape($nH, $hd)->contiguous();
+        $Qr = $Q->reshape($nH, 1, $hd)->contiguous();  // [nH, 1, hd]
 
-        // Output projection
+        $kv->append($layerIdx, $Kr, $Vr);              // 1 FFI call: append to all heads
+        $attnOut = $kv->attend($layerIdx, $Qr);        // 1 FFI call: attend [nH,1,hd]
+
+        // Merge heads: [nH, 1, hd] → [1, nH, hd] → [1, D]
+        $merged = $attnOut->transposeNd([1, 0, 2])->contiguous()->reshape(1, $D);
         return $this->Wo->forward($merged);
     }
 

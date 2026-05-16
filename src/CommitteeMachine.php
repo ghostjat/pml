@@ -46,7 +46,7 @@ final class CommitteeMachine implements Learner
         }
     }
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         foreach ($this->members as $m) {
             $m['estimator']->train($dataset);

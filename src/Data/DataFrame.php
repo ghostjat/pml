@@ -80,6 +80,38 @@ final class DataFrame
         self::ffi()->df_free($this->ptr);
     }
 
+    /**
+     * §27 — block PHP clone; use copy() for a deep C-level duplicate.
+     * PHP clone would double-free the C DataFrame* on GC of either object.
+     */
+    public function __clone()
+    {
+        throw new \LogicException(
+            'DataFrame cannot be cloned with PHP clone (would cause double-free). '
+            . 'Use ->copy() for a deep copy.'
+        );
+    }
+
+    /**
+     * §27 — deep copy via df_slice_rows(0, numRows()).
+     * The returned DataFrame owns its own C memory and is fully independent.
+     */
+    public function copy(): self
+    {
+        $nRows = $this->numRows();
+        $ptr   = self::ffi()->df_slice_rows($this->ptr, 0, $nRows);
+        self::checkError();
+        return new self($ptr);
+    }
+
+    /**
+     * §27 — alias for iloc() with a semantic name.
+     */
+    public function sliceRows(int $offset, int $n): self
+    {
+        return $this->iloc($offset, $n);
+    }
+
     // ── FFI singleton ────────────────────────────────────────────────────
 
     private static function ffi(): \FFI

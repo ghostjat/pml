@@ -38,7 +38,7 @@ final class Ridge implements Learner, Persistable
         $this->batchSize = $batchSize;
     }
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         $x = $dataset->samples();
         $y = $dataset->labels();

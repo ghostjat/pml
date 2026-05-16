@@ -28,7 +28,7 @@ final class GaussianMLE implements Learner, Persistable
         $this->threshold = $threshold;
     }
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         $x = $dataset->samples();
         

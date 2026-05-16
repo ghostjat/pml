@@ -4,21 +4,26 @@ declare(strict_types=1);
 
 namespace Pml\NeuralNetwork\Layers;
 
-use Pml\Tensor;
+use Pml\Interfaces\Quantizable;
 use Pml\Interfaces\Stateful;
+use Pml\QuantizedTensor;
+use Pml\Tensor;
 
 /**
  * Fully-connected linear layer with optional bias.
  * Implements Stateful for zero-copy SafeTensors checkpoint I/O.
+ * Implements Quantizable for INT8 block quantization (inference-only).
  *
  * State-dict keys (relative to prefix):
  *   "weight" — [outputDim, inputDim] FLOAT32
  *   "bias"   — [outputDim]           FLOAT32  (omitted when useBias=false)
  */
-final class Dense implements Layer, Stateful, HasTrainingMode
+final class Dense implements Layer, Stateful, HasTrainingMode, Quantizable
 {
-    private Tensor $weights;
+    private ?Tensor $weights;
     private ?Tensor $bias;
+
+    private ?QuantizedTensor $quantizedW = null;
 
     private ?Tensor $input = null;
     private bool $training = true;   // false during inference — skips input cache
@@ -53,26 +58,32 @@ final class Dense implements Layer, Stateful, HasTrainingMode
 
         $this->dW = Tensor::zeros($outputDim, $inputDim);
 
-        // Cache capabilities (JIT friendly)
-        $this->hasMatmulInto = method_exists($this->dW, 'matmulInto');
-        $this->hasSumInto = $this->dbias !== null && method_exists($this->dbias, 'sumAxisInto');
+        // Tensor is final — matmulInto and sumAxisInto are always present
+        $this->hasMatmulInto = true;
+        $this->hasSumInto    = $this->dbias !== null;
     }
 
     public function forward(Tensor $input): Tensor
     {
-        // Optional: only enforce if your backend requires it
         if (!$input->isContiguous()) {
             $input = $input->contiguous();
         }
 
-        // Only cache during training — avoids pinning large tensors in inference mode.
         $this->input = $this->training ? $input : null;
+
+        if ($this->quantizedW !== null) {
+            return $this->quantizedW->linear($input, $this->bias);
+        }
 
         return $input->linear($this->weights, $this->bias);
     }
 
     public function backward(Tensor $dY): Tensor
     {
+        if ($this->quantizedW !== null) {
+            throw new \LogicException('Dense: backward() is not supported after quantize(). Quantized layers are inference-only.');
+        }
+
         $input = $this->input;
 
         if ($input === null) {
@@ -126,8 +137,34 @@ final class Dense implements Layer, Stateful, HasTrainingMode
     {
         $this->training = $mode;
         if (!$mode) {
-            $this->input = null;  // Release any cached input immediately
+            $this->input = null;
         }
+    }
+
+    /**
+     * Quantize weights to INT8 block format and free the fp32 copy.
+     *
+     * After this call:
+     *   - forward() uses the AVX2 fused int8→fp32 kernel (~4× less weight I/O)
+     *   - backward() throws (quantized layers are inference-only)
+     *   - getStateDict() dequantizes on demand for checkpoint export
+     *   - memory used by the fp32 weight matrix is released immediately
+     *
+     * Idempotent: calling quantize() on an already-quantized layer is a no-op.
+     */
+    public function quantize(int $groupSize = 32): void
+    {
+        if ($this->quantizedW !== null) {
+            return;
+        }
+        $this->quantizedW = QuantizedTensor::fromTensor($this->weights, $groupSize);
+        $this->weights    = null;  // free fp32 — the whole point
+        $this->dW         = Tensor::zeros(1);  // release gradient buffer too (not needed)
+    }
+
+    public function isQuantized(): bool
+    {
+        return $this->quantizedW !== null;
     }
 
     public function getParameters(): array
@@ -163,8 +200,8 @@ final class Dense implements Layer, Stateful, HasTrainingMode
     public function getConfig(): array
     {
         return [
-            'inputDim'  => $this->weights->ptr->shape[1],
-            'outputDim' => $this->weights->ptr->shape[0],
+            'inputDim'  => $this->quantizedW !== null ? $this->quantizedW->cols() : $this->weights->ptr->shape[1],
+            'outputDim' => $this->quantizedW !== null ? $this->quantizedW->rows() : $this->weights->ptr->shape[0],
             'useBias'   => $this->bias !== null,
         ];
     }
@@ -195,7 +232,11 @@ final class Dense implements Layer, Stateful, HasTrainingMode
      */
     public function getStateDict(string $prefix = ''): array
     {
-        $dict = [$prefix . 'weight' => $this->weights];
+        $weight = $this->quantizedW !== null
+            ? $this->quantizedW->toTensor()  // dequantize for checkpoint compat
+            : $this->weights;
+
+        $dict = [$prefix . 'weight' => $weight];
 
         if ($this->bias !== null) {
             $dict[$prefix . 'bias'] = $this->bias;
@@ -216,21 +257,20 @@ final class Dense implements Layer, Stateful, HasTrainingMode
      */
     public function loadStateDict(array $dict, string $prefix = ''): void
     {
-        // SafeTensorsIO::load() returns mmap-backed tensors (owns_data=false).
-        // Storing a direct reference means the C struct is freed when the caller's
-        // $weights dict goes out of scope, leaving $this->weights as a dangling
-        // pointer → SIGSEGV on the first forward pass.  copyFrom() memcpy's the
-        // data into the tensor we already own, so the mmap lifetime is irrelevant.
         $wKey = $prefix . 'weight';
         if (isset($dict[$wKey])) {
-            $this->weights->copyFrom($dict[$wKey]);
-            // dW was allocated in the constructor with the same shape — no realloc needed.
+            if ($this->quantizedW !== null) {
+                // Re-quantize from the incoming fp32 tensor
+                $gs = $this->quantizedW->groupSize();
+                $this->quantizedW = QuantizedTensor::fromTensor($dict[$wKey], $gs);
+            } else {
+                $this->weights->copyFrom($dict[$wKey]);
+            }
         }
 
         $bKey = $prefix . 'bias';
         if (isset($dict[$bKey]) && $this->bias !== null) {
             $this->bias->copyFrom($dict[$bKey]);
-            // dbias likewise stays correctly sized from construction.
         }
     }
 }

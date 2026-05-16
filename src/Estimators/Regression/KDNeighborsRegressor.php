@@ -26,7 +26,7 @@ final class KDNeighborsRegressor implements Learner, Persistable
 
     public function __construct(private readonly int $k = 5) {}
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         if ($dataset->labels() === null) {
             throw new \InvalidArgumentException("KDNeighborsRegressor requires labeled data.");

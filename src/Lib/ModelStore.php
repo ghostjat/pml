@@ -155,8 +155,21 @@ final class ModelStore
             return $model->getStateDict('');
         }
 
-        // Saveable without Stateful → class has explicitly declared no Tensor state.
+        // §30 — Saveable without Stateful: warn if untracked Tensor properties exist.
+        // A Saveable class is expected to explicitly opt-in to Stateful for any Tensor
+        // weights it holds.  If it doesn't, those weights are silently dropped on save.
         if ($model instanceof Saveable) {
+            $orphans = self::reflectScanTensors($model);
+            if (!empty($orphans)) {
+                $class = \get_class($model);
+                $names = implode(', ', array_keys($orphans));
+                trigger_error(
+                    "ModelStore: {$class} implements Saveable but not Stateful, yet has "
+                    . "Tensor properties [{$names}] that will NOT be saved. "
+                    . "Implement Stateful::getStateDict() to fix this.",
+                    E_USER_WARNING
+                );
+            }
             return [];
         }
 

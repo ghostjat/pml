@@ -34,7 +34,7 @@ final class LogitBoost implements Learner, Probabilistic, Persistable
         private readonly int   $minSamples   = 2
     ) {}
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         $labels = $dataset->labels();
         if ($labels === null) {

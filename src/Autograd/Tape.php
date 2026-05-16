@@ -3,7 +3,7 @@ declare(strict_types=1);
 
 namespace Pml\Autograd;
 
-use Pml\Lib\AutogradEngine;
+use Pml\Lib\TensorEngine;
 
 /**
  * PHP wrapper around the C Tape* computation graph.
@@ -32,7 +32,7 @@ final class Tape
      */
     public function __construct(int $opsCap = 0, int $varsCap = 0)
     {
-        $this->ffi = AutogradEngine::get();
+        $this->ffi = TensorEngine::get();
         $tape = $this->ffi->tape_create($opsCap, $varsCap);
         if (\FFI::isNull($tape)) {
             throw new \RuntimeException('[Tape] tape_create() returned NULL — out of memory.');

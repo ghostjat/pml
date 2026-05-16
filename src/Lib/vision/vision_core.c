@@ -227,11 +227,10 @@ VisionImage* vision_image_clone(const VisionImage* src)
     if (!src) VISION_ERR("vision_image_clone: null src");
 
     VisionImage* dst = vision_image_create(src->width, src->height, src->channels,
-                                            src->format, src->layout);
+                                            src->format, src->layout, src->color_space);
     if (!dst) return NULL;
 
     memcpy(dst->data, src->data, src->data_size);
-    dst->color_space = src->color_space;
     return dst;
 }
 
@@ -284,7 +283,7 @@ VisionImage* vision_imread(const char* path, int desired_channels)
 
     int actual_ch = desired_channels > 0 ? desired_channels : ch;
     VisionImage* img = vision_image_create(w, h, actual_ch,
-                                            VISION_FMT_UINT8, VISION_LAYOUT_HWC);
+                                            VISION_FMT_UINT8, VISION_LAYOUT_HWC, VISION_CS_RGB);
     if (!img) { stbi_image_free(raw); return NULL; }
 
     /* stb_image uses tightly packed rows; we use padded rows */
@@ -346,7 +345,7 @@ VisionImage* vision_imdecode(const uint8_t* buf, size_t len, int desired_channel
 
     int actual_ch = desired_channels > 0 ? desired_channels : ch;
     VisionImage* img = vision_image_create(w, h, actual_ch,
-                                            VISION_FMT_UINT8, VISION_LAYOUT_HWC);
+                                            VISION_FMT_UINT8, VISION_LAYOUT_HWC, VISION_CS_RGB);
     if (!img) { stbi_image_free(raw); return NULL; }
 
     size_t src_row = (size_t)w * actual_ch;
@@ -431,7 +430,7 @@ VisionImage* vision_to_float32(const VisionImage* src, float scale)
     if (src->format == VISION_FMT_FLOAT32) return vision_image_clone(src);
 
     VisionImage* dst = vision_image_create(src->width, src->height, src->channels,
-                                            VISION_FMT_FLOAT32, src->layout);
+                                            VISION_FMT_FLOAT32, src->layout, src->color_space);
     if (!dst) return NULL;
 
     int n_total = src->width * src->height * src->channels;
@@ -493,7 +492,7 @@ VisionImage* vision_to_uint8(const VisionImage* src, float scale)
     if (src->format == VISION_FMT_UINT8) return vision_image_clone(src);
 
     VisionImage* dst = vision_image_create(src->width, src->height, src->channels,
-                                            VISION_FMT_UINT8, src->layout);
+                                            VISION_FMT_UINT8, src->layout, src->color_space);
     if (!dst) return NULL;
 
     int n = src->width * src->height * src->channels;
@@ -518,7 +517,7 @@ VisionImage* vision_to_int8(const VisionImage* src, float scale, float zero_poin
     if (!src) VISION_ERR("vision_to_int8: null src");
 
     VisionImage* dst = vision_image_create(src->width, src->height, src->channels,
-                                            VISION_FMT_INT8, src->layout);
+                                            VISION_FMT_INT8, src->layout, src->color_space);
     if (!dst) return NULL;
 
     int n = src->width * src->height * src->channels;
@@ -557,7 +556,7 @@ VisionImage* vision_hwc_to_chw(const VisionImage* src)
     int H = src->height, W = src->width, C = src->channels;
     size_t esz = vision_element_size(src->format);
 
-    VisionImage* dst = vision_image_create(W, H, C, src->format, VISION_LAYOUT_CHW);
+    VisionImage* dst = vision_image_create(W, H, C, src->format, VISION_LAYOUT_CHW, src->color_space);
     if (!dst) return NULL;
 
     /* CHW stride = aligned(H*W*esz) per channel plane */
@@ -589,7 +588,7 @@ VisionImage* vision_chw_to_hwc(const VisionImage* src)
     size_t esz = vision_element_size(src->format);
     size_t plane_stride = src->stride;
 
-    VisionImage* dst = vision_image_create(W, H, C, src->format, VISION_LAYOUT_HWC);
+    VisionImage* dst = vision_image_create(W, H, C, src->format, VISION_LAYOUT_HWC, src->color_space);
     if (!dst) return NULL;
 
     #pragma omp parallel for schedule(static) collapse(2)
@@ -648,16 +647,18 @@ void* vision_image_to_tensor(const VisionImage* img)
         VISION_ERR("vision_image_to_tensor: alloc failed");
     }
 
-    /* Copy plane by plane, stripping any alignment padding */
+    /* Copy plane by plane, stripping alignment padding.
+     * CHW stride = bytes per plane (aligned); row stride within a plane = W. */
     int H = src->height, W = src->width, C = src->channels;
-    size_t plane_elems = (size_t)H * W;
+    size_t plane_elems  = (size_t)H * W;
+    size_t plane_stride = src->stride / sizeof(float);   /* plane size in floats (aligned) */
     for (int c = 0; c < C; c++) {
-        const float* src_plane = (const float*)(src->data) + c * (src->stride / sizeof(float));
-        float* dst_plane = buf + c * plane_elems;
+        const float* src_plane = (const float*)(src->data) + (size_t)c * plane_stride;
+        float*       dst_plane = buf + (size_t)c * plane_elems;
         for (int r = 0; r < H; r++) {
-            memcpy(dst_plane + r * W,
-                   src_plane + r * (src->stride / sizeof(float) / C) ,
-                   W * sizeof(float));
+            memcpy(dst_plane + (size_t)r * W,
+                   src_plane  + (size_t)r * W,   /* row stride within plane = W */
+                   (size_t)W * sizeof(float));
         }
     }
 
@@ -676,3 +677,7 @@ VisionImage* vision_tensor_to_image(void* tensor_data, int width, int height,
     return vision_image_create_from_data(tensor_data, width, height,
                                           channels, format, VISION_LAYOUT_CHW, 0);
 }
+
+/* Free a raw pointer returned by vision_image_to_tensor().
+ * Uses free() since posix_memalign / vision_alloc sit on the standard heap. */
+void vision_free_raw(void* ptr) { if (ptr) free(ptr); }

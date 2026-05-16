@@ -17,7 +17,7 @@ final class DummyRegressor implements Learner, Persistable
 {
     private ?float $mean = null;
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         // Extract the continuous mean natively in C
         $this->mean = $dataset->labels()->mean();

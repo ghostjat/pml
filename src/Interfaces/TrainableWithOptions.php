@@ -7,21 +7,15 @@ namespace Pml\Interfaces;
 use Pml\Dataset;
 
 /**
- * Extension of Learner for estimators that accept additional training
- * options beyond the dataset (e.g. epochs, validation set, patience).
+ * @deprecated Use Learner directly — its train() now accepts mixed ...$options (§16).
  *
- * Sequential implements this so Pipeline can forward its variadic $args
- * cleanly without violating the base Learner contract.
- *
- * PHP's type system requires a discriminated interface rather than widening
- * Learner::train() with variadic params (which would force every Learner
- * implementation to be updated or trigger a fatal declaration-mismatch error).
+ * TrainableWithOptions was a sub-interface of Learner that widened train() to
+ * accept variadic options for neural-network backends.  That widening has been
+ * merged into Learner itself, making this interface redundant.  It is kept as a
+ * transparent alias so existing code that type-checks for TrainableWithOptions
+ * keeps working without change.  It will be removed in the next major version.
  */
 interface TrainableWithOptions extends Learner
 {
-    /**
-     * Train the model, forwarding additional backend-specific options.
-     * Implementations are free to ignore options they do not recognise.
-     */
-    public function train(Dataset $dataset, mixed ...$options): void;
+    // Intentionally empty — all semantics are now in Learner::train().
 }

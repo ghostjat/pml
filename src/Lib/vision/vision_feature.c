@@ -101,7 +101,7 @@ HOGResult *vision_hog(const VisionImage *src, int cell_size, int block_size,
     if(!res){free(cell_hist);return NULL;}
     res->descriptors=(float*)calloc((size_t)total,sizeof(float));
     if(!res->descriptors){free(res);free(cell_hist);return NULL;}
-    res->length=total;
+    res->n_features=total;
 
     float *out=res->descriptors;
     for(int by=0;by<blocks_y;by++){
@@ -146,14 +146,14 @@ LBPResult *vision_lbp(const VisionImage *src, int radius, int grid_x, int grid_y
 
     LBPResult *res=(LBPResult*)malloc(sizeof(LBPResult));
     if(!res){if(free_g)vision_image_free(gray);return NULL;}
-    res->histogram=(float*)calloc((size_t)total,sizeof(float));
-    if(!res->histogram){free(res);if(free_g)vision_image_free(gray);return NULL;}
-    res->length=total;
+    res->descriptors=(float*)calloc((size_t)total,sizeof(float));
+    if(!res->descriptors){free(res);if(free_g)vision_image_free(gray);return NULL;}
+    res->n_features=total;
 
     int cell_w=W/grid_x, cell_h=H/grid_y;
     for(int gy=0;gy<grid_y;gy++){
         for(int gx=0;gx<grid_x;gx++){
-            float *h=res->histogram+(gy*grid_x+gx)*hist_size;
+            float *h=res->descriptors+(gy*grid_x+gx)*hist_size;
             int x0=gx*cell_w, y0=gy*cell_h;
             int x1=x0+cell_w, y1=y0+cell_h;
             if(x1>W)x1=W; if(y1>H)y1=H;
@@ -199,7 +199,7 @@ LBPResult *vision_lbp(const VisionImage *src, int radius, int grid_x, int grid_y
 }
 
 void vision_lbp_free(LBPResult *r){
-    if(r){free(r->histogram);free(r);}
+    if(r){free(r->descriptors);free(r);}
 }
 
 /* ------------------------------------------------------------------ Harris corners */

@@ -34,7 +34,7 @@ final class MLPRegressor implements Learner, Persistable
         private readonly float $dropout      = 0.0
     ) {}
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         if ($dataset->labels() === null) {
             throw new \InvalidArgumentException("MLPRegressor requires labeled data.");

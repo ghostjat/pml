@@ -804,6 +804,70 @@ final class Tensor {
         return ['dX' => $dX, 'dW' => $dW, 'dbias' => $dbias];
     }
 
+    // --- VISION / MODEL UTILITIES ---
+
+    /**
+     * Create a Tensor by COPYING from a raw float* pointer (e.g. vision_image_to_tensor output).
+     * The source pointer is NOT freed — caller is responsible.
+     */
+    public static function fromFloatCopy(\FFI\CData $floatPtr, array $shape): self
+    {
+        $ffi   = self::ffi();
+        $ndim  = count($shape);
+        $cShape = $ffi->new("int[{$ndim}]");
+        foreach ($shape as $i => $d) $cShape[$i] = $d;
+        $res = self::wrap($ffi->tensor_from_float_copy($floatPtr, $ndim, $ffi->cast("int*", $cShape)));
+        self::checkError();
+        return $res;
+    }
+
+    /** Alias for contiguous() with the name models use internally. */
+    public function makeContiguous(): self { return $this->contiguous(); }
+
+    /** Return raw void* data pointer for zero-copy FFI hand-off. */
+    public function dataPtr(): \FFI\CData { return $this->ptr->data; }
+
+    /**
+     * 2D nearest-neighbor upsampling of [N,C,H,W] by integer scale factor.
+     * Executed entirely in C (tensor_upsample_nearest2d).
+     */
+    public function upsample(int $scale): self
+    {
+        $res = self::wrap(self::ffi()->tensor_upsample_nearest2d($this->ptr, $scale, $scale));
+        self::checkError(); return $res;
+    }
+
+    // --- MOBILE / VISION-SPECIFIC PRIMITIVES ---
+    public function depthwiseConv2d(Tensor $W, ?Tensor $bias = null, int $sh = 1, int $sw = 1, int $ph = 0, int $pw = 0): self {
+        $b_ptr = $bias?->ptr;
+        $res = self::wrap(self::ffi()->tensor_depthwise_conv2d($this->ptr, $W->ptr, $b_ptr, $sh, $sw, $ph, $pw));
+        self::checkError(); return $res;
+    }
+    public function depthwiseConv2dBackward(Tensor $X, Tensor $W, int $sh = 1, int $sw = 1, int $ph = 0, int $pw = 0): array {
+        $ffi  = self::ffi();
+        $grads = $ffi->tensor_depthwise_conv2d_backward($this->ptr, $X->ptr, $W->ptr, $sh, $sw, $ph, $pw);
+        self::checkError();
+        $dX = self::wrap($grads[0]); $dW = self::wrap($grads[1]); $db = self::wrap($grads[2]);
+        $ffi->free($grads);
+        return ['dX' => $dX, 'dW' => $dW, 'dbias' => $db];
+    }
+    public function hardSigmoid(): self {
+        $res = self::wrap(self::ffi()->tensor_hard_sigmoid($this->ptr));
+        self::checkError(); return $res;
+    }
+    public function hardSwish(): self {
+        $res = self::wrap(self::ffi()->tensor_hard_swish($this->ptr));
+        self::checkError(); return $res;
+    }
+    public function hardSigmoidBackward(Tensor $X): self {
+        $res = self::wrap(self::ffi()->tensor_hard_sigmoid_backward($this->ptr, $X->ptr));
+        self::checkError(); return $res;
+    }
+    public function hardSwishBackward(Tensor $X): self {
+        $res = self::wrap(self::ffi()->tensor_hard_swish_backward($this->ptr, $X->ptr));
+        self::checkError(); return $res;
+    }
+
     // --- LLM AND NLP INTEGRATION ---
     public function embeddingLookup(Tensor $weights): self {
         $res = self::wrap(self::ffi()->tensor_embedding_lookup($this->ptr, $weights->ptr));
@@ -847,6 +911,61 @@ final class Tensor {
             $this->ptr, $x->ptr, $weight->ptr, $eps, $dWeight->ptr, $dBias?->ptr
         ));
         self::checkError(); return $res;
+    }
+
+    /**
+     * LSTM inference forward — single FFI crossing, no cache allocated.
+     * input: [B, T, D]  W_ih: [D, 4H]  W_hh: [H, 4H]  b_ih/b_hh: [4H] → [B, T, H]
+     */
+    public static function lstmForward(self $input, self $W_ih, self $W_hh,
+                                        self $b_ih,  self $b_hh): self
+    {
+        $res = self::wrap(self::ffi()->tensor_lstm_forward(
+            $input->ptr, $W_ih->ptr, $W_hh->ptr, $b_ih->ptr, $b_hh->ptr
+        ));
+        self::checkError();
+        return $res;
+    }
+
+    /**
+     * LSTM train forward — writes gate-activation and cell-state caches for BPTT.
+     * cache_acts [B,T,4H] and cache_cell [B,T,H] must be pre-allocated by caller.
+     */
+    public static function lstmForwardTrain(self $input, self $W_ih, self $W_hh,
+                                             self $b_ih,  self $b_hh,
+                                             self $cacheActs, self $cacheCell): self
+    {
+        $res = self::wrap(self::ffi()->tensor_lstm_forward_train(
+            $input->ptr, $W_ih->ptr, $W_hh->ptr, $b_ih->ptr, $b_hh->ptr,
+            $cacheActs->ptr, $cacheCell->ptr
+        ));
+        self::checkError();
+        return $res;
+    }
+
+    /**
+     * LSTM BPTT backward — single FFI crossing for the full reverse pass.
+     * Returns [dX, dW_ih, dW_hh, db_ih, db_hh].
+     *
+     * @return self[]  5-element array indexed 0..4
+     */
+    public static function lstmBackward(self $dY,   self $input,  self $output,
+                                         self $W_ih, self $W_hh,
+                                         self $cacheActs, self $cacheCell): array
+    {
+        $ffi = self::ffi();
+        $raw = $ffi->tensor_lstm_backward(
+            $dY->ptr, $input->ptr, $output->ptr,
+            $W_ih->ptr, $W_hh->ptr,
+            $cacheActs->ptr, $cacheCell->ptr
+        );
+        self::checkError();
+        $out = [];
+        for ($i = 0; $i < 5; $i++) {
+            $out[$i] = self::wrap($raw[$i]);
+        }
+        \FFI::free($raw);
+        return $out;
     }
 
     /**

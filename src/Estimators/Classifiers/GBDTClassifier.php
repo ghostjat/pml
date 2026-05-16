@@ -6,7 +6,9 @@ namespace Pml\Estimators\Classifiers;
 use Pml\Interfaces\Learner;
 use Pml\Interfaces\Probabilistic;
 use Pml\Interfaces\Persistable;
+use Pml\Interfaces\Scoring;
 use Pml\Lib\SafeTensorsIO;
+use Pml\Traits\GBDTCore;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -24,24 +26,14 @@ use RuntimeException;
  * runs in C via Section 22/26 kernels. PHP manages the O(T * K * 2^depth)
  * node-level loop — negligible overhead. Zero memory copies across FFI.
  */
-final class GBDTClassifier implements Learner, Probabilistic, Persistable
+final class GBDTClassifier implements Learner, Probabilistic, Persistable, Scoring
 {
-    // ── Shared state ──────────────────────────────────────────────────────────
-    private ?Tensor $boundaries  = null;
-    private ?Tensor $treeFeats   = null;
-    private ?Tensor $treeThresh  = null;
-    private ?Tensor $treeLefts   = null;
-    private ?Tensor $treeRights  = null;
-    private ?Tensor $treeSizes   = null;
+    use GBDTCore;
+
     private int     $maxNodes    = 0;
-
-    // ── Binary-only ───────────────────────────────────────────────────────────
-    private float   $baseScore   = 0.0;
-
-    // ── Multiclass-only ───────────────────────────────────────────────────────
     private int     $nClasses    = 2;
-    private array   $classLabels = [];   // sorted unique label values (float)
-    private ?Tensor $baseScoresMC = null; // [K] log-prior per class
+    private array   $classLabels = [];
+    private ?Tensor $baseScoresMC = null;
 
     public function __construct(
         private readonly int   $nEstimators = 100,
@@ -56,7 +48,7 @@ final class GBDTClassifier implements Learner, Probabilistic, Persistable
 
     // ── Training ──────────────────────────────────────────────────────────────
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         $y = $dataset->labels();
         if ($y === null) {
@@ -65,14 +57,12 @@ final class GBDTClassifier implements Learner, Probabilistic, Persistable
 
         $X = $dataset->samples();
         $N = $X->shape()[0];
-        $Q = $this->numBins;
         $T = $this->nEstimators;
 
-        $this->boundaries = Tensor::gbdtComputeBoundaries($X, $Q);
-        $bins             = Tensor::gbdtBinSamples($X, $this->boundaries, $Q);
+        $bins = $this->gbdtInitBins($X);
 
         // Detect unique classes (sorted)
-        $flatY = $y->toFlatArray();
+        $flatY  = $y->toFlatArray();
         $unique = array_values(array_unique($flatY));
         sort($unique);
         $K = count($unique);
@@ -84,38 +74,30 @@ final class GBDTClassifier implements Learner, Probabilistic, Persistable
         $maxNodes       = $maxLeaves * 2;
         $this->maxNodes = $maxNodes;
 
-        // Per-tree scratch tensors (reused every iteration)
-        $outFeats  = Tensor::zeros($maxNodes);
-        $outThresh = Tensor::zeros($maxNodes);
-        $outLefts  = Tensor::zeros($maxNodes);
-        $outRights = Tensor::zeros($maxNodes);
+        [$outFeats, $outThresh, $outLefts, $outRights] = $this->gbdtAllocateScratch($maxNodes);
 
         if ($K === 2) {
-            $this->trainBinary($bins, $y, $N, $T, $Q, $maxLeaves, $maxNodes,
+            $this->trainBinary($bins, $y, $N, $T, $maxLeaves, $maxNodes,
                                $outFeats, $outThresh, $outLefts, $outRights);
         } else {
-            $this->trainMulticlass($bins, $y, $flatY, $N, $K, $T, $Q, $maxLeaves, $maxNodes,
+            $this->trainMulticlass($bins, $y, $flatY, $N, $K, $T, $maxLeaves, $maxNodes,
                                    $outFeats, $outThresh, $outLefts, $outRights);
         }
     }
 
     private function trainBinary(
-        Tensor $bins, Tensor $y, int $N, int $T, int $Q,
+        Tensor $bins, Tensor $y, int $N, int $T,
         int $maxLeaves, int $maxNodes,
         Tensor $outFeats, Tensor $outThresh, Tensor $outLefts, Tensor $outRights
     ): void {
-        // Base score: log-odds of positive class
         $posCount        = $y->sum();
         $p               = max(1e-7, min(1.0 - 1e-7, $posCount / $N));
         $this->baseScore = log($p / (1.0 - $p));
 
-        $preds = Tensor::zeros($N)->addScalarInplace($this->baseScore);
+        $preds    = Tensor::zeros($N)->addScalarInplace($this->baseScore);
+        $sizesArr = array_fill(0, $T, 0.0);
 
-        $this->treeFeats  = Tensor::zeros($T * $maxNodes)->fill(-1.0);
-        $this->treeThresh = Tensor::zeros($T * $maxNodes);
-        $this->treeLefts  = Tensor::zeros($T * $maxNodes)->fill(-1.0);
-        $this->treeRights = Tensor::zeros($T * $maxNodes)->fill(-1.0);
-        $sizesArr         = array_fill(0, $T, 0.0);
+        $this->gbdtAllocateForest($T, $maxNodes);
 
         for ($t = 0; $t < $T; $t++) {
             [$g, $h] = Tensor::gbdtLogLossGradHess($preds, $y);
@@ -126,65 +108,48 @@ final class GBDTClassifier implements Learner, Probabilistic, Persistable
             $outRights->fill(-1.0);
 
             $nodesUsed = Tensor::gbdtTrainTree(
-                $bins, $g, $h, $Q, $maxLeaves,
+                $bins, $g, $h, $this->numBins, $maxLeaves,
                 $this->lambda, $this->alpha, $this->gamma, $this->minChildW, $this->lr,
                 $preds, $outFeats, $outThresh, $outLefts, $outRights
             );
-            $sizesArr[$t] = (float)$nodesUsed;
+            $sizesArr[$t] = (float) $nodesUsed;
 
-            Tensor::gbdtCollectTree($this->treeFeats,  $t, $maxNodes, $outFeats);
-            Tensor::gbdtCollectTree($this->treeThresh, $t, $maxNodes, $outThresh);
-            Tensor::gbdtCollectTree($this->treeLefts,  $t, $maxNodes, $outLefts);
-            Tensor::gbdtCollectTree($this->treeRights, $t, $maxNodes, $outRights);
+            $this->gbdtStoreTree($t, $maxNodes, $outFeats, $outThresh, $outLefts, $outRights);
             unset($g, $h);
         }
 
-        $this->treeFeats  = $this->treeFeats->reshape($T, $maxNodes);
-        $this->treeThresh = $this->treeThresh->reshape($T, $maxNodes);
-        $this->treeLefts  = $this->treeLefts->reshape($T, $maxNodes);
-        $this->treeRights = $this->treeRights->reshape($T, $maxNodes);
-        $this->treeSizes  = Tensor::fromArray($sizesArr);
+        $this->gbdtReshapeForest($T, $maxNodes, $sizesArr);
     }
 
     private function trainMulticlass(
         Tensor $bins, Tensor $y, array $flatY,
-        int $N, int $K, int $T, int $Q,
+        int $N, int $K, int $T,
         int $maxLeaves, int $maxNodes,
         Tensor $outFeats, Tensor $outThresh, Tensor $outLefts, Tensor $outRights
     ): void {
-        // Encode labels to integer indices 0..K-1
-        // Use string keys — float values cannot be array_flip'd in PHP
         $labelToIdx = array_flip(array_map('strval', $this->classLabels));
         $encArr     = array_map(fn($v) => (float)$labelToIdx[strval($v)], $flatY);
-        $yEnc       = Tensor::fromArray($encArr);  // [N] FLOAT32 class indices
+        $yEnc       = Tensor::fromArray($encArr);
 
-        // Base scores: log-prior per class
         $counts = array_fill(0, $K, 0);
         foreach ($encArr as $idx) { $counts[(int)$idx]++; }
         $baseArr = [];
         for ($k = 0; $k < $K; $k++) {
             $baseArr[$k] = log(max(1e-7, $counts[$k] / $N));
         }
-        $this->baseScoresMC = Tensor::fromArray($baseArr);  // [K]
+        $this->baseScoresMC = Tensor::fromArray($baseArr);
 
-        // preds: [N, K] — initialised with log-priors via single C call
         $preds = new Tensor([$N, $K]);
         Tensor::gbdtInitPredsMC($preds, $this->baseScoresMC);
 
-        // g, h: [N, K] — allocated once and reused every round
-        $g = new Tensor([$N, $K]);
-        $h = new Tensor([$N, $K]);
+        $g  = new Tensor([$N, $K]);
+        $h  = new Tensor([$N, $K]);
+        $TK = $T * $K;
 
-        // Total T*K trees stored round-major: tree tk → round (tk÷K), class (tk%K)
-        $TK              = $T * $K;
-        $this->treeFeats  = Tensor::zeros($TK * $maxNodes)->fill(-1.0);
-        $this->treeThresh = Tensor::zeros($TK * $maxNodes);
-        $this->treeLefts  = Tensor::zeros($TK * $maxNodes)->fill(-1.0);
-        $this->treeRights = Tensor::zeros($TK * $maxNodes)->fill(-1.0);
-        $sizesArr         = array_fill(0, $TK, 0.0);
+        $this->gbdtAllocateForest($TK, $maxNodes);
+        $sizesArr = array_fill(0, $TK, 0.0);
 
         for ($t = 0; $t < $T; $t++) {
-            // One FFI call computes all K grad/hess columns simultaneously
             Tensor::gbdtSoftmaxGradHessInto($preds, $yEnc, $g, $h);
 
             for ($k = 0; $k < $K; $k++) {
@@ -193,28 +158,20 @@ final class GBDTClassifier implements Learner, Probabilistic, Persistable
                 $outLefts->fill(-1.0);
                 $outRights->fill(-1.0);
 
-                // Train tree for class k — reads g/h/preds at stride K, zero copies
                 $nodesUsed = Tensor::gbdtTrainTreeMC(
                     $bins, $g, $h, $K, $k,
-                    $Q, $maxLeaves,
+                    $this->numBins, $maxLeaves,
                     $this->lambda, $this->alpha, $this->gamma, $this->minChildW, $this->lr,
                     $preds, $outFeats, $outThresh, $outLefts, $outRights
                 );
                 $tk = $t * $K + $k;
-                $sizesArr[$tk] = (float)$nodesUsed;
+                $sizesArr[$tk] = (float) $nodesUsed;
 
-                Tensor::gbdtCollectTree($this->treeFeats,  $tk, $maxNodes, $outFeats);
-                Tensor::gbdtCollectTree($this->treeThresh, $tk, $maxNodes, $outThresh);
-                Tensor::gbdtCollectTree($this->treeLefts,  $tk, $maxNodes, $outLefts);
-                Tensor::gbdtCollectTree($this->treeRights, $tk, $maxNodes, $outRights);
+                $this->gbdtStoreTree($tk, $maxNodes, $outFeats, $outThresh, $outLefts, $outRights);
             }
         }
 
-        $this->treeFeats  = $this->treeFeats->reshape($TK, $maxNodes);
-        $this->treeThresh = $this->treeThresh->reshape($TK, $maxNodes);
-        $this->treeLefts  = $this->treeLefts->reshape($TK, $maxNodes);
-        $this->treeRights = $this->treeRights->reshape($TK, $maxNodes);
-        $this->treeSizes  = Tensor::fromArray($sizesArr);
+        $this->gbdtReshapeForest($TK, $maxNodes, $sizesArr);
     }
 
     // ── Inference ─────────────────────────────────────────────────────────────
@@ -226,21 +183,17 @@ final class GBDTClassifier implements Learner, Probabilistic, Persistable
         }
         $bins = Tensor::gbdtBinSamples($dataset->samples(), $this->boundaries, $this->numBins);
 
-        if ($this->nClasses === 2) {
-            return $this->probaBinary($bins);
-        }
-        return $this->probaMulticlass($bins);
+        return $this->nClasses === 2
+            ? $this->probaBinary($bins)
+            : $this->probaMulticlass($bins);
     }
 
     private function probaBinary(Tensor $bins): Tensor
     {
-        $raw = Tensor::gbdtPredictAll(
-            $bins,
-            $this->treeFeats, $this->treeThresh,
-            $this->treeLefts, $this->treeRights,
-            $this->treeSizes, $this->baseScore
+        $raw  = Tensor::gbdtPredictAll(
+            $bins, $this->treeFeats, $this->treeThresh,
+            $this->treeLefts, $this->treeRights, $this->treeSizes, $this->baseScore
         );
-        // Sigmoid → P(class=1); stack [P(0), P(1)] as [N, 2]
         $p1   = $raw->copy()->sigmoidInplace();
         $ones = Tensor::ones($raw->shape()[0]);
         $p0   = $ones->sub($p1);
@@ -249,15 +202,12 @@ final class GBDTClassifier implements Learner, Probabilistic, Persistable
 
     private function probaMulticlass(Tensor $bins): Tensor
     {
-        // Single FFI call → [N, K] raw logits, then softmax in-place
         $raw = Tensor::gbdtPredictAllMC(
-            $bins,
-            $this->treeFeats, $this->treeThresh,
-            $this->treeLefts, $this->treeRights,
-            $this->treeSizes, $this->baseScoresMC,
-            $this->nClasses
+            $bins, $this->treeFeats, $this->treeThresh,
+            $this->treeLefts, $this->treeRights, $this->treeSizes,
+            $this->baseScoresMC, $this->nClasses
         );
-        $raw->rowSoftmaxInplace();  // [N, K] probabilities
+        $raw->rowSoftmaxInplace();
         return $raw;
     }
 
@@ -268,19 +218,16 @@ final class GBDTClassifier implements Learner, Probabilistic, Persistable
         }
         $bins = Tensor::gbdtBinSamples($dataset->samples(), $this->boundaries, $this->numBins);
 
-        if ($this->nClasses === 2) {
-            return $this->predictBinary($bins);
-        }
-        return $this->predictMulticlass($bins);
+        return $this->nClasses === 2
+            ? $this->predictBinary($bins)
+            : $this->predictMulticlass($bins);
     }
 
     private function predictBinary(Tensor $bins): Tensor
     {
         $raw   = Tensor::gbdtPredictAll(
-            $bins,
-            $this->treeFeats, $this->treeThresh,
-            $this->treeLefts, $this->treeRights,
-            $this->treeSizes, $this->baseScore
+            $bins, $this->treeFeats, $this->treeThresh,
+            $this->treeLefts, $this->treeRights, $this->treeSizes, $this->baseScore
         );
         $zeros = Tensor::zeros($raw->shape()[0]);
         return $raw->greaterEqual($zeros);
@@ -289,19 +236,19 @@ final class GBDTClassifier implements Learner, Probabilistic, Persistable
     private function predictMulticlass(Tensor $bins): Tensor
     {
         $raw = Tensor::gbdtPredictAllMC(
-            $bins,
-            $this->treeFeats, $this->treeThresh,
-            $this->treeLefts, $this->treeRights,
-            $this->treeSizes, $this->baseScoresMC,
-            $this->nClasses
+            $bins, $this->treeFeats, $this->treeThresh,
+            $this->treeLefts, $this->treeRights, $this->treeSizes,
+            $this->baseScoresMC, $this->nClasses
         );
-        // argmax over class axis → [N] integer class indices
         return $raw->argmaxAxis(1);
     }
 
-    public function trained(): bool
+    /** Accuracy — proportion of correctly predicted labels (computed entirely in C). */
+    public function score(Dataset $dataset): float
     {
-        return $this->treeFeats !== null;
+        $pred   = $this->predict($dataset);
+        $labels = $dataset->labels();
+        return $pred->equal($labels)->mean();
     }
 
     /** Return sorted class label values (index k → original label). */
@@ -315,30 +262,23 @@ final class GBDTClassifier implements Learner, Probabilistic, Persistable
     public function save(string $dir): void
     {
         is_dir($dir) || mkdir($dir, 0755, true);
-        $cfg = [
-            'nEstimators' => $this->nEstimators,
-            'maxDepth'    => $this->maxDepth,
-            'numBins'     => $this->numBins,
-            'lr'          => $this->lr,
-            'lambda'      => $this->lambda,
-            'alpha'       => $this->alpha,
-            'gamma'       => $this->gamma,
-            'minChildW'   => $this->minChildW,
-            'maxNodes'    => $this->maxNodes,
-            'nClasses'    => $this->nClasses,
-            'classLabels' => $this->classLabels,
-            'baseScore'   => $this->baseScore,
-        ];
-        file_put_contents($dir . '/config.json', json_encode($cfg));
+        file_put_contents($dir . '/config.json', json_encode([
+            'nEstimators' => $this->nEstimators, 'maxDepth'    => $this->maxDepth,
+            'numBins'     => $this->numBins,      'lr'          => $this->lr,
+            'lambda'      => $this->lambda,        'alpha'       => $this->alpha,
+            'gamma'       => $this->gamma,         'minChildW'   => $this->minChildW,
+            'maxNodes'    => $this->maxNodes,      'nClasses'    => $this->nClasses,
+            'classLabels' => $this->classLabels,   'baseScore'   => $this->baseScore,
+        ]));
 
         if ($this->treeFeats !== null) {
             $tensors = [
-                'boundaries'   => $this->boundaries,
-                'tree_feats'   => $this->treeFeats,
-                'tree_thresh'  => $this->treeThresh,
-                'tree_lefts'   => $this->treeLefts,
-                'tree_rights'  => $this->treeRights,
-                'tree_sizes'   => $this->treeSizes,
+                'boundaries'  => $this->boundaries,
+                'tree_feats'  => $this->treeFeats,
+                'tree_thresh' => $this->treeThresh,
+                'tree_lefts'  => $this->treeLefts,
+                'tree_rights' => $this->treeRights,
+                'tree_sizes'  => $this->treeSizes,
             ];
             if ($this->baseScoresMC !== null) {
                 $tensors['base_scores_mc'] = $this->baseScoresMC;
@@ -355,21 +295,21 @@ final class GBDTClassifier implements Learner, Probabilistic, Persistable
             (float)$c['lr'],         (float)$c['lambda'],    (float)($c['alpha'] ?? 0.0),
             (float)$c['gamma'],      (float)$c['minChildW']
         );
-        $i->maxNodes    = (int)($c['maxNodes'] ?? 0);
-        $i->nClasses    = (int)($c['nClasses'] ?? 2);
+        $i->maxNodes    = (int)($c['maxNodes']    ?? 0);
+        $i->nClasses    = (int)($c['nClasses']    ?? 2);
         $i->classLabels = (array)($c['classLabels'] ?? []);
-        $i->baseScore   = (float)($c['baseScore'] ?? 0.0);
+        $i->baseScore   = (float)($c['baseScore']  ?? 0.0);
 
         $stPath = $dir . '/model.safetensors';
         if (is_file($stPath)) {
             $t = SafeTensorsIO::load($stPath);
-            $i->boundaries    = $t['boundaries']     ?? null;
-            $i->treeFeats     = $t['tree_feats']     ?? null;
-            $i->treeThresh    = $t['tree_thresh']    ?? null;
-            $i->treeLefts     = $t['tree_lefts']     ?? null;
-            $i->treeRights    = $t['tree_rights']    ?? null;
-            $i->treeSizes     = $t['tree_sizes']     ?? null;
-            $i->baseScoresMC  = $t['base_scores_mc'] ?? null;
+            $i->boundaries   = $t['boundaries']     ?? null;
+            $i->treeFeats    = $t['tree_feats']     ?? null;
+            $i->treeThresh   = $t['tree_thresh']    ?? null;
+            $i->treeLefts    = $t['tree_lefts']     ?? null;
+            $i->treeRights   = $t['tree_rights']    ?? null;
+            $i->treeSizes    = $t['tree_sizes']     ?? null;
+            $i->baseScoresMC = $t['base_scores_mc'] ?? null;
         }
         return $i;
     }

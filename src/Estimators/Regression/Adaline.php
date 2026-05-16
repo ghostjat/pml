@@ -29,7 +29,7 @@ final class Adaline implements Learner, Persistable
         private readonly int   $batchSize    = 32
     ) {}
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         $d = $dataset->numColumns();
         $this->weights = Tensor::randomNormal([$d, 1], 0.0, 0.001);

@@ -37,6 +37,7 @@ SOURCES=(
     "${SCRIPT_DIR}/vision_augment.c"
     "${SCRIPT_DIR}/vision_detect.c"
     "${SCRIPT_DIR}/vision_segment.c"
+    "${SCRIPT_DIR}/vision_model.c"
 )
 
 echo "[PML Vision] Compiling ${#SOURCES[@]} C files..."

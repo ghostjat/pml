@@ -33,7 +33,7 @@ final class Loda implements Learner, Persistable
         $this->bins = $bins;
     }
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         $x = $dataset->samples();
         $features = $x->shape()[1];

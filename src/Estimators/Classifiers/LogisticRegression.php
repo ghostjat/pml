@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Pml\Estimators\Classifiers;
 
 use Pml\Interfaces\Learner;
+use Pml\Interfaces\Online;
 use Pml\Interfaces\Persistable;
 use Pml\Interfaces\Probabilistic;
 use Pml\Lib\SafeTensorsIO;
@@ -19,7 +20,7 @@ use RuntimeException;
  * - 100% vector-matrix arithmetic via OpenBLAS.
  * - Memory-flat training loop updates weights purely In-Place.
  */
-final class LogisticRegression implements Learner, Probabilistic, Persistable
+final class LogisticRegression implements Learner, Online, Probabilistic, Persistable
 {
     private int $epochs;
     private float $learningRate;
@@ -35,41 +36,44 @@ final class LogisticRegression implements Learner, Probabilistic, Persistable
         $this->batchSize = $batchSize;
     }
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
-        $features = $dataset->numColumns();
-        
-        // Initialize weights to tiny random values [D, 1]
-        $this->weights = Tensor::randomNormal([$features, 1], 0.0, 0.01);
-        $this->bias = 0.0;
+        $this->weights = Tensor::randomNormal([$dataset->numColumns(), 1], 0.0, 0.01);
+        $this->bias    = 0.0;
 
         for ($e = 0; $e < $this->epochs; $e++) {
             $dataset->randomize();
+            $this->runEpoch($dataset);
+        }
+    }
 
-            foreach ($dataset->batches($this->batchSize) as $batch) {
-                $x = $batch->samples();
-                
-                // Y must be shape [N, 1]
-                $y = $batch->labels();
-                $y = $y->ndim() === 1 ? $y->expandDims(1) : $y;
-                $n = (float) $x->shape()[0];
+    /** One mini-batch SGD pass — initializes weights on first call if not yet trained. */
+    public function partial(Dataset $dataset): void
+    {
+        if ($this->weights === null) {
+            $this->weights = Tensor::randomNormal([$dataset->numColumns(), 1], 0.0, 0.01);
+            $this->bias    = 0.0;
+        }
+        $dataset->randomize();
+        $this->runEpoch($dataset);
+    }
 
-                // 1. Forward Pass: Z = X * W + b
-                $z = $x->matmul($this->weights)->addScalarInplace($this->bias);
-                $predictions = $z->sigmoid();
+    private function runEpoch(Dataset $dataset): void
+    {
+        foreach ($dataset->batches($this->batchSize) as $batch) {
+            $x = $batch->samples();
+            $y = $batch->labels();
+            $y = $y->ndim() === 1 ? $y->expandDims(1) : $y;
+            $n = (float) $x->shape()[0];
 
-                // 2. Compute Gradients: dZ = A - Y
-                $dz = $predictions->sub($y);
-                
-                // dW = (X^T * dZ) / N
-                $dw = $x->transpose()->matmul($dz)->mulScalarInplace(1.0 / $n);
-                $db = $dz->mean();
+            $z           = $x->matmul($this->weights)->addScalarInplace($this->bias);
+            $predictions = $z->sigmoid();
+            $dz          = $predictions->sub($y);
+            $dw          = $x->transpose()->matmul($dz)->mulScalarInplace($this->learningRate / $n);
+            $db          = $dz->mean();
 
-                // 3. Update Weights In-Place: W -= dW * lr
-                $dw->mulScalarInplace($this->learningRate);
-                $this->weights->subInplace($dw);
-                $this->bias -= $db * $this->learningRate;
-            }
+            $this->weights->subInplace($dw);
+            $this->bias -= $db * $this->learningRate;
         }
     }
 

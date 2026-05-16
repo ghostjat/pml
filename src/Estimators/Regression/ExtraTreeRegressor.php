@@ -30,7 +30,7 @@ final class ExtraTreeRegressor implements Learner, Persistable
         private readonly ?int $maxFeatures     = null
     ) {}
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         if ($dataset->labels() === null) {
             throw new \InvalidArgumentException("ExtraTreeRegressor requires labeled data.");

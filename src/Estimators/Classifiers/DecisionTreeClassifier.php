@@ -6,6 +6,7 @@ namespace Pml\Estimators\Classifiers;
 
 use Pml\Interfaces\Learner;
 use Pml\Interfaces\Persistable;
+use Pml\Interfaces\RanksFeatures;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -17,7 +18,7 @@ use RuntimeException;
  * - Extracts 1D boolean masks to PHP to rapidly route tree topology via JIT.
  * - Employs Randomized Split searching to bypass exhaustive O(N^2) loops.
  */
-final class DecisionTreeClassifier implements Learner, Persistable
+final class DecisionTreeClassifier implements Learner, Persistable, RanksFeatures
 {
     private int $maxDepth;
     private int $minSamplesSplit;
@@ -37,7 +38,7 @@ final class DecisionTreeClassifier implements Learner, Persistable
         $this->maxFeatures = $maxFeatures;
     }
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         $x = $dataset->samples();
         $y = $dataset->labels();
@@ -263,6 +264,43 @@ private function findBestSplit(Tensor $x, Tensor $y): ?array
         $instance->buildHardwareNodes();
 
         return $instance;
+    }
+
+    public function numHardwareNodes(): int { return $this->numHardwareNodes; }
+    public function hardwareNodes(): \FFI\CData { return $this->hardwareNodes; }
+
+    private static function countSplits(array $node, array &$counts): void
+    {
+        if (!isset($node['feature'])) return;
+        $counts[$node['feature']] = ($counts[$node['feature']] ?? 0) + 1;
+        self::countSplits($node['left'],  $counts);
+        self::countSplits($node['right'], $counts);
+    }
+
+    /** Returns raw per-feature split counts (no FFI). Used by ensemble wrappers. */
+    public function featureSplitCounts(): array
+    {
+        if ($this->tree === null) {
+            throw new RuntimeException("DecisionTreeClassifier is not trained.");
+        }
+        $counts = [];
+        self::countSplits($this->tree, $counts);
+        return $counts;
+    }
+
+    public function featureImportances(): Tensor
+    {
+        $raw   = $this->featureSplitCounts();
+        $vals  = array_fill(0, $this->nFeatures, 0.0);
+        $total = 0.0;
+        foreach ($raw as $f => $c) {
+            $vals[$f]  = (float) $c;
+            $total    += $c;
+        }
+        if ($total > 0.0) {
+            foreach ($vals as &$v) { $v /= $total; }
+        }
+        return Tensor::fromArray($vals);
     }
 
     public function save(string $dir): void

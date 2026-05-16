@@ -7,6 +7,7 @@ namespace Pml\NeuralNetwork;
 use Pml\Tensor;
 use Pml\Dataset;
 use Pml\Interfaces\Persistable;
+use Pml\Interfaces\Quantizable;
 use Pml\Interfaces\Stateful;
 use Pml\Interfaces\TrainableWithOptions;
 use Pml\Interfaces\Verbose;
@@ -268,6 +269,24 @@ final class Sequential implements TrainableWithOptions, Persistable, Verbose
     public function trained(): bool
     {
         return $this->isTrained;
+    }
+
+    /**
+     * Quantize all Quantizable layers (Dense) in the model to INT8.
+     *
+     * After this call, forward() runs the AVX2 fused int8→fp32 kernel for
+     * every quantized layer.  The fp32 weight matrices are freed immediately,
+     * reducing peak RAM by ~4× for weight storage.
+     *
+     * @param int $groupSize  Elements per quantization group (32 = Q8_0-class).
+     */
+    public function quantize(int $groupSize = 32): void
+    {
+        foreach ($this->layers as $layer) {
+            if ($layer instanceof Quantizable) {
+                $layer->quantize($groupSize);
+            }
+        }
     }
 
     // ========================================================================

@@ -13,7 +13,7 @@ final class DummyClassifier implements Learner, Persistable
 {
     private ?float $mode = null;
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         // Extract the most frequent class natively in C using bincount -> argmax
         $this->mode = (float) $dataset->labels()->bincount()->argmax();

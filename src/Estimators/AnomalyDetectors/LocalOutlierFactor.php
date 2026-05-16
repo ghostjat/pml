@@ -28,7 +28,7 @@ final class LocalOutlierFactor implements Learner, Persistable
         $this->k = $k;
     }
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         // LOF is a lazy learner. Memorize the training set structure natively.
         $this->fitSamples = $dataset->samples();

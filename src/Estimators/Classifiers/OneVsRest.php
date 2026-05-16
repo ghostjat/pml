@@ -33,7 +33,7 @@ final class OneVsRest implements Learner, Probabilistic, Persistable
      */
     public function __construct(private readonly Learner $prototype) {}
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         $labels = $dataset->labels();
         if ($labels === null) {

@@ -25,7 +25,7 @@ final class LinearRegression implements Learner, Persistable
      * Train the model using the closed-form equation: W = X^+ * Y
      * (Where X^+ is the Pseudo-Inverse of X).
      */
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         $x = $dataset->samples();
         $y = $dataset->labels();

@@ -44,7 +44,7 @@ final class GradientBoostingRegressor implements Learner, Persistable
         $this->maxFeatures = $maxFeatures;
     }
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         $x = $dataset->samples();
         $y = $dataset->labels();

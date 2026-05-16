@@ -4369,6 +4369,361 @@ void tensor_attention_kv(Tensor* out, Tensor* q, const KVCache* kvc) {
     }
 }
 
+// ============================================================================
+// INT8 WEIGHT QUANTIZATION (qweight_*)
+// ============================================================================
+
+QuantizedWeight* qweight_quantize(const Tensor* w, int group_size) {
+    if (!w) { tensor_set_error("qweight_quantize: NULL tensor"); return NULL; }
+    if (w->ndim != 2 || w->dtype != DTYPE_FLOAT32) {
+        tensor_set_error("qweight_quantize: requires 2-D FLOAT32 tensor"); return NULL;
+    }
+    if (!tensor_is_contiguous(w)) {
+        tensor_set_error("qweight_quantize: tensor must be contiguous"); return NULL;
+    }
+
+    int rows = w->shape[0];
+    int cols = w->shape[1];
+    if (group_size <= 0 || group_size > cols) group_size = cols;
+    int num_groups = (cols + group_size - 1) / group_size;
+
+    QuantizedWeight* q = (QuantizedWeight*)safe_malloc(sizeof(QuantizedWeight));
+    if (!q) return NULL;
+    q->data   = (int8_t*)safe_memalign(64, (size_t)rows * cols);
+    q->scales = (float* )safe_memalign(64, (size_t)rows * num_groups * sizeof(float));
+    if (!q->data || !q->scales) {
+        free(q->data); free(q->scales); free(q);
+        tensor_set_error("qweight_quantize: OOM"); return NULL;
+    }
+    q->rows       = rows;
+    q->cols       = cols;
+    q->group_size = group_size;
+    q->num_groups = num_groups;
+
+    const float* src = F32(w);
+
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < rows; i++) {
+        const float* row = src     + (size_t)i * cols;
+        int8_t*      dst = q->data + (size_t)i * cols;
+        float*       sc  = q->scales + (size_t)i * num_groups;
+
+        for (int g = 0; g < num_groups; g++) {
+            int gstart = g * group_size;
+            int gend   = gstart + group_size; if (gend > cols) gend = cols;
+
+            /* absmax of group */
+            float absmax = 0.0f;
+            for (int j = gstart; j < gend; j++) {
+                float v = row[j]; if (v < 0.0f) v = -v;
+                if (v > absmax) absmax = v;
+            }
+            float scale   = (absmax > 0.0f) ? absmax / 127.0f : 1.0f;
+            float inv_sc  = 1.0f / scale;
+            sc[g] = scale;
+
+            for (int j = gstart; j < gend; j++) {
+                float qv = row[j] * inv_sc;
+                if (qv >  127.0f) qv =  127.0f;
+                if (qv < -127.0f) qv = -127.0f;
+                dst[j] = (int8_t)(qv >= 0.0f ? qv + 0.5f : qv - 0.5f);
+            }
+        }
+    }
+    return q;
+}
+
+Tensor* qweight_dequantize(const QuantizedWeight* q) {
+    if (!q) { tensor_set_error("qweight_dequantize: NULL"); return NULL; }
+    int shape[2] = { q->rows, q->cols };
+    Tensor* out = tensor_create(2, shape);
+    if (!out) return NULL;
+
+    float* dst = F32(out);
+
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < q->rows; i++) {
+        const int8_t* src = q->data   + (size_t)i * q->cols;
+        const float*  sc  = q->scales + (size_t)i * q->num_groups;
+        float*        row = dst       + (size_t)i * q->cols;
+        for (int j = 0; j < q->cols; j++)
+            row[j] = (float)src[j] * sc[j / q->group_size];
+    }
+    return out;
+}
+
+/* AVX2 fused int8→fp32 dot: dot(X[cols], W_int8[cols]) where W is one group. */
+static inline float qw_dot_group(
+    const int8_t* __restrict wi, const float* __restrict xi, int n)
+{
+    float sum = 0.0f;
+    int j = 0;
+#ifdef __AVX2__
+    __m256 vacc = _mm256_setzero_ps();
+    for (; j <= n - 8; j += 8) {
+        __m128i vi8  = _mm_loadl_epi64((const __m128i*)(wi + j));
+        __m256i vi32 = _mm256_cvtepi8_epi32(vi8);
+        __m256  vw   = _mm256_cvtepi32_ps(vi32);
+        __m256  vx   = _mm256_loadu_ps(xi + j);
+        vacc = _mm256_fmadd_ps(vw, vx, vacc);
+    }
+    sum = _hsum256(vacc);
+#endif
+    for (; j < n; j++) sum += (float)wi[j] * xi[j];
+    return sum;
+}
+
+Tensor* qweight_linear(const Tensor* X, const QuantizedWeight* q, const Tensor* bias) {
+    if (!X || !q) { tensor_set_error("qweight_linear: NULL"); return NULL; }
+    if (!tensor_is_contiguous(X)) { tensor_set_error("qweight_linear: X must be contiguous"); return NULL; }
+
+    int batch = (X->ndim == 1) ? 1 : X->shape[0];
+    int cols  = (X->ndim == 1) ? X->shape[0] : X->shape[1];
+    if (cols != q->cols) {
+        tensor_set_error("qweight_linear: X cols != weight cols"); return NULL;
+    }
+
+    int out_shape[2] = { batch, q->rows };
+    Tensor* out = tensor_create(2, out_shape);
+    if (!out) return NULL;
+
+    const float* bd = bias ? F32(bias) : NULL;
+    const float* xd = F32(X);
+    float*       od = F32(out);
+
+    /* For each batch row b and output row i, compute dot(X[b,:], W_int8[i,:])
+     * by iterating over groups and applying the group scale after each group dot.
+     * OpenMP parallel over output rows (i). */
+    for (int b = 0; b < batch; b++) {
+        const float* xb = xd + (size_t)b * q->cols;
+        float*       ob = od + (size_t)b * q->rows;
+
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < q->rows; i++) {
+            const int8_t* wi = q->data   + (size_t)i * q->cols;
+            const float*  si = q->scales + (size_t)i * q->num_groups;
+            float acc = 0.0f;
+
+            for (int g = 0; g < q->num_groups; g++) {
+                int gstart = g * q->group_size;
+                int glen   = q->group_size;
+                if (gstart + glen > q->cols) glen = q->cols - gstart;
+                acc += qw_dot_group(wi + gstart, xb + gstart, glen) * si[g];
+            }
+            ob[i] = bd ? acc + bd[i] : acc;
+        }
+    }
+    return out;
+}
+
+size_t qweight_memory(const QuantizedWeight* q) {
+    if (!q) return 0;
+    return (size_t)q->rows * q->cols                        /* INT8 data   */
+         + (size_t)q->rows * q->num_groups * sizeof(float); /* scales      */
+}
+
+void qweight_free(QuantizedWeight* q) {
+    if (!q) return;
+    free(q->data);
+    free(q->scales);
+    free(q);
+}
+
+// ============================================================================
+// MULTI-HEAD KV CACHE (mkvca_*)
+// ============================================================================
+
+/* Milakov online-softmax attention for a single Q row vs. the interleaved KV
+ * cache.  Extracted so mkvca_attend can parallelize over heads without
+ * allocating fake Tensor structs.
+ *
+ * q_row:   [hd] contiguous query vector
+ * kv_data: [len][2*hd] interleaved key/value cache data (64-byte aligned)
+ * o_row:   [hd] pre-allocated output — overwritten
+ */
+static void attn_kv_one_row(
+    float* __restrict       o_row,
+    const float* __restrict q_row,
+    const float* __restrict kv_data,
+    int len, int hd, float scale)
+{
+    if (len == 0) { memset(o_row, 0, (size_t)hd * sizeof(float)); return; }
+
+    const int stride = 2 * hd;
+    const float* kv0 = kv_data;
+
+    float s0 = dot_f32(q_row, kv0, hd) * scale;
+    float m = s0, denom = 1.0f;
+    memcpy(o_row, kv0 + hd, (size_t)hd * sizeof(float));
+
+    for (int j = 1; j < len; j++) {
+        const float* __restrict kvj = kv_data + (size_t)j * stride;
+        __builtin_prefetch(kvj + stride,      0, 1);
+        __builtin_prefetch(kvj + stride + 32, 0, 1);
+
+        float s     = dot_f32(q_row, kvj, hd) * scale;
+        float m_new = s > m ? s : m;
+        float alpha = fast_expf(m - m_new);
+        float beta  = fast_expf(s - m_new);
+
+        const float* __restrict vj = kvj + hd;
+        int d = 0;
+#ifdef __AVX512F__
+        { __m512 va = _mm512_set1_ps(alpha); __m512 vb = _mm512_set1_ps(beta);
+          for (; d <= hd - 16; d += 16)
+              _mm512_storeu_ps(o_row + d,
+                  _mm512_fmadd_ps(va, _mm512_loadu_ps(o_row + d),
+                                      _mm512_mul_ps(vb, _mm512_loadu_ps(vj + d)))); }
+#elif defined(__AVX2__)
+        { __m256 va = _mm256_set1_ps(alpha); __m256 vb = _mm256_set1_ps(beta);
+          for (; d <= hd - 8; d += 8)
+              _mm256_storeu_ps(o_row + d,
+                  _mm256_fmadd_ps(va, _mm256_loadu_ps(o_row + d),
+                                      _mm256_mul_ps(vb, _mm256_loadu_ps(vj + d)))); }
+#endif
+        for (; d < hd; d++) o_row[d] = o_row[d] * alpha + beta * vj[d];
+        denom = denom * alpha + beta;
+        m     = m_new;
+    }
+
+    float inv_d = 1.0f / denom;
+    int d = 0;
+#ifdef __AVX512F__
+    { __m512 vi = _mm512_set1_ps(inv_d);
+      for (; d <= hd - 16; d += 16)
+          _mm512_storeu_ps(o_row + d, _mm512_mul_ps(_mm512_loadu_ps(o_row + d), vi)); }
+#elif defined(__AVX2__)
+    { __m256 vi = _mm256_set1_ps(inv_d);
+      for (; d <= hd - 8; d += 8)
+          _mm256_storeu_ps(o_row + d, _mm256_mul_ps(_mm256_loadu_ps(o_row + d), vi)); }
+#endif
+    for (; d < hd; d++) o_row[d] *= inv_d;
+}
+
+MultiKVCache* mkvca_create(int nLayers, int nHeads, int maxSeqLen, int headDim) {
+    if (nLayers <= 0 || nHeads <= 0 || maxSeqLen <= 0 || headDim <= 0) {
+        tensor_set_error("mkvca_create: all dimensions must be > 0"); return NULL;
+    }
+    MultiKVCache* c = (MultiKVCache*)safe_malloc(sizeof(MultiKVCache));
+    if (!c) return NULL;
+    int total = nLayers * nHeads;
+    c->caches = (KVCache**)safe_malloc((size_t)total * sizeof(KVCache*));
+    if (!c->caches) { free(c); return NULL; }
+    for (int i = 0; i < total; i++) {
+        c->caches[i] = kvcache_create(maxSeqLen, headDim);
+        if (!c->caches[i]) {
+            for (int j = 0; j < i; j++) kvcache_free(c->caches[j]);
+            free(c->caches); free(c); return NULL;
+        }
+    }
+    c->nLayers   = nLayers;
+    c->nHeads    = nHeads;
+    c->maxSeqLen = maxSeqLen;
+    c->headDim   = headDim;
+    return c;
+}
+
+void mkvca_free(MultiKVCache* c) {
+    if (!c) return;
+    int total = c->nLayers * c->nHeads;
+    for (int i = 0; i < total; i++) kvcache_free(c->caches[i]);
+    free(c->caches);
+    free(c);
+}
+
+void mkvca_reset(MultiKVCache* c) {
+    if (!c) return;
+    int total = c->nLayers * c->nHeads;
+    for (int i = 0; i < total; i++) kvcache_reset(c->caches[i]);
+}
+
+/* k, v: [nH, T, hd] contiguous — fills T prompt tokens for the given layer. */
+void mkvca_prefill(MultiKVCache* c, int layer, const Tensor* k, const Tensor* v) {
+    if (!c || !k || !v) { tensor_set_error("mkvca_prefill: NULL pointer"); return; }
+    if (layer < 0 || layer >= c->nLayers) { tensor_set_error("mkvca_prefill: layer out of range"); return; }
+    if (!tensor_is_contiguous(k) || !tensor_is_contiguous(v)) {
+        tensor_set_error("mkvca_prefill: k/v must be contiguous"); return;
+    }
+    int nH = c->nHeads;
+    int hd = c->headDim;
+    int T  = (k->ndim >= 2) ? (int)(k->total_size / (size_t)(nH * hd)) : 1;
+
+    const float* kd = F32(k);
+    const float* vd = F32(v);
+
+    for (int h = 0; h < nH; h++) {
+        KVCache* kvc = c->caches[layer * nH + h];
+        if (kvc->len + T > kvc->cap) {
+            tensor_set_error("mkvca_prefill: cache capacity exceeded"); return;
+        }
+        const float* ks  = kd + (size_t)h * T * hd;
+        const float* vs  = vd + (size_t)h * T * hd;
+        float*       dst = kvc->data + (size_t)kvc->len * 2 * hd;
+        for (int t = 0; t < T; t++) {
+            memcpy(dst,      ks + (size_t)t * hd, (size_t)hd * sizeof(float));
+            memcpy(dst + hd, vs + (size_t)t * hd, (size_t)hd * sizeof(float));
+            dst += 2 * hd;
+        }
+        kvc->len += T;
+    }
+}
+
+/* k, v: [nH, hd] contiguous — appends one decode-step token for the given layer. */
+void mkvca_append(MultiKVCache* c, int layer, const Tensor* k, const Tensor* v) {
+    if (!c || !k || !v) { tensor_set_error("mkvca_append: NULL pointer"); return; }
+    if (layer < 0 || layer >= c->nLayers) { tensor_set_error("mkvca_append: layer out of range"); return; }
+    if (!tensor_is_contiguous(k) || !tensor_is_contiguous(v)) {
+        tensor_set_error("mkvca_append: k/v must be contiguous"); return;
+    }
+    int nH = c->nHeads;
+    int hd = c->headDim;
+    const float* kd = F32(k);
+    const float* vd = F32(v);
+
+    for (int h = 0; h < nH; h++) {
+        KVCache* kvc = c->caches[layer * nH + h];
+        if (kvc->len >= kvc->cap) {
+            tensor_set_error("mkvca_append: cache capacity exceeded"); return;
+        }
+        float* dst = kvc->data + (size_t)kvc->len * 2 * hd;
+        memcpy(dst,      kd + (size_t)h * hd, (size_t)hd * sizeof(float));
+        memcpy(dst + hd, vd + (size_t)h * hd, (size_t)hd * sizeof(float));
+        kvc->len++;
+    }
+}
+
+/* q: [nH, 1, hd] — returns new Tensor [nH, 1, hd]; OpenMP parallel over heads. */
+Tensor* mkvca_attend(MultiKVCache* c, int layer, const Tensor* q) {
+    if (!c || !q) { tensor_set_error("mkvca_attend: NULL pointer"); return NULL; }
+    if (layer < 0 || layer >= c->nLayers) { tensor_set_error("mkvca_attend: layer out of range"); return NULL; }
+    if (!tensor_is_contiguous(q)) { tensor_set_error("mkvca_attend: q must be contiguous"); return NULL; }
+
+    int nH   = c->nHeads;
+    int hd   = c->headDim;
+    int seq_q = (q->ndim >= 3) ? q->shape[1] : 1;
+    float scale = 1.0f / sqrtf((float)hd);
+
+    int out_shape[3] = { nH, seq_q, hd };
+    Tensor* out = tensor_create_dtype(3, out_shape, DTYPE_FLOAT32);
+    if (!out) return NULL;
+
+    const float* qd = F32(q);
+    float*       od = F32(out);
+
+#pragma omp parallel for schedule(static)
+    for (int h = 0; h < nH; h++) {
+        const KVCache* kvc = c->caches[layer * nH + h];
+        const float*   qh  = qd + (size_t)h * seq_q * hd;
+        float*         oh  = od + (size_t)h * seq_q * hd;
+        for (int qi = 0; qi < seq_q; qi++) {
+            attn_kv_one_row(oh + (size_t)qi * hd,
+                            qh + (size_t)qi * hd,
+                            kvc->data, kvc->len, hd, scale);
+        }
+    }
+    return out;
+}
+
 void tensor_copy_from(Tensor* dest, Tensor* src) {
     if (dest->total_size != src->total_size || dest->total_size == 0) return;
 
@@ -8455,4 +8810,548 @@ void tensor_causal_attention_backward(Tensor* dOut, Tensor* attn,
         free(dA);
         free(dS);
     }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * §29.5: VISION MODEL HELPERS
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* Create an OWNED tensor by copying n floats from an external buffer.
+ * Used to import vision_image_to_tensor() buffers into TensorEngine. */
+Tensor* tensor_from_float_copy(const float* src, int ndim, int* shape) {
+    if (!src || ndim < 1) TENSOR_ERROR("tensor_from_float_copy: invalid args.");
+    Tensor* t = tensor_create(ndim, shape);
+    if (!t) return NULL;
+    memcpy(F32(t), src, t->total_size * sizeof(float));
+    return t;
+}
+
+/* Nearest-neighbor 2D upsampling of [N,C,H,W] by integer scale factors.
+ * output[n,c,h,w] = input[n, c, h/scale_h, w/scale_w]                       */
+Tensor* tensor_upsample_nearest2d(Tensor* X, int scale_h, int scale_w) {
+    if (!X || X->ndim != 4) TENSOR_ERROR("upsample_nearest2d: 4-D tensor required.");
+    if (scale_h < 1 || scale_w < 1) TENSOR_ERROR("upsample_nearest2d: scale >= 1 required.");
+    int N = X->shape[0], C = X->shape[1], H = X->shape[2], W = X->shape[3];
+    int oH = H * scale_h, oW = W * scale_w;
+    Tensor* out = tensor_create_uninitialized(4, (int[]){N, C, oH, oW}, DTYPE_FLOAT32);
+    if (!out) return NULL;
+    float* x = F32(X); float* o = F32(out);
+    #pragma omp parallel for collapse(2) schedule(static) if(N*C > 16)
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < oH; oh++) {
+                int ih = oh / scale_h;
+                const float* src_row = x + ((n*C + c)*H + ih)*W;
+                float* dst_row = o + ((n*C + c)*oH + oh)*oW;
+                for (int ow = 0; ow < oW; ow++) {
+                    dst_row[ow] = src_row[ow / scale_w];
+                }
+            }
+        }
+    }
+    return out;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * §30: MOBILE / VISION-SPECIFIC PRIMITIVES
+ *      Hard-sigmoid, Hard-swish, Depthwise Conv2D
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+static inline float _hard_sigmoid_f(float x) {
+    float v = (x + 3.0f) * (1.0f / 6.0f);
+    return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+}
+static inline float _hard_swish_f(float x) { return x * _hard_sigmoid_f(x); }
+
+Tensor* tensor_hard_sigmoid(Tensor* A) {
+    if (!A || A->dtype != DTYPE_FLOAT32) TENSOR_ERROR("hard_sigmoid: FLOAT32 required.");
+    Tensor* out = tensor_create_uninitialized(A->ndim, A->shape, DTYPE_FLOAT32);
+    float* a = F32(A); float* o = F32(out); size_t n = A->total_size;
+    #pragma omp parallel for simd schedule(static) if(n > 32768)
+    for (size_t i = 0; i < n; i++) o[i] = _hard_sigmoid_f(a[i]);
+    return out;
+}
+
+Tensor* tensor_hard_swish(Tensor* A) {
+    if (!A || A->dtype != DTYPE_FLOAT32) TENSOR_ERROR("hard_swish: FLOAT32 required.");
+    Tensor* out = tensor_create_uninitialized(A->ndim, A->shape, DTYPE_FLOAT32);
+    float* a = F32(A); float* o = F32(out); size_t n = A->total_size;
+    #pragma omp parallel for simd schedule(static) if(n > 32768)
+    for (size_t i = 0; i < n; i++) o[i] = _hard_swish_f(a[i]);
+    return out;
+}
+
+/* hard_sigmoid'(x) = 1/6 if x in (-3,3), else 0 */
+Tensor* tensor_hard_sigmoid_backward(Tensor* dY, Tensor* X) {
+    if (!X || X->dtype != DTYPE_FLOAT32) TENSOR_ERROR("hard_sigmoid_backward: FLOAT32 required.");
+    Tensor* out = tensor_create_uninitialized(X->ndim, X->shape, DTYPE_FLOAT32);
+    float* dy = F32(dY); float* x = F32(X); float* o = F32(out); size_t n = X->total_size;
+    #pragma omp parallel for simd schedule(static) if(n > 32768)
+    for (size_t i = 0; i < n; i++)
+        o[i] = (x[i] > -3.0f && x[i] < 3.0f) ? dy[i] * (1.0f / 6.0f) : 0.0f;
+    return out;
+}
+
+/* hard_swish'(x) = h_sig(x) + x * h_sig'(x) */
+Tensor* tensor_hard_swish_backward(Tensor* dY, Tensor* X) {
+    if (!X || X->dtype != DTYPE_FLOAT32) TENSOR_ERROR("hard_swish_backward: FLOAT32 required.");
+    Tensor* out = tensor_create_uninitialized(X->ndim, X->shape, DTYPE_FLOAT32);
+    float* dy = F32(dY); float* x = F32(X); float* o = F32(out); size_t n = X->total_size;
+    #pragma omp parallel for simd schedule(static) if(n > 32768)
+    for (size_t i = 0; i < n; i++) {
+        float xi = x[i];
+        float hs  = _hard_sigmoid_f(xi);
+        float hsg = (xi > -3.0f && xi < 3.0f) ? (1.0f / 6.0f) : 0.0f;
+        o[i] = dy[i] * (hs + xi * hsg);
+    }
+    return out;
+}
+
+/* ── Depthwise Conv2D ───────────────────────────────────────────────────────
+ *  X    : [N, C, H, W]
+ *  W    : [C, 1, kH, kW]   (one kernel per input channel)
+ *  bias : [C] or NULL
+ *  Out  : [N, C, oH, oW]
+ * ─────────────────────────────────────────────────────────────────────────── */
+Tensor* tensor_depthwise_conv2d(Tensor* X, Tensor* W, Tensor* bias,
+                                 int sh, int sw, int ph, int pw) {
+    if (!X || !W || X->ndim != 4 || W->ndim != 4)
+        TENSOR_ERROR("depthwise_conv2d: 4-D FLOAT32 tensors required.");
+    int N = X->shape[0], C = X->shape[1], H = X->shape[2], IW = X->shape[3];
+    if (W->shape[0] != C || W->shape[1] != 1)
+        TENSOR_ERROR("depthwise_conv2d: W must be [C,1,kH,kW].");
+    int kH = W->shape[2], kW = W->shape[3];
+    int oH = (H + 2*ph - kH) / sh + 1;
+    int oW = (IW + 2*pw - kW) / sw + 1;
+    Tensor* out = tensor_create_uninitialized(4, (int[]){N, C, oH, oW}, DTYPE_FLOAT32);
+    float* x = F32(X); float* w = F32(W); float* o = F32(out);
+    float* b = bias ? F32(bias) : NULL;
+    #pragma omp parallel for collapse(3) schedule(static)
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < oH; oh++) {
+                for (int ow = 0; ow < oW; ow++) {
+                    float sum = b ? b[c] : 0.0f;
+                    for (int kh = 0; kh < kH; kh++) {
+                        int ih = oh*sh - ph + kh;
+                        if (ih < 0 || ih >= H) continue;
+                        for (int kw2 = 0; kw2 < kW; kw2++) {
+                            int iw = ow*sw - pw + kw2;
+                            if (iw < 0 || iw >= IW) continue;
+                            sum += x[((n*C + c)*H + ih)*IW + iw]
+                                 * w[(c*kH + kh)*kW + kw2];
+                        }
+                    }
+                    o[((n*C + c)*oH + oh)*oW + ow] = sum;
+                }
+            }
+        }
+    }
+    return out;
+}
+
+/* Returns [dX, dW, dbias] — caller owns all three */
+Tensor** tensor_depthwise_conv2d_backward(Tensor* dY, Tensor* X, Tensor* W,
+                                           int sh, int sw, int ph, int pw) {
+    if (!dY || !X || !W) TENSOR_ERROR_VAL(NULL, "depthwise_conv2d_backward: NULL args.");
+    int N = X->shape[0], C = X->shape[1], H = X->shape[2], IW = X->shape[3];
+    int kH = W->shape[2], kW = W->shape[3];
+    int oH = dY->shape[2], oW = dY->shape[3];
+    Tensor* dX = tensor_zeros(4, (int[]){N, C, H, IW});
+    Tensor* dW = tensor_zeros(4, (int[]){C, 1, kH, kW});
+    int axes[] = {0, 2, 3};
+    Tensor* db = tensor_sum_multi(dY, axes, 3);   /* [C] */
+    float* xp = F32(X); float* wp = F32(W);
+    float* dyp = F32(dY); float* dxp = F32(dX); float* dwp = F32(dW);
+    for (int n = 0; n < N; n++) {
+        for (int c = 0; c < C; c++) {
+            for (int oh = 0; oh < oH; oh++) {
+                for (int ow = 0; ow < oW; ow++) {
+                    float g = dyp[((n*C + c)*oH + oh)*oW + ow];
+                    for (int kh = 0; kh < kH; kh++) {
+                        int ih = oh*sh - ph + kh;
+                        if (ih < 0 || ih >= H) continue;
+                        for (int kw2 = 0; kw2 < kW; kw2++) {
+                            int iw = ow*sw - pw + kw2;
+                            if (iw < 0 || iw >= IW) continue;
+                            dxp[((n*C + c)*H + ih)*IW + iw] += g * wp[(c*kH + kh)*kW + kw2];
+                            dwp[(c*kH + kh)*kW + kw2]        += g * xp[((n*C + c)*H + ih)*IW + iw];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Tensor** grads = (Tensor**)malloc(3 * sizeof(Tensor*));
+    if (!grads) {
+        tensor_free(dX); tensor_free(dW); tensor_free(db);
+        TENSOR_ERROR_VAL(NULL, "depthwise_conv2d_backward: OOM.");
+    }
+    grads[0] = dX; grads[1] = dW; grads[2] = db;
+    return grads;
+}
+
+// ============================================================================
+// LSTM FORWARD PASS — single FFI boundary crossing (§25)
+// input:  [B, T, D]   W_ih: [D, 4H]   W_hh: [H, 4H]
+// b_ih/b_hh: [4H]     output: [B, T, H]
+// ============================================================================
+Tensor* tensor_lstm_forward(Tensor* input, Tensor* W_ih, Tensor* W_hh,
+                             Tensor* b_ih, Tensor* b_hh)
+{
+    if (!input || !W_ih || !W_hh || !b_ih || !b_hh)
+        TENSOR_ERROR_VAL(NULL, "tensor_lstm_forward: NULL argument.");
+
+    int B  = input->shape[0];
+    int T  = input->shape[1];
+    int D  = input->shape[2];
+    int H4 = W_ih->shape[1];   /* 4 * hidden_size */
+    int H  = H4 / 4;
+
+    float* inp  = (float*)input->data;
+    float* wih  = (float*)W_ih->data;
+    float* whh  = (float*)W_hh->data;
+    float* bih  = (float*)b_ih->data;
+    float* bhh  = (float*)b_hh->data;
+
+    /* Allocate output [B, T, H] */
+    int out_shape[3] = {B, T, H};
+    Tensor* out = tensor_create_uninitialized(3, out_shape, DTYPE_FLOAT32);
+    if (!out) TENSOR_ERROR_VAL(NULL, "tensor_lstm_forward: OOM (output).");
+    float* outp = (float*)out->data;
+
+    /* Per-batch hidden and cell state [B, H] — initialised to zero */
+    float* h = (float*)calloc((size_t)B * H, sizeof(float));
+    float* c = (float*)calloc((size_t)B * H, sizeof(float));
+    /* Gate scratch buffer [B, 4H] */
+    float* g = (float*)malloc((size_t)B * H4 * sizeof(float));
+    if (!h || !c || !g) {
+        free(h); free(c); free(g);
+        tensor_free(out);
+        TENSOR_ERROR_VAL(NULL, "tensor_lstm_forward: OOM (workspace).");
+    }
+
+    for (int t = 0; t < T; t++) {
+        /* x_t pointer: input[*, t, *] → [B, D] row-major */
+        float* xt = inp + (size_t)t * D;   /* stride T*D along batch handled below */
+
+        /* g = x_t @ W_ih   [B, D] x [D, 4H] → [B, 4H]
+         * We must account for the T stride in input: input is [B,T,D],
+         * so x_t for batch b is inp + b*T*D + t*D. */
+        /* Build a strided view using sgemm with lda = T*D */
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    B, H4, D,
+                    1.0f, inp + (size_t)t * D, T * D,   /* lda = T*D (row stride in batch) */
+                    wih, H4,
+                    0.0f, g, H4);
+
+        /* g += h_{t-1} @ W_hh   [B, H] x [H, 4H] → [B, 4H] */
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    B, H4, H,
+                    1.0f, h, H,
+                    whh, H4,
+                    1.0f, g, H4);
+
+        /* Add biases and compute gates element-wise (OpenMP over B*H) */
+        #pragma omp parallel for schedule(static)
+        for (int b = 0; b < B; b++) {
+            float* gb = g + (size_t)b * H4;
+            float* hb = h + (size_t)b * H;
+            float* cb = c + (size_t)b * H;
+            float* ob = outp + ((size_t)b * T + t) * H;
+
+            /* Add biases */
+            for (int j = 0; j < H4; j++) gb[j] += bih[j] + bhh[j];
+
+            /* Compute gates and update cell/hidden */
+            for (int j = 0; j < H; j++) {
+                float ig = 1.0f / (1.0f + expf(-gb[j]));          /* i gate */
+                float fg = 1.0f / (1.0f + expf(-gb[H   + j]));    /* f gate */
+                float gg = tanhf(gb[H*2 + j]);                     /* g gate */
+                float og = 1.0f / (1.0f + expf(-gb[H*3 + j]));    /* o gate */
+
+                cb[j] = fg * cb[j] + ig * gg;
+                hb[j] = og * tanhf(cb[j]);
+                ob[j] = hb[j];
+            }
+        }
+    }
+
+    free(h); free(c); free(g);
+    return out;
+}
+
+// ============================================================================
+// RF BATCH PREDICT — single FFI call for all T trees (§29)
+// nodes_flat: [T * maxNodes] HardwareNode, out: [N, T] pre-allocated
+// ============================================================================
+void tensor_rf_predict_batch(Tensor* X, HardwareNode* nodes_flat,
+                              int T, int maxNodes, Tensor* out)
+{
+    if (!X || !nodes_flat || !out)
+        TENSOR_ERROR_VOID("tensor_rf_predict_batch: NULL argument.");
+    int N = X->shape[0];
+    int D = X->shape[1];
+    float* xp = F32(X);
+    float* op = F32(out);   /* out is [N, T] row-major */
+
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int t = 0; t < T; t++) {
+        for (int i = 0; i < N; i++) {
+            HardwareNode* tree = nodes_flat + (size_t)t * maxNodes;
+            const float* row   = xp + (size_t)i * D;
+            int curr = 0, depth = 0;
+            while (tree[curr].left_idx != -1 && depth < 64) {
+                int fi = tree[curr].feature_idx;
+                if (fi < 0 || fi >= D) break;
+                curr = (row[fi] < tree[curr].threshold)
+                    ? tree[curr].left_idx : tree[curr].right_idx;
+                if (curr < 0) break;
+                depth++;
+            }
+            op[(size_t)i * T + t] = tree[curr].value;
+        }
+    }
+}
+
+// ============================================================================
+// LSTM FORWARD (TRAIN) — writes gate-activation + cell-state caches for BPTT
+// input [B,T,D]  W_ih[D,4H]  W_hh[H,4H]  b_ih/b_hh[4H]
+// cache_acts (caller-allocated [B,T,4H]): activated gate values i,f,g,o
+// cache_cell (caller-allocated [B,T,H]):  cell state c_t per step
+// returns output [B,T,H]
+// ============================================================================
+Tensor* tensor_lstm_forward_train(Tensor* input,  Tensor* W_ih, Tensor* W_hh,
+                                   Tensor* b_ih,   Tensor* b_hh,
+                                   Tensor* cache_acts, Tensor* cache_cell)
+{
+    if (!input || !W_ih || !W_hh || !b_ih || !b_hh || !cache_acts || !cache_cell)
+        TENSOR_ERROR_VAL(NULL, "tensor_lstm_forward_train: NULL argument.");
+
+    int B  = input->shape[0];
+    int T  = input->shape[1];
+    int D  = input->shape[2];
+    int H4 = W_ih->shape[1];
+    int H  = H4 / 4;
+
+    float* inp  = F32(input);
+    float* wih  = F32(W_ih);
+    float* whh  = F32(W_hh);
+    float* bih  = F32(b_ih);
+    float* bhh  = F32(b_hh);
+    float* acts = F32(cache_acts);  /* [B, T, 4H] */
+    float* cell = F32(cache_cell);  /* [B, T, H]  */
+
+    int out_shape[3] = {B, T, H};
+    Tensor* out = tensor_create_uninitialized(3, out_shape, DTYPE_FLOAT32);
+    if (!out) TENSOR_ERROR_VAL(NULL, "tensor_lstm_forward_train: OOM (output).");
+    float* outp = F32(out);
+
+    float* h = (float*)calloc((size_t)B * H, sizeof(float));
+    float* c = (float*)calloc((size_t)B * H, sizeof(float));
+    float* g = (float*)malloc((size_t)B * H4 * sizeof(float));
+    if (!h || !c || !g) {
+        free(h); free(c); free(g); tensor_free(out);
+        TENSOR_ERROR_VAL(NULL, "tensor_lstm_forward_train: OOM (workspace).");
+    }
+
+    for (int t = 0; t < T; t++) {
+        /* g = x_t @ W_ih  [B,D] x [D,4H] → [B,4H] (strided input, lda=T*D) */
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    B, H4, D,
+                    1.0f, inp + (size_t)t * D, T * D,
+                    wih, H4,
+                    0.0f, g, H4);
+
+        /* g += h_{t-1} @ W_hh  [B,H] x [H,4H] → [B,4H] */
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    B, H4, H,
+                    1.0f, h, H,
+                    whh, H4,
+                    1.0f, g, H4);
+
+        #pragma omp parallel for schedule(static)
+        for (int b = 0; b < B; b++) {
+            float* gb   = g    + (size_t)b * H4;
+            float* hb   = h    + (size_t)b * H;
+            float* cb   = c    + (size_t)b * H;
+            float* ob   = outp + ((size_t)b * T + t) * H;
+            float* ab   = acts + ((size_t)b * T + t) * H4;
+            float* cellb = cell + ((size_t)b * T + t) * H;
+
+            for (int j = 0; j < H; j++) {
+                float ig = 1.0f / (1.0f + expf(-(gb[j]        + bih[j]        + bhh[j])));
+                float fg = 1.0f / (1.0f + expf(-(gb[H   + j]  + bih[H   + j]  + bhh[H   + j])));
+                float gg = tanhf(                  gb[H*2 + j]  + bih[H*2 + j]  + bhh[H*2 + j]);
+                float og = 1.0f / (1.0f + expf(-(gb[H*3 + j]  + bih[H*3 + j]  + bhh[H*3 + j])));
+
+                cb[j] = fg * cb[j] + ig * gg;
+                hb[j] = og * tanhf(cb[j]);
+
+                /* write cache */
+                ab[j]        = ig;
+                ab[H   + j]  = fg;
+                ab[H*2 + j]  = gg;
+                ab[H*3 + j]  = og;
+                cellb[j]     = cb[j];
+                ob[j]        = hb[j];
+            }
+        }
+    }
+
+    free(h); free(c); free(g);
+    return out;
+}
+
+// ============================================================================
+// LSTM BPTT BACKWARD — fully fused, single FFI crossing (§25 extension)
+// dY[B,T,H]  input[B,T,D]  output[B,T,H]  W_ih[D,4H]  W_hh[H,4H]
+// cache_acts[B,T,4H]  cache_cell[B,T,H]
+// Returns malloc'd array of 5 Tensor*: [dX, dW_ih, dW_hh, db_ih, db_hh]
+// Caller must free() the array pointer; each Tensor* is pool-managed.
+// db_ih == db_hh (same gradient — both biases receive identical update).
+// ============================================================================
+Tensor** tensor_lstm_backward(Tensor* dY,   Tensor* input,  Tensor* output,
+                               Tensor* W_ih, Tensor* W_hh,
+                               Tensor* cache_acts, Tensor* cache_cell)
+{
+    if (!dY || !input || !output || !W_ih || !W_hh || !cache_acts || !cache_cell)
+        TENSOR_ERROR_VAL(NULL, "tensor_lstm_backward: NULL argument.");
+
+    int B  = dY->shape[0];
+    int T  = dY->shape[1];
+    int H  = dY->shape[2];
+    int D  = input->shape[2];
+    int H4 = W_ih->shape[1];
+
+    float* dy_p   = F32(dY);
+    float* x_p    = F32(input);
+    float* out_p  = F32(output);
+    float* wih_p  = F32(W_ih);
+    float* whh_p  = F32(W_hh);
+    float* acts_p = F32(cache_acts);
+    float* cell_p = F32(cache_cell);
+
+    /* Allocate output gradient tensors (zero-initialised) */
+    int dx_shape[3]   = {B, T, D};
+    int dwih_shape[2] = {D, H4};
+    int dwhh_shape[2] = {H, H4};
+    int db_shape[1]   = {H4};
+
+    Tensor* dX   = tensor_create(3, dx_shape);
+    Tensor* dWih = tensor_create(2, dwih_shape);
+    Tensor* dWhh = tensor_create(2, dwhh_shape);
+    Tensor* db   = tensor_create(1, db_shape);   /* shared gradient for b_ih and b_hh */
+    if (!dX || !dWih || !dWhh || !db) {
+        tensor_free(dX); tensor_free(dWih); tensor_free(dWhh); tensor_free(db);
+        TENSOR_ERROR_VAL(NULL, "tensor_lstm_backward: OOM (output grads).");
+    }
+
+    float* dx_p   = F32(dX);
+    float* dwih_p = F32(dWih);
+    float* dwhh_p = F32(dWhh);
+    float* db_p   = F32(db);
+
+    /* Per-step workspace (not parallelised across t since BPTT is sequential) */
+    float* dh_next = (float*)calloc((size_t)B * H,  sizeof(float));
+    float* dc_next = (float*)calloc((size_t)B * H,  sizeof(float));
+    float* dgates  = (float*)malloc((size_t)B * H4 * sizeof(float));
+    if (!dh_next || !dc_next || !dgates) {
+        free(dh_next); free(dc_next); free(dgates);
+        tensor_free(dX); tensor_free(dWih); tensor_free(dWhh); tensor_free(db);
+        TENSOR_ERROR_VAL(NULL, "tensor_lstm_backward: OOM (workspace).");
+    }
+
+    for (int t = T - 1; t >= 0; t--) {
+
+        /* Compute per-element gate gradients — parallelise over batch */
+        #pragma omp parallel for schedule(static)
+        for (int b = 0; b < B; b++) {
+            float* dy_bt   = dy_p    + ((size_t)b * T + t) * H;
+            float* dhn_b   = dh_next +  (size_t)b * H;
+            float* dcn_b   = dc_next +  (size_t)b * H;
+            float* acts_bt = acts_p  + ((size_t)b * T + t) * H4;
+            float* cell_bt = cell_p  + ((size_t)b * T + t) * H;
+            float* cell_prev = (t > 0) ? (cell_p + ((size_t)b * T + t - 1) * H) : NULL;
+            float* dg_b    = dgates  +  (size_t)b * H4;
+
+            for (int j = 0; j < H; j++) {
+                float ig = acts_bt[j];           /* input gate  (activated) */
+                float fg = acts_bt[H   + j];     /* forget gate */
+                float gg = acts_bt[H*2 + j];     /* cell gate   (tanh-activated) */
+                float og = acts_bt[H*3 + j];     /* output gate */
+                float c  = cell_bt[j];
+                float tc = tanhf(c);
+
+                /* Combined gradient: gradient from this step + recurrent from t+1 */
+                float dh = dy_bt[j] + dhn_b[j];
+                /* cell gradient: from output path + recurrent */
+                float dc = dh * og * (1.0f - tc * tc) + dcn_b[j];
+
+                float c_prev = (cell_prev != NULL) ? cell_prev[j] : 0.0f;
+
+                dg_b[j]       = dc * gg * ig * (1.0f - ig);           /* di */
+                dg_b[H   + j] = dc * c_prev * fg * (1.0f - fg);       /* df */
+                dg_b[H*2 + j] = dc * ig * (1.0f - gg * gg);           /* dg */
+                dg_b[H*3 + j] = dh * tc * og * (1.0f - og);           /* do */
+
+                /* Pass cell gradient to t-1 */
+                dcn_b[j] = dc * fg;
+            }
+        }
+
+        /* dX[:,t,:] += dgates @ W_ih^T  [B,4H] x [4H,D] → [B,D] strided into dX */
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    B, D, H4,
+                    1.0f, dgates, H4,
+                    wih_p, H4,
+                    1.0f, dx_p + (size_t)t * D, T * D);   /* ldc=T*D = batch stride */
+
+        /* dW_ih += X[:,t,:]^T @ dgates  [D,B] x [B,4H] → [D,4H] */
+        cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                    D, H4, B,
+                    1.0f, x_p + (size_t)t * D, T * D,     /* lda=T*D */
+                    dgates, H4,
+                    1.0f, dwih_p, H4);
+
+        /* dW_hh += h_{t-1}^T @ dgates  [H,B] x [B,4H] → [H,4H] */
+        if (t > 0) {
+            cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                        H, H4, B,
+                        1.0f, out_p + (size_t)(t - 1) * H, T * H,  /* lda=T*H */
+                        dgates, H4,
+                        1.0f, dwhh_p, H4);
+        }
+
+        /* db += sum(dgates, axis=0)  [4H] — serial sum (small H4) */
+        for (int b = 0; b < B; b++) {
+            float* dg_b = dgates + (size_t)b * H4;
+            for (int j = 0; j < H4; j++) db_p[j] += dg_b[j];
+        }
+
+        /* dh_next = dgates @ W_hh^T  [B,4H] x [4H,H] → [B,H] */
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    B, H, H4,
+                    1.0f, dgates, H4,
+                    whh_p, H4,
+                    0.0f, dh_next, H);
+    }
+
+    free(dh_next); free(dc_next); free(dgates);
+
+    /* db_ih == db_hh: both biases receive the same gradient */
+    Tensor* db2 = tensor_copy(db);
+    if (!db2) {
+        tensor_free(dX); tensor_free(dWih); tensor_free(dWhh); tensor_free(db);
+        TENSOR_ERROR_VAL(NULL, "tensor_lstm_backward: OOM (db copy).");
+    }
+
+    Tensor** ret = (Tensor**)malloc(5 * sizeof(Tensor*));
+    if (!ret) {
+        tensor_free(dX); tensor_free(dWih); tensor_free(dWhh);
+        tensor_free(db); tensor_free(db2);
+        TENSOR_ERROR_VAL(NULL, "tensor_lstm_backward: OOM (ret array).");
+    }
+    ret[0] = dX; ret[1] = dWih; ret[2] = dWhh; ret[3] = db; ret[4] = db2;
+    return ret;
 }

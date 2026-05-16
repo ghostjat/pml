@@ -13,14 +13,33 @@ final class TensorEngine {
     public static function get(): \FFI {
         if (self::$ffi === null) {
             $libPath = __DIR__ . '/libtensor.so';
+
+            // §38 — auto-repair missing symlink (libtensor.so → libtensor.so.7)
+            if (!file_exists($libPath) && file_exists($libPath . '.7')) {
+                symlink($libPath . '.7', $libPath);
+            }
+
             if (!file_exists($libPath)) {
-                echo "[Compiler] Building C-Core with OpenBLAS, LAPACKE, and AVX2...\n";
-                // Glob relative to __DIR__ — process CWD is unreliable under php-fpm.
-                $cFiles = implode(' ', array_map('escapeshellarg', glob(__DIR__ . '/*.c')));
+                // §7 — never auto-compile in production
+                if (getenv('PML_ENV') === 'production') {
+                    throw new \RuntimeException(
+                        '[TensorEngine] libtensor.so not found. Pre-build it before deploying.'
+                    );
+                }
+                echo "[Compiler] Building libtensor.so with OpenBLAS, LAPACKE, and AVX2...\n";
+                // §7 — exclude quant.c (belongs in libquant.so, not libtensor.so)
+                $srcFiles = array_filter(
+                    glob(__DIR__ . '/*.c') ?: [],
+                    static fn(string $f): bool => !str_ends_with($f, '/quant.c')
+                );
+                if (empty($srcFiles)) {
+                    throw new \RuntimeException('[TensorEngine] No C source files found in ' . __DIR__);
+                }
+                $cFiles = implode(' ', array_map('escapeshellarg', $srcFiles));
                 $result = shell_exec(
                     "gcc -O3 -march=native -mtune=native -mfma -fno-math-errno -funsafe-math-optimizations -fopenmp -funroll-loops -flto -fomit-frame-pointer -D_GNU_SOURCE -shared -fPIC -o "
-                    . escapeshellarg($libPath) . " " . $cFiles
-                    . " -lopenblas -llapacke -lm 2>&1"
+                    . escapeshellarg($libPath) . ' ' . $cFiles
+                    . ' -lopenblas -llapacke -lm 2>&1'
                 );
                 if (!file_exists($libPath)) {
                     throw new \RuntimeException("[Compiler] Build failed:\n" . (string)$result);
@@ -213,6 +232,20 @@ final class TensorEngine {
                 TensorC* tensor_conv2d(TensorC* X, TensorC* W, TensorC* bias, int stride_h, int stride_w, int pad_h, int pad_w);
                 TensorC** tensor_conv2d_backward(TensorC* dY, TensorC* X, TensorC* W, int stride_h, int stride_w, int pad_h, int pad_w);
 
+                // Vision model helpers
+                TensorC* tensor_from_float_copy(const float* src, int ndim, int* shape);
+                TensorC* tensor_upsample_nearest2d(TensorC* X, int scale_h, int scale_w);
+
+                // Depthwise Conv2D — W shape [C,1,kH,kW]
+                TensorC* tensor_depthwise_conv2d(TensorC* X, TensorC* W, TensorC* bias, int sh, int sw, int ph, int pw);
+                TensorC** tensor_depthwise_conv2d_backward(TensorC* dY, TensorC* X, TensorC* W, int sh, int sw, int ph, int pw);
+
+                // Hard-sigmoid: clamp(x+3,0,6)/6   Hard-swish: x * hard_sigmoid(x)
+                TensorC* tensor_hard_sigmoid(TensorC* A);
+                TensorC* tensor_hard_swish(TensorC* A);
+                TensorC* tensor_hard_sigmoid_backward(TensorC* dY, TensorC* X);
+                TensorC* tensor_hard_swish_backward(TensorC* dY, TensorC* X);
+
                 TensorC* tensor_embedding_lookup(TensorC* tokens, TensorC* weights);
                 TensorC** tensor_dataset_from_csv(const char* filepath, int label_col, int has_header);
 
@@ -254,6 +287,36 @@ final class TensorEngine {
                 int      kvcache_len(KVCache* cache);
                 void     kvcache_append(KVCache* cache, TensorC* k, TensorC* v);
                 void     tensor_attention_kv(TensorC* out, TensorC* q, KVCache* cache);
+
+                typedef struct {
+                    void*  caches;
+                    int    nLayers;
+                    int    nHeads;
+                    int    maxSeqLen;
+                    int    headDim;
+                } MultiKVCache;
+
+                MultiKVCache* mkvca_create (int nLayers, int nHeads, int maxSeqLen, int headDim);
+                void          mkvca_free   (MultiKVCache* c);
+                void          mkvca_reset  (MultiKVCache* c);
+                void          mkvca_prefill(MultiKVCache* c, int layer, TensorC* k, TensorC* v);
+                void          mkvca_append (MultiKVCache* c, int layer, TensorC* k, TensorC* v);
+                TensorC*      mkvca_attend (MultiKVCache* c, int layer, TensorC* q);
+
+                typedef struct {
+                    int8_t  *data;
+                    float   *scales;
+                    int      rows;
+                    int      cols;
+                    int      group_size;
+                    int      num_groups;
+                } QuantizedWeight;
+
+                QuantizedWeight* qweight_quantize  (TensorC* w, int group_size);
+                TensorC*         qweight_dequantize(QuantizedWeight* q);
+                TensorC*         qweight_linear    (TensorC* X, QuantizedWeight* q, TensorC* bias);
+                uint64_t         qweight_memory    (QuantizedWeight* q);
+                void             qweight_free      (QuantizedWeight* q);
 
                 typedef struct {
                     int feature_idx;
@@ -317,6 +380,24 @@ final class TensorEngine {
                 void tensor_causal_attention_backward(TensorC* dOut, TensorC* attn,
                                                        TensorC* Q, TensorC* K, TensorC* V,
                                                        TensorC* dQ, TensorC* dK, TensorC* dV);
+
+                /* LSTM inference — single FFI call (§25) */
+                TensorC* tensor_lstm_forward(TensorC* input, TensorC* W_ih, TensorC* W_hh,
+                                             TensorC* b_ih, TensorC* b_hh);
+
+                /* LSTM train forward — writes gate+cell caches for BPTT */
+                TensorC* tensor_lstm_forward_train(TensorC* input, TensorC* W_ih, TensorC* W_hh,
+                                                   TensorC* b_ih,  TensorC* b_hh,
+                                                   TensorC* cache_acts, TensorC* cache_cell);
+
+                /* LSTM BPTT backward — returns [dX, dW_ih, dW_hh, db_ih, db_hh] */
+                TensorC** tensor_lstm_backward(TensorC* dY,   TensorC* input,  TensorC* output,
+                                               TensorC* W_ih, TensorC* W_hh,
+                                               TensorC* cache_acts, TensorC* cache_cell);
+
+                /* RF batch predict — single C call for all T trees (§29) */
+                void tensor_rf_predict_batch(TensorC* X, HardwareNode* nodes_flat,
+                                             int T, int maxNodes, TensorC* out);
 
                 // ---------------------------------------------------------------
                 // Columnar DataFrame + ETL  (src/Lib/dataset_io.c)
@@ -625,6 +706,40 @@ final class TensorEngine {
                                             ModelConfig* cfg);
                 TensorC*  inf_get_weight(const InferenceSession* sess,
                                           const char* name);
+
+                // ── §4/5/6: Autograd engine (graph.c + autograd.c) ───────────
+                // These share TensorC* with all other kernels — one FFI universe.
+
+                typedef struct OpNode OpNode;
+
+                typedef struct {
+                    TensorC* data;
+                    TensorC* grad;
+                    int      op_idx;
+                    bool     requires_grad;
+                    bool     data_owned;
+                } VarNode;
+
+                typedef struct {
+                    OpNode*  ops;
+                    VarNode* vars;
+                    int      n_ops;
+                    int      ops_cap;
+                    int      n_vars;
+                    int      vars_cap;
+                } Tape;
+
+                Tape*    tape_create(int ops_cap, int vars_cap);
+                void     tape_reset(Tape* t);
+                void     tape_destroy(Tape* t);
+                void     tape_clear_grads(Tape* t);
+                void     tape_backward(Tape* t, VarNode* root);
+
+                VarNode* ag_var(Tape* tape, TensorC* data, bool requires_grad);
+                VarNode* ag_add(Tape* tape, VarNode* a, VarNode* b);
+                VarNode* ag_mul(Tape* tape, VarNode* a, VarNode* b);
+                VarNode* ag_matmul(Tape* tape, VarNode* a, VarNode* b);
+                VarNode* ag_relu(Tape* tape, VarNode* a);
             ", $libPath);
         }
         return self::$ffi;

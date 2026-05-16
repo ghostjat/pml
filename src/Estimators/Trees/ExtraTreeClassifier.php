@@ -6,6 +6,7 @@ namespace Pml\Estimators\Trees;
 
 use Pml\Interfaces\Learner;
 use Pml\Interfaces\Persistable;
+use Pml\Interfaces\RanksFeatures;
 use Pml\Tensor;
 use Pml\Dataset;
 use RuntimeException;
@@ -16,7 +17,7 @@ use RuntimeException;
  * - Skips exhaustive threshold searching. Evaluates exactly ONE random threshold per feature.
  * - Builds tree topologies exponentially faster than standard CART algorithms.
  */
-final class ExtraTreeClassifier implements Learner, Persistable
+final class ExtraTreeClassifier implements Learner, Persistable, RanksFeatures
 {
     private int $maxDepth;
     private int $minSamplesSplit;
@@ -32,7 +33,7 @@ final class ExtraTreeClassifier implements Learner, Persistable
         $this->maxFeatures = $maxFeatures;
     }
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         $x = $dataset->samples();
         $y = $dataset->labels();
@@ -184,6 +185,39 @@ final class ExtraTreeClassifier implements Learner, Persistable
     public function trained(): bool
     {
         return $this->tree !== null;
+    }
+
+    private static function countSplits(array $node, array &$counts): void
+    {
+        if (!isset($node['feature'])) return;
+        $counts[$node['feature']] = ($counts[$node['feature']] ?? 0) + 1;
+        self::countSplits($node['left'],  $counts);
+        self::countSplits($node['right'], $counts);
+    }
+
+    public function featureSplitCounts(): array
+    {
+        if ($this->tree === null) {
+            throw new RuntimeException("ExtraTreeClassifier is not trained.");
+        }
+        $counts = [];
+        self::countSplits($this->tree, $counts);
+        return $counts;
+    }
+
+    public function featureImportances(): Tensor
+    {
+        $raw   = $this->featureSplitCounts();
+        $vals  = array_fill(0, $this->nFeatures, 0.0);
+        $total = 0.0;
+        foreach ($raw as $f => $c) {
+            $vals[$f]  = (float) $c;
+            $total    += $c;
+        }
+        if ($total > 0.0) {
+            foreach ($vals as &$v) { $v /= $total; }
+        }
+        return Tensor::fromArray($vals);
     }
 
     public function exportPhpTree(): array

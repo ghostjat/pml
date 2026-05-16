@@ -11,12 +11,11 @@ use Pml\Serializers\Native;
 use RuntimeException;
 
 /**
- * Persistent Model — wraps any Learner with automatic save/load via a Persister.
- * Delegates all train/predict calls to the wrapped estimator.
+ * @deprecated Use ModelStore::save() + SafeTensorsIO instead (zero PHP serialize()).
  *
- * JIT & Memory Optimized:
- * - The wrapped estimator is accessed via a direct property reference — no proxy overhead.
- * - Save/load crosses the FFI boundary exactly once per Tensor parameter (via serialize).
+ * PersistentModel wraps a Learner with a Persister + Serializer. The Native
+ * and GzipNative serializers use PHP serialize() which cannot safely round-trip
+ * FFI\CData / Tensor values. This class will be removed in the next major version.
  */
 final class PersistentModel implements Learner
 {

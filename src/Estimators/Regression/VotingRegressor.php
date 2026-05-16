@@ -31,7 +31,7 @@ final class VotingRegressor implements Learner, Persistable
         $this->estimators = $estimators;
     }
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         foreach ($this->estimators as $estimator) {
             $estimator->train($dataset);

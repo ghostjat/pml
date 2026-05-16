@@ -28,7 +28,7 @@ final class KDNeighborsClassifier implements Learner, Persistable
         private readonly string $distance = 'euclidean'
     ) {}
 
-    public function train(Dataset $dataset): void
+    public function train(Dataset $dataset, mixed ...$options): void
     {
         if ($dataset->labels() === null) {
             throw new \InvalidArgumentException("KDNeighborsClassifier requires labeled data.");

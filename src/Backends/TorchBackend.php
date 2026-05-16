@@ -53,9 +53,9 @@ final class TorchBackend implements MLBackend
         $this->model->save($path);
     }
 
-    public static function load(string $path): static
+    public static function load(string $path): self
     {
-        return new static(Sequential::load($path));
+        return new self(Sequential::load($path));
     }
 
     public function backendName(): string { return 'torch'; }

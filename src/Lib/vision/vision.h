@@ -79,6 +79,14 @@ typedef enum {
     VISION_COLOR_LAB  = 5,
 } VisionColorSpace;
 
+/* Short aliases used in .c implementations */
+#define VISION_CS_RGB  VISION_COLOR_RGB
+#define VISION_CS_BGR  VISION_COLOR_BGR
+#define VISION_CS_GRAY VISION_COLOR_GRAY
+#define VISION_CS_RGBA VISION_COLOR_RGBA
+#define VISION_CS_HSV  VISION_COLOR_HSV
+#define VISION_CS_LAB  VISION_COLOR_LAB
+
 /* ═══════════════════════════════════════════════════════════════════════
  * 2.  CORE DATA STRUCTURES
  * ═══════════════════════════════════════════════════════════════════════ */
@@ -263,23 +271,23 @@ VisionImage* vision_chw_to_hwc(const VisionImage* src);
 /* ═══════════════════════════════════════════════════════════════════════
  * 8.  RESIZE & SPATIAL TRANSFORMS
  * ═══════════════════════════════════════════════════════════════════════ */
-VisionImage* vision_resize(const VisionImage* src, int dst_w, int dst_h, int interp);
-VisionImage* vision_resize_long_edge(const VisionImage* src, int long_edge, int interp);
+VisionImage* vision_resize(const VisionImage* src, int dst_w, int dst_h, VisionInterp interp);
+VisionImage* vision_resize_long_edge(const VisionImage* src, int long_edge, VisionInterp interp);
 VisionImage* vision_center_crop(const VisionImage* src, int crop_w, int crop_h);
 VisionImage* vision_crop(const VisionImage* src, int x, int y, int w, int h);
 VisionImage* vision_pad(const VisionImage* src, int top, int bottom,
-                         int left, int right, int border, float constant_value);
+                         int left, int right, VisionBorderMode border, float fill_value);
 VisionImage* vision_flip_horizontal(const VisionImage* src);
 VisionImage* vision_flip_vertical(const VisionImage* src);
 VisionImage* vision_rotate90(const VisionImage* src, int times);
 VisionImage* vision_rotate(const VisionImage* src, float angle_deg,
-                            int interp, int border, float constant_value);
+                            VisionInterp interp, VisionBorderMode border, float fill_value);
 VisionImage* vision_affine(const VisionImage* src, const float* M6,
-                            int dst_w, int dst_h, int interp,
-                            int border, float constant_value);
+                            int dst_w, int dst_h, VisionInterp interp,
+                            VisionBorderMode border, float fill_value);
 VisionImage* vision_perspective(const VisionImage* src,
                                  const float* src_pts8, const float* dst_pts8,
-                                 int dst_w, int dst_h, int interp);
+                                 int dst_w, int dst_h, VisionInterp interp);
 
 /* ═══════════════════════════════════════════════════════════════════════
  * 9.  COLOR OPERATIONS
@@ -311,7 +319,7 @@ VisionImage* vision_laplacian(const VisionImage* src);
 VisionImage* vision_canny(const VisionImage* src, float low_thresh, float high_thresh,
                            int gaussian_radius, float gaussian_sigma);
 VisionImage* vision_convolve2d(const VisionImage* src, const VisionKernel* kernel,
-                                int border);
+                                VisionBorderMode border);
 
 /* ═══════════════════════════════════════════════════════════════════════
  * 11. MORPHOLOGY
@@ -326,45 +334,50 @@ VisionImage* vision_morph_gradient(const VisionImage* src, int radius);
  * 12. FEATURE EXTRACTION
  * ═══════════════════════════════════════════════════════════════════════ */
 HOGResult*    vision_hog(const VisionImage* src, int cell_size, int block_size,
-                          int n_bins, int signed_grad);
+                          int nbins, int* out_len);
 void          vision_hog_free(HOGResult* r);
 LBPResult*    vision_lbp(const VisionImage* src, int radius,
-                          int grid_x, int grid_y);
+                          int grid_x, int grid_y, int* out_len);
 void          vision_lbp_free(LBPResult* r);
-VisionImage*  vision_integral_image(const VisionImage* src);
-VisionCorners* vision_harris_corners(const VisionImage* src, int block_size,
-                                      int ksize, float k, float threshold);
+void          vision_integral_image(const VisionImage* src, double* integral);
+VisionCorners* vision_harris_corners(const VisionImage* src,
+                                      float k, float threshold,
+                                      int nms_radius, int* out_count);
 VisionCorners* vision_fast_corners(const VisionImage* src, int threshold,
-                                    int nonmax_suppression);
+                                    int n_consecutive, int* out_count);
 void           vision_corners_free(VisionCorners* c);
 
 /* ═══════════════════════════════════════════════════════════════════════
  * 13. DATA AUGMENTATION
  * ═══════════════════════════════════════════════════════════════════════ */
 void         vision_rng_init(VisionRNG* rng, uint64_t seed);
+uint32_t     vision_rng_next(VisionRNG* rng);
 VisionImage* vision_random_crop(const VisionImage* src, int crop_w, int crop_h,
                                  VisionRNG* rng);
 VisionImage* vision_random_resize_crop(const VisionImage* src,
                                         int out_w, int out_h,
                                         float scale_lo, float scale_hi,
                                         float ratio_lo, float ratio_hi,
-                                        VisionRNG* rng, int interp);
-VisionImage* vision_random_flip_h(const VisionImage* src, float prob, VisionRNG* rng);
-VisionImage* vision_random_flip_v(const VisionImage* src, float prob, VisionRNG* rng);
+                                        VisionRNG* rng, VisionInterp interp);
+VisionImage* vision_random_flip_horizontal(const VisionImage* src, float prob,
+                                            VisionRNG* rng);
+VisionImage* vision_random_flip_vertical(const VisionImage* src, float prob,
+                                          VisionRNG* rng);
 VisionImage* vision_random_brightness(const VisionImage* src, float max_delta,
                                        VisionRNG* rng);
-VisionImage* vision_random_contrast(const VisionImage* src, float lower,
-                                     float upper, VisionRNG* rng);
+VisionImage* vision_random_contrast(const VisionImage* src, float lo, float hi,
+                                     VisionRNG* rng);
 VisionImage* vision_random_hue(const VisionImage* src, float max_delta,
                                 VisionRNG* rng);
 VisionImage* vision_cutout(const VisionImage* src, int n_holes, int hole_size,
                             float fill_value, VisionRNG* rng);
-void         vision_mixup(VisionImage* img_a, const VisionImage* img_b, float alpha);
-float        vision_cutmix(VisionImage* img_a, const VisionImage* img_b,
-                            float alpha, VisionRNG* rng);
-VisionImage* vision_random_rotation(const VisionImage* src, float max_angle,
-                                     VisionRNG* rng, int interp,
-                                     int border, float constant_value);
+VisionImage* vision_mixup(const VisionImage* a, const VisionImage* b,
+                           float alpha, VisionRNG* rng, float* out_lambda);
+VisionImage* vision_cutmix(const VisionImage* a, const VisionImage* b,
+                            float alpha, VisionRNG* rng, float* out_lambda);
+VisionImage* vision_random_rotation(const VisionImage* src, float max_angle_deg,
+                                     VisionRNG* rng, VisionInterp interp,
+                                     VisionBorderMode border, float fill_value);
 
 /* ═══════════════════════════════════════════════════════════════════════
  * 14. DETECTION UTILITIES
@@ -372,16 +385,16 @@ VisionImage* vision_random_rotation(const VisionImage* src, float max_angle,
 float vision_iou(const VisionBBox* a, const VisionBBox* b);
 float vision_giou(const VisionBBox* a, const VisionBBox* b);
 float vision_diou(const VisionBBox* a, const VisionBBox* b);
-int   vision_nms(VisionBBox* boxes, int n, float iou_threshold);
-int   vision_soft_nms(VisionBBox* boxes, int n, float sigma,
-                       float score_threshold);
+VisionBBoxArray* vision_nms(const VisionBBoxArray* boxes, float iou_thresh);
+VisionBBoxArray* vision_soft_nms(const VisionBBoxArray* boxes,
+                                  float sigma, float score_thresh);
 
 VisionBBoxArray* vision_bbox_array_create(int capacity);
-void             vision_bbox_array_push(VisionBBoxArray* arr, const VisionBBox* box);
+int              vision_bbox_array_push(VisionBBoxArray* arr, const VisionBBox* box);
 void             vision_bbox_array_free(VisionBBoxArray* arr);
 
 VisionBBoxArray* vision_generate_anchors(int feat_w, int feat_h,
-                                          float stride_x, float stride_y,
+                                          int stride,
                                           const float* scales, int n_scales,
                                           const float* ratios, int n_ratios);
 
@@ -396,12 +409,67 @@ void vision_bbox_decode(const VisionBBox* anchor,
  * ═══════════════════════════════════════════════════════════════════════ */
 VisionImage* vision_mask_resize(const VisionImage* mask, int dst_w, int dst_h);
 VisionImage* vision_polygon_rasterize(const float* pts_xy, int n_pts,
-                                       int img_w, int img_h);
+                                       int img_w, int img_h, uint8_t fill_val);
 VisionCC*    vision_connected_components(const VisionImage* binary_mask);
 void         vision_cc_free(VisionCC* cc);
 
 /* ═══════════════════════════════════════════════════════════════════════
- * 16. TENSOR BRIDGE  (round-trips to/from existing Pml Tensor)
+ * 16. MODEL DECODE & MASK ASSEMBLY
+ *     Used by SSDLite, NanoDet, PicoDet, YOLO11n, FastSAM PHP classes.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* SSDLite prior box generator */
+VisionBBoxArray* vision_ssd_prior_boxes(const int*   feat_sizes,  int n_scales,
+                                         const float* min_sizes,
+                                         const float* max_sizes,
+                                         const float* ratios,     int n_ratios,
+                                         int img_size);
+
+/* SSD prediction decode (loc deltas + class logits → filtered boxes) */
+VisionBBoxArray* vision_ssd_decode(const float* loc_pred, const float* cls_pred,
+                                    const VisionBBoxArray* anchors,
+                                    int n_cls,    float conf_thr,
+                                    float var_xy, float var_wh);
+
+/* NanoDet FCOS + GFL distribution decode */
+VisionBBoxArray* vision_nanodet_decode(const float* cls_pred, const float* reg_pred,
+                                        int feat_h, int feat_w, int stride,
+                                        int n_cls, int reg_max,
+                                        int img_w, int img_h, float conf_thr);
+
+/* PicoDet DFL + aligned head decode (same math as NanoDet) */
+VisionBBoxArray* vision_picodet_decode(const float* cls_pred, const float* reg_pred,
+                                        int feat_h, int feat_w, int stride,
+                                        int n_cls, int reg_max,
+                                        int img_w, int img_h, float conf_thr);
+
+/* YOLO11n DFL + anchor-free decode (single scale output tensor) */
+VisionBBoxArray* vision_yolo11_decode(const float* output,
+                                       int feat_h, int feat_w, int stride,
+                                       int n_cls, int reg_max,
+                                       int img_w, int img_h, float conf_thr);
+
+/* FastSAM prototype-bank mask assembly → CHW uint8 image (n_dets channels) */
+VisionImage* vision_fastsam_assemble_masks(const float* proto, int n_proto,
+                                            int proto_h, int proto_w,
+                                            const float* coeffs, int n_dets,
+                                            const VisionBBoxArray* boxes,
+                                            int out_w, int out_h, float mask_thr);
+
+/* Multi-scale decode (NanoDet/YOLO11 FPN) + NMS */
+VisionBBoxArray* vision_multiscale_decode(const float** cls_preds,
+                                           const float** reg_preds,
+                                           const int*    feat_hs,
+                                           const int*    feat_ws,
+                                           const int*    strides,
+                                           int n_scales,
+                                           int n_cls, int reg_max,
+                                           int img_w, int img_h,
+                                           float conf_thr, float iou_thr,
+                                           int decode_fn);
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * 17. TENSOR BRIDGE  (round-trips to/from existing Pml Tensor)
  *
  * The Tensor layout expected:  CHW float32, owned.
  * Caller is responsible for casting void* to/from their Tensor type.
@@ -409,9 +477,10 @@ void         vision_cc_free(VisionCC* cc);
 void*        vision_image_to_tensor(const VisionImage* img);
 VisionImage* vision_tensor_to_image(void* tensor_data, int width, int height,
                                      int channels, int format);
+void         vision_free_raw(void* ptr);   /* free() a vision_image_to_tensor buffer */
 
 /* ═══════════════════════════════════════════════════════════════════════
- * 17. VIDEO FOUNDATION (architecture stub — no implementation)
+ * 18. VIDEO FOUNDATION (architecture stub — no implementation)
  *
  * The opaque VisionVideoCapture type is declared here so future
  * translation units can extend it without ABI breaks.
@@ -424,15 +493,16 @@ VisionImage* vision_tensor_to_image(void* tensor_data, int width, int height,
 /* double              vision_video_fps(VisionVideoCapture*);       */
 
 /* ═══════════════════════════════════════════════════════════════════════
- * 18. MEMORY DIAGNOSTICS
+ * 19. MEMORY DIAGNOSTICS
  * ═══════════════════════════════════════════════════════════════════════ */
 const VisionMemStats* vision_mem_stats(void);
 void                  vision_mem_stats_reset(void);
 
 /* ═══════════════════════════════════════════════════════════════════════
- * 19. INTERNAL HELPERS  (used across .c files, not exposed to PHP)
+ * 20. INTERNAL HELPERS  (used across .c files, not exposed to PHP)
  * ═══════════════════════════════════════════════════════════════════════ */
 #ifdef VISION_INTERNAL
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
