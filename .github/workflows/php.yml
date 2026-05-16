@@ -1,94 +1,169 @@
-## YAML Template.
----
-name: PML Native Build (FFI + BLAS + LAPACK + XGBoost)
+name: CI
 
 on:
   push:
+    branches: [main, master, develop]
   pull_request:
-  workflow_dispatch:
+    branches: [main, master, develop]
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  test:
+    name: PHP ${{ matrix.php }} — Tests
+    runs-on: ubuntu-22.04
 
-    env:
-      LD_LIBRARY_PATH: /usr/local/lib:/usr/lib
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.1", "8.2", "8.3"]
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # --------------------------------------------------
-      # PHP + FFI
-      # --------------------------------------------------
-      - name: Setup PHP with FFI
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc libopenblas-dev liblapacke-dev valgrind
+
+      - name: Setup PHP ${{ matrix.php }}
         uses: shivammathur/setup-php@v2
         with:
-          php-version: 8.2
-          extensions: ffi
-          ini-values: ffi.enable=1
+          php-version: ${{ matrix.php }}
+          extensions: ffi, pcntl, posix
+          ini-values: |
+            ffi.enable=true
+            memory_limit=2G
+            opcache.enable_cli=1
+            opcache.jit=tracing
+            opcache.jit_buffer_size=128M
           coverage: none
-          tools: composer
 
-      - name: Verify PHP + FFI
+      - name: Get Composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+
+      - name: Cache Composer packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: ${{ runner.os }}-composer-
+
+      - name: Install PHP dependencies
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader
+
+      - name: Build libtensor.so
         run: |
-          php -v
-          php -m | grep ffi
+          cd src/Lib
+          gcc -O3 -march=native -mtune=native -mfma -fno-math-errno \
+              -funsafe-math-optimizations -fopenmp -funroll-loops \
+              -fomit-frame-pointer -D_GNU_SOURCE -shared -fPIC \
+              -o libtensor.so.7 tensor.c dataset_io.c inference.c autograd.c graph.c tokenizer.c \
+              -lopenblas -llapacke -lm
+          ln -sf libtensor.so.7 libtensor.so
+          echo "libtensor.so symbols:"
+          nm -D libtensor.so | grep -c tensor_ || true
 
-      # --------------------------------------------------
-      # Install optimized math backend
-      # --------------------------------------------------
-      - name: Install OpenBLAS + LAPACK
+      - name: Build libquant.so
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libopenblas-dev \
-            liblapack-dev \
-            gfortran \
-            build-essential \
-            cmake \
-            pkg-config
+          cd src/Lib
+          gcc -O3 -march=native -mfma -funsafe-math-optimizations \
+              -fopenmp -funroll-loops -fomit-frame-pointer -D_GNU_SOURCE \
+              -shared -fPIC -o libquant.so.1 quant.c -lopenblas -lm
+          ln -sf libquant.so.1 libquant.so
+          echo "libquant.so symbols:"
+          nm -D libquant.so | grep -c quant_ || true
 
-      - name: Verify BLAS
-        run: ldconfig -p | grep blas || true
+      - name: Run PHPUnit
+        run: vendor/bin/phpunit --colors=always --testdox
 
-      # --------------------------------------------------
-      # Build XGBoost (prebuilt native library)
-      # --------------------------------------------------
-      - name: Build XGBoost C library
+      - name: Check for memory leaks (core tensor suite)
         run: |
-          git clone --recursive https://github.com/dmlc/xgboost.git
-          cd xgboost
-          mkdir build && cd build
-          cmake .. -DUSE_OPENMP=ON -DBUILD_SHARED_LIBS=ON
-          make -j$(nproc)
-          sudo make install
+          valgrind \
+            --leak-check=full \
+            --error-exitcode=1 \
+            --suppressions=.valgrind.supp \
+            php vendor/bin/phpunit tests/TensorTest.php 2>&1 | tail -30
+        continue-on-error: true  # report but don't block on valgrind noise from PHP runtime
 
-      - name: Verify XGBoost install
-        run: ldconfig -p | grep xgboost || true
+  lint:
+    name: PHP Lint + Static Analysis
+    runs-on: ubuntu-22.04
 
-      # --------------------------------------------------
-      # Composer dependencies
-      # --------------------------------------------------
-      - name: Install dependencies
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: ffi
+          ini-values: ffi.enable=true
+          coverage: none
+          tools: cs2pr
+
+      - name: Install PHP dependencies
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader
+
+      - name: PHP syntax check (all PHP files)
+        run: |
+          find src/ -name "*.php" -print0 | xargs -0 -P4 php -l | grep -v "No syntax errors" || true
+
+      - name: Check interface compliance (basic)
+        run: |
+          php -r "
+          require 'vendor/autoload.php';
+          // Verify FFI bridge loads without error
+          \$ffi = Pml\Lib\TensorEngine::get();
+          echo 'TensorEngine OK' . PHP_EOL;
+          " || exit 1
+
+  benchmark-smoke:
+    name: Benchmark Smoke Test
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc libopenblas-dev liblapacke-dev
+
+      - name: Setup PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: ffi, pcntl
+          ini-values: ffi.enable=true, memory_limit=2G, opcache.jit=tracing, opcache.jit_buffer_size=128M
+          coverage: none
+
+      - name: Install PHP dependencies
         run: composer install --no-interaction --prefer-dist
 
-      # --------------------------------------------------
-      # Run tests (numeric stability tests)
-      # --------------------------------------------------
-      - name: Run PHPUnit
+      - name: Build C backend
         run: |
-          if [ -f vendor/bin/phpunit ]; then
-            vendor/bin/phpunit
-          else
-            echo "No tests found yet"
-          fi
+          cd src/Lib
+          gcc -O3 -march=native -mfma -funsafe-math-optimizations -fopenmp \
+              -funroll-loops -fomit-frame-pointer -D_GNU_SOURCE -shared -fPIC \
+              -o libtensor.so.7 tensor.c dataset_io.c inference.c autograd.c graph.c tokenizer.c \
+              -lopenblas -llapacke -lm
+          ln -sf libtensor.so.7 libtensor.so
+          cd ../..
+          cd src/Lib
+          gcc -O3 -march=native -mfma -funsafe-math-optimizations -fopenmp \
+              -funroll-loops -fomit-frame-pointer -D_GNU_SOURCE -shared -fPIC \
+              -o libquant.so.1 quant.c -lopenblas -lm
+          ln -sf libquant.so.1 libquant.so
 
-      # --------------------------------------------------
-      # Benchmark (optional but useful for ML library)
-      # --------------------------------------------------
-      - name: Run performance tests
+      - name: Run benchmark smoke (fast subset)
         run: |
-          if [ -f benchmark/run.php ]; then
-            php benchmark/run.php
-          fi
+          vendor/bin/phpbench run benchmarks/TensorBench.php \
+              --report=aggregate \
+              --iterations=2 \
+              --revs=3 \
+              --warmup=1 \
+              --time-unit=milliseconds

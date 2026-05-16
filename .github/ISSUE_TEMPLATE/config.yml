@@ -1,0 +1,12 @@
+blank_issues_enabled: false
+
+contact_links:
+  - name: Documentation
+    url: https://ghostjat.github.io/pml
+    about: Full API reference and guides
+  - name: Discussions (questions & ideas)
+    url: https://github.com/ghostjat/pml/discussions
+    about: Use Discussions for questions, design ideas, and community conversation
+  - name: Sponsor PML
+    url: https://github.com/sponsors/ghostjat
+    about: Support continued development
