@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Inference &amp; LLM — PML Framework</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav id="sidebar">
+  <div class="sidebar-header">
+    <a href="index.html" class="logo">PML Framework</a>
+    <div class="version">v7.0 · PHP 8.2+ · FFI/C Backend</div>
+  </div>
+  <div class="sidebar-search"><input type="text" id="nav-search" placeholder="Filter pages..." autocomplete="off"></div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Overview</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="index.html" class="nav-link">Home</a>
+      <a href="getting-started.html" class="nav-link">Getting Started</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Core</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="tensor.html" class="nav-link">Tensor</a>
+      <a href="dataset.html" class="nav-link">Dataset &amp; DataFrame</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Estimators</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="estimators.html#classifiers" class="nav-link">Classifiers</a>
+      <a href="estimators.html#regressors" class="nav-link">Regressors</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Transformers</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="transformers.html" class="nav-link">All Transformers</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Neural Networks</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="neural-network.html" class="nav-link">Sequential &amp; Layers</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Training</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="training.html" class="nav-link">Trainer &amp; Args</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Inference &amp; LLM</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="inference.html#session" class="nav-link active">InferenceSession</a>
+      <a href="inference.html#kvcache" class="nav-link active">KVCache</a>
+      <a href="inference.html#tokenizer" class="nav-link active">Tokenizer (BPE)</a>
+      <a href="inference.html#modelconfig" class="nav-link active">ModelConfig</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Vision</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="vision.html" class="nav-link">Vision Module</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Pipeline &amp; CV</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="pipeline.html" class="nav-link">Pipeline &amp; CV</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Roadmap</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="roadmap.html" class="nav-link">Vulkan GPU Support</a></div>
+  </div>
+</nav>
+
+<div id="main">
+  <div class="topbar">
+    <div class="topbar-breadcrumb"><a href="index.html">PML</a> / Inference &amp; LLM</div>
+    <div class="topbar-links"><a href="vision.html">Vision →</a></div>
+  </div>
+
+  <div class="content">
+    <div class="page-hero">
+      <span class="page-tag">Inference</span>
+      <h1>Inference &amp; LLM</h1>
+      <p class="page-lead">
+        Run LLaMA-style language models directly in PHP. The C inference engine
+        (<code>inference.c</code>) implements Grouped Query Attention (GQA), RoPE,
+        RMSNorm, SwiGLU MLP, and autoregressive decode with a multi-head KV-cache.
+        The <code>KVCache</code> class eliminates O(T²) recompute — each decode step
+        is O(1) in sequence length.
+      </p>
+    </div>
+
+    <div class="toc-inline">
+      <h5>On this page</h5>
+      <ol>
+        <li><a href="#architecture">Architecture</a></li>
+        <li><a href="#session">InferenceSession</a></li>
+        <li><a href="#kvcache">KVCache</a></li>
+        <li><a href="#tokenizer">Tokenizer (BPE)</a></li>
+        <li><a href="#modelconfig">ModelConfig</a></li>
+        <li><a href="#example">Generation Examples</a></li>
+        <li><a href="#performance">Performance Notes</a></li>
+      </ol>
+    </div>
+
+    <!-- ── Architecture ───────────────────────────────────────── -->
+    <h2 id="architecture">Architecture</h2>
+    <div class="arch-box">
+PHP call: $session->step($tokenId, $pos)
+                ↓  1 FFI crossing
+inference.c: inf_forward()
+  ├─ Embedding lookup  (token → dModel vector)
+  ├─ For each layer (nLayers):
+  │   ├─ RMSNorm(x)
+  │   ├─ CausalSelfAttention (GQA):
+  │   │   ├─ Q = x @ Wq   K = x @ Wk   V = x @ Wv
+  │   │   ├─ RoPE: Q, K rotated by position $pos
+  │   │   ├─ KV-cache: append K,V; attend with all cached K,V
+  │   │   │   └─ Milakov online-softmax (O(head_dim) working mem)
+  │   │   └─ out = attn_out @ Wo
+  │   ├─ Residual: x += out
+  │   ├─ RMSNorm(x)
+  │   ├─ SwiGLU MLP: x2 = silu(x @ Wg) ⊙ (x @ Wu); out = x2 @ Wd
+  │   └─ Residual: x += out
+  └─ Final RMSNorm → logits = x @ Wout  [vocabSize]
+    </div>
+
+    <div class="callout callout-info">
+      <strong>GQA (Grouped Query Attention)</strong>
+      When <code>nKvHeads &lt; nHeads</code>, K/V heads are shared across Q head groups
+      (LLaMA-3, Mistral-style). The C kernel handles the grouping natively.
+    </div>
+
+    <!-- ── InferenceSession ───────────────────────────────────── -->
+    <h2 id="session">InferenceSession</h2>
+    <p>The main entry point for LLM inference. Loads weights from a SafeTensors file, sets up the KV-cache, and exposes token-step and generation APIs.</p>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">load</span>
+        <span class="method-sig">static (string $safetensorsPath, ModelConfig $config): self</span>
+      </div>
+      <div class="api-block-body">
+        <p>Loads model weights from a SafeTensors file and initialises the C inference context. Weights are mmap'd — no full copy into RAM.</p>
+        <pre><code><span class="va">$cfg</span>     = <span class="ty">ModelConfig</span>::<span class="fn">llama3_8b</span>();
+<span class="va">$session</span> = <span class="ty">InferenceSession</span>::<span class="fn">load</span>(<span class="st">'models/llama3-8b.safetensors'</span>, <span class="va">$cfg</span>);</code></pre>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">loadFile</span>
+        <span class="method-sig">static (string $modelDir): self</span>
+      </div>
+      <div class="api-block-body">
+        <p>Convenience loader: reads <code>$modelDir/config.json</code> for <code>ModelConfig</code> and <code>$modelDir/model.safetensors</code> for weights.</p>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">step</span>
+        <span class="method-sig">(int $tokenId, int $pos): Tensor</span>
+        <span class="return-type">Tensor [vocabSize]</span>
+      </div>
+      <div class="api-block-body">
+        <p>Single-token forward pass with KV-cache. Called in a loop for autoregressive decode. One FFI crossing per token.</p>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">forward</span>
+        <span class="method-sig">(array $tokens): Tensor</span>
+        <span class="return-type">Tensor [vocabSize]</span>
+      </div>
+      <div class="api-block-body">
+        <p>Full prefill forward pass: processes all prompt tokens in one C call (batch attention), returns logits for the last token. Populates the KV-cache.</p>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">generate</span>
+        <span class="method-sig">(array $promptIds, int $maxNewTokens = 256, float $temperature = 0.0, float $topP = 0.9): Generator</span>
+      </div>
+      <div class="api-block-body">
+        <p>Autoregressive generation. Yields one token ID per step. Stops at EOS or <code>$maxNewTokens</code>.</p>
+        <pre><code><span class="kw">foreach</span> (<span class="va">$session</span>-><span class="fn">generate</span>(<span class="va">$promptIds</span>, maxNewTokens: <span class="nu">512</span>, temperature: <span class="nu">0.8</span>) <span class="kw">as</span> <span class="va">$id</span>) {
+    <span class="fn">echo</span> <span class="va">$tok</span>-><span class="fn">decode</span>([<span class="va">$id</span>]);
+    <span class="fn">flush</span>();
+}</code></pre>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">generateIds</span>
+        <span class="method-sig">(array $promptIds, int $maxNewTokens = 256, float $temperature = 0.0, float $topP = 0.9): array</span>
+      </div>
+      <div class="api-block-body">
+        <p>Collects all generated token IDs into an array (non-streaming).</p>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">chat</span>
+        <span class="method-sig">(array $messages, int $maxNewTokens = 512, float $temperature = 0.0): string</span>
+      </div>
+      <div class="api-block-body">
+        <p>Chat-template generation. Messages format: <code>[['role' =&gt; 'user', 'content' =&gt; '...'], ...]</code>. Applies LLaMA-3 / ChatML template, generates and decodes response.</p>
+      </div>
+    </div>
+
+    <table>
+      <thead><tr><th>Method</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>sampleGreedy(Tensor $logits): int</code></td><td>Argmax sampling — deterministic</td></tr>
+        <tr><td><code>sample(Tensor $logits, float $temp, float $topP): int</code></td><td>Temperature + top-p nucleus sampling</td></tr>
+        <tr><td><code>resetKv(): void</code></td><td>Clears KV-cache for a new conversation</td></tr>
+        <tr><td><code>getWeight(string $name): ?Tensor</code></td><td>Access a named weight tensor by SafeTensors key</td></tr>
+        <tr><td><code>parseConfig(string $jsonPath): ModelConfig</code></td><td>Parse <code>config.json</code> to ModelConfig</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── KVCache ────────────────────────────────────────────── -->
+    <h2 id="kvcache">KVCache</h2>
+    <p>
+      <code>Pml\KVCache</code> wraps a C <code>MultiKVCache*</code> struct that manages
+      <code>nLayers × nHeads</code> key/value cache slots.
+      Eliminates the O(T²) attention recompute during autoregressive decode.
+    </p>
+
+    <div class="callout callout-info">
+      <strong>FFI crossings per decode step:</strong> 2 total — one <code>mkvca_append</code> (add K,V for new token)
+      and one <code>mkvca_attend</code> (Milakov online-softmax attention over all cached tokens).
+      OpenMP parallelizes over heads inside C.
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">__construct</span>
+        <span class="method-sig">(int $nLayers, int $nHeads, int $maxSeqLen, int $headDim)</span>
+      </div>
+      <div class="api-block-body">
+        <p>Allocates the multi-head cache. Memory: <code>nLayers × nHeads × maxSeqLen × 2 × headDim × 4</code> bytes.</p>
+        <pre><code><span class="va">$kv</span> = <span class="kw">new</span> <span class="ty">KVCache</span>(
+    nLayers:   <span class="nu">32</span>,
+    nHeads:    <span class="nu">8</span>,    <span class="cm">// nKvHeads for GQA</span>
+    maxSeqLen: <span class="nu">4096</span>,
+    headDim:   <span class="nu">128</span>,
+);
+<span class="fn">printf</span>(<span class="st">"Cache memory: %.1f MB\n"</span>, <span class="va">$kv</span>-><span class="fn">memoryBytes</span>() / <span class="nu">1e6</span>);</code></pre>
+      </div>
+    </div>
+
+    <table>
+      <thead><tr><th>Method</th><th>Signature</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>prefill</code></td><td><code>(int $layerIdx, Tensor $k, Tensor $v): void</code></td><td>Populate cache with T prompt tokens (K: [T, nH, hd], V: same)</td></tr>
+        <tr><td><code>append</code></td><td><code>(int $layerIdx, Tensor $k, Tensor $v): void</code></td><td>Append one decode token (K: [nH, hd], V: same)</td></tr>
+        <tr><td><code>attend</code></td><td><code>(int $layerIdx, Tensor $q): Tensor</code></td><td>Compute attention over all cached K,V for query Q [nH, 1, hd]. Returns [1, nH, hd].</td></tr>
+        <tr><td><code>reset</code></td><td><code>(): void</code></td><td>Clear all caches (start new generation)</td></tr>
+        <tr><td><code>memoryBytes</code></td><td><code>(): int</code></td><td>Total RAM used by K+V buffers</td></tr>
+        <tr><td><code>nLayers/nHeads/maxSeqLen/headDim</code></td><td>—</td><td>Construction parameters</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Memory estimate</h3>
+    <pre><code><span class="cm">// LLaMA-3 8B: 32 layers, 8 KV-heads, 4096 max context, 128 head-dim</span>
+<span class="va">$kv</span> = <span class="kw">new</span> <span class="ty">KVCache</span>(<span class="nu">32</span>, <span class="nu">8</span>, <span class="nu">4096</span>, <span class="nu">128</span>);
+<span class="cm">// = 32 × 8 × 4096 × 2 × 128 × 4 bytes = 1,073,741,824 bytes = 1.07 GB</span>
+
+<span class="cm">// Reduce context to 2048 for lower memory:</span>
+<span class="va">$kv</span> = <span class="kw">new</span> <span class="ty">KVCache</span>(<span class="nu">32</span>, <span class="nu">8</span>, <span class="nu">2048</span>, <span class="nu">128</span>);
+<span class="cm">// = 536 MB</span></code></pre>
+
+    <!-- ── Tokenizer ──────────────────────────────────────────── -->
+    <h2 id="tokenizer">Tokenizer (BPE)</h2>
+    <p>
+      <code>Pml\Inference\Tokenizer</code> wraps the C BPE tokenizer (<code>tokenizer.c</code>).
+      Supports HuggingFace <code>tokenizer.json</code> format and raw vocabulary + merges files.
+      Zero-copy: the PHP Tokenizer holds a C <code>Tokenizer*</code> pointer.
+    </p>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">fromJson</span>
+        <span class="method-sig">static (string $path): self</span>
+      </div>
+      <div class="api-block-body">
+        <p>Load from a HuggingFace <code>tokenizer.json</code> file. Compatible with LLaMA, Mistral, Gemma, SmolLM2.</p>
+        <pre><code><span class="va">$tok</span> = <span class="ty">Tokenizer</span>::<span class="fn">fromJson</span>(<span class="st">'models/llama3/tokenizer.json'</span>);</code></pre>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">fromFiles</span>
+        <span class="method-sig">static (string $vocabPath, string $mergesPath): self</span>
+      </div>
+      <div class="api-block-body">
+        <p>Load from separate vocabulary (<code>vocab.json</code>) and BPE merges (<code>merges.txt</code>) files.</p>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">encode</span>
+        <span class="method-sig">(string $text, bool $addBos = false): int[]</span>
+      </div>
+      <div class="api-block-body">
+        <p>BPE-encodes a string to token IDs. Optionally prepends the BOS token.</p>
+        <pre><code><span class="va">$ids</span> = <span class="va">$tok</span>-><span class="fn">encode</span>(<span class="st">"Hello world"</span>, addBos: <span class="kw">true</span>);
+<span class="cm">// → [1, 22557, 1879]  (example)</span></code></pre>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">encodeBatch</span>
+        <span class="method-sig">(array $texts, bool $addBos = false, int $maxLen = 0): Tensor</span>
+        <span class="return-type">Tensor [N, maxLen] int64</span>
+      </div>
+      <div class="api-block-body">
+        <p>Encode a batch of strings. Pads to the longest sequence (or <code>$maxLen</code>). Returns an int64 Tensor for batch inference.</p>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">decode</span>
+        <span class="method-sig">(array $ids, bool $skipSpecial = true): string</span>
+      </div>
+      <div class="api-block-body">
+        <p>Converts token IDs back to a string. Skips special tokens (BOS, EOS, PAD) unless <code>$skipSpecial = false</code>.</p>
+      </div>
+    </div>
+
+    <table>
+      <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>vocabSize(): int</code></td><td>int</td><td>Total vocabulary size</td></tr>
+        <tr><td><code>bosId(): int</code></td><td>int</td><td>Beginning-of-sequence token ID</td></tr>
+        <tr><td><code>eosId(): int</code></td><td>int</td><td>End-of-sequence token ID</td></tr>
+        <tr><td><code>padId(): int</code></td><td>int</td><td>Padding token ID</td></tr>
+        <tr><td><code>unkId(): int</code></td><td>int</td><td>Unknown token ID</td></tr>
+        <tr><td><code>idToStr(int $id): ?string</code></td><td>string</td><td>Decode single token to string</td></tr>
+        <tr><td><code>strToId(string $s): int</code></td><td>int</td><td>Encode single token (exact match in vocab)</td></tr>
+        <tr><td><code>isSpecial(int $id): bool</code></td><td>bool</td><td>Whether token is a special token</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── ModelConfig ────────────────────────────────────────── -->
+    <h2 id="modelconfig">ModelConfig</h2>
+    <p>
+      <code>Pml\Inference\ModelConfig</code> is a pure value object describing the model architecture.
+      Passed to <code>InferenceSession::load()</code>. Pre-built configs are available as static factory methods.
+    </p>
+
+    <h3>Pre-built configs</h3>
+    <table>
+      <thead><tr><th>Factory</th><th>Parameters</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>ModelConfig::llama3_8b()</code></td>
+          <td>32L · 32H · 8KVH · dModel=4096 · vocab=128k</td>
+          <td>LLaMA-3 8B (Meta). GQA, RoPE 500k, RMSNorm.</td>
+        </tr>
+        <tr>
+          <td><code>ModelConfig::mistral_7b()</code></td>
+          <td>32L · 32H · 8KVH · dModel=4096 · vocab=32k</td>
+          <td>Mistral 7B v0.3. Sliding window attention (not yet implemented in C).</td>
+        </tr>
+        <tr>
+          <td><code>ModelConfig::smollm2_135m()</code></td>
+          <td>30L · 9H · 3KVH · dModel=576 · vocab=49k</td>
+          <td>SmolLM2-135M (HuggingFace). Fits in ~270 MB fp32.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Constructor properties</h3>
+    <table>
+      <thead><tr><th>Property</th><th>Type</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>arch</code></td><td>int</td><td><code>ARCH_LLAMA</code> = 0 (currently only supported arch)</td></tr>
+        <tr><td><code>vocabSize</code></td><td>int</td><td>Vocabulary size</td></tr>
+        <tr><td><code>nLayers</code></td><td>int</td><td>Number of transformer layers</td></tr>
+        <tr><td><code>nHeads</code></td><td>int</td><td>Number of Q attention heads</td></tr>
+        <tr><td><code>nKvHeads</code></td><td>int</td><td>Number of KV heads (GQA: nKvHeads &lt; nHeads)</td></tr>
+        <tr><td><code>dModel</code></td><td>int</td><td>Hidden state dimension</td></tr>
+        <tr><td><code>dFf</code></td><td>int</td><td>Feed-forward intermediate dimension</td></tr>
+        <tr><td><code>maxSeqLen</code></td><td>int</td><td>Maximum context length</td></tr>
+        <tr><td><code>rmsEps</code></td><td>float</td><td>RMSNorm epsilon (1e-5)</td></tr>
+        <tr><td><code>ropeBase</code></td><td>float</td><td>RoPE theta base (10000 or 500000 for LLaMA-3)</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Example ─────────────────────────────────────────────── -->
+    <h2 id="example">Generation Examples</h2>
+
+    <h3>Streaming generation</h3>
+    <pre><code><span class="kw">use</span> <span class="ty">Pml\Inference\{InferenceSession, Tokenizer, ModelConfig}</span>;
+
+<span class="va">$tok</span>     = <span class="ty">Tokenizer</span>::<span class="fn">fromJson</span>(<span class="st">'models/smollm2/tokenizer.json'</span>);
+<span class="va">$session</span> = <span class="ty">InferenceSession</span>::<span class="fn">load</span>(<span class="st">'models/smollm2/model.safetensors'</span>, <span class="ty">ModelConfig</span>::<span class="fn">smollm2_135m</span>());
+
+<span class="va">$prompt</span>  = <span class="st">"def fibonacci(n):\n"</span>;
+<span class="va">$ids</span>     = <span class="va">$tok</span>-><span class="fn">encode</span>(<span class="va">$prompt</span>, addBos: <span class="kw">true</span>);
+
+<span class="cm">// Stream token by token</span>
+<span class="kw">foreach</span> (<span class="va">$session</span>-><span class="fn">generate</span>(<span class="va">$ids</span>, maxNewTokens: <span class="nu">200</span>, temperature: <span class="nu">0.7</span>, topP: <span class="nu">0.9</span>) <span class="kw">as</span> <span class="va">$tokenId</span>) {
+    <span class="kw">if</span> (<span class="va">$tokenId</span> === <span class="va">$tok</span>-><span class="fn">eosId</span>()) <span class="kw">break</span>;
+    <span class="fn">echo</span> <span class="va">$tok</span>-><span class="fn">decode</span>([<span class="va">$tokenId</span>]);
+    <span class="fn">flush</span>();
+}</code></pre>
+
+    <h3>Chat interface</h3>
+    <pre><code><span class="va">$response</span> = <span class="va">$session</span>-><span class="fn">chat</span>([
+    [<span class="st">'role'</span> => <span class="st">'system'</span>,    <span class="st">'content'</span> => <span class="st">'You are a helpful assistant.'</span>],
+    [<span class="st">'role'</span> => <span class="st">'user'</span>,      <span class="st">'content'</span> => <span class="st">'What is gradient descent?'</span>],
+], maxNewTokens: <span class="nu">256</span>, temperature: <span class="nu">0.8</span>);
+
+<span class="fn">echo</span> <span class="va">$response</span>;</code></pre>
+
+    <h3>INT8-quantized LLM</h3>
+    <pre><code><span class="cm">// Load weights and quantize all Dense layers to INT8</span>
+<span class="va">$session</span> = <span class="ty">InferenceSession</span>::<span class="fn">load</span>(<span class="st">'models/llama3-8b.safetensors'</span>, <span class="ty">ModelConfig</span>::<span class="fn">llama3_8b</span>());
+<span class="cm">// $session internally uses Sequential — call quantize() on its model:</span>
+<span class="va">$session</span>-><span class="fn">getModel</span>()-><span class="fn">quantize</span>(groupSize: <span class="nu">32</span>);
+<span class="cm">// fp32 weights freed immediately → ~7 GB instead of ~28 GB</span>
+
+<span class="kw">foreach</span> (<span class="va">$session</span>-><span class="fn">generate</span>(<span class="va">$ids</span>, maxNewTokens: <span class="nu">500</span>) <span class="kw">as</span> <span class="va">$id</span>) {
+    <span class="fn">echo</span> <span class="va">$tok</span>-><span class="fn">decode</span>([<span class="va">$id</span>]);
+}</code></pre>
+
+    <!-- ── Performance Notes ──────────────────────────────────── -->
+    <h2 id="performance">Performance Notes</h2>
+    <div class="card-grid">
+      <div class="card-sm">
+        <h4>Without KV-cache</h4>
+        <p class="text-muted" style="font-size:0.82rem;">O(T²) per decode step. Unusable above ~256 tokens context. 1–3 t/s for 7B models.</p>
+      </div>
+      <div class="card-sm">
+        <h4>With KV-cache</h4>
+        <p class="text-muted" style="font-size:0.82rem;">O(1) per decode step. 4096 token context is practical. 3–6 t/s for 7B fp32 on 8-core CPU.</p>
+      </div>
+      <div class="card-sm">
+        <h4>KV-cache + INT8</h4>
+        <p class="text-muted" style="font-size:0.82rem;">~8–12 t/s for 7B. 7 GB total RAM (4× reduction). Recommended for production.</p>
+      </div>
+      <div class="card-sm">
+        <h4>Next step: fp16</h4>
+        <p class="text-muted" style="font-size:0.82rem;">fp16 weights + AVX-512 fp16 FMA would give another ~2× decode speedup and halve weight RAM again.</p>
+      </div>
+    </div>
+
+    <div class="callout callout-tip">
+      <strong>Thread tuning</strong>
+      For decode-heavy workloads, set <code>OPENBLAS_NUM_THREADS=1</code> and rely on
+      <code>OMP_NUM_THREADS=N</code> for the OpenMP attention/MLP loops.
+      BLAS thrashing on multi-thread decode is counterproductive.
+    </div>
+
+  </div>
+
+  <footer>
+    <span>PML Framework</span>
+    <span>Next: <a href="vision.html">Vision →</a></span>
+  </footer>
+</div>
+
+<script>
+function toggleGroup(el) {
+  el.classList.toggle('open');
+  el.nextElementSibling.classList.toggle('open');
+}
+document.getElementById('nav-search').addEventListener('input', function () {
+  const q = this.value.toLowerCase();
+  document.querySelectorAll('.nav-link').forEach(function (a) {
+    a.style.display = a.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+});
+</script>
+</body>
+</html>

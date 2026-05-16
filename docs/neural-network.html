@@ -1,0 +1,616 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Neural Networks — PML Framework</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav id="sidebar">
+  <div class="sidebar-header">
+    <a href="index.html" class="logo">PML Framework</a>
+    <div class="version">v7.0 · PHP 8.2+ · FFI/C Backend</div>
+  </div>
+  <div class="sidebar-search"><input type="text" id="nav-search" placeholder="Filter pages..." autocomplete="off"></div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Overview</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="index.html" class="nav-link">Home</a>
+      <a href="getting-started.html" class="nav-link">Getting Started</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Core</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="tensor.html" class="nav-link">Tensor</a>
+      <a href="dataset.html" class="nav-link">Dataset &amp; DataFrame</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Estimators</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="estimators.html#classifiers" class="nav-link">Classifiers</a>
+      <a href="estimators.html#regressors" class="nav-link">Regressors</a>
+      <a href="estimators.html#anomaly" class="nav-link">Anomaly Detectors</a>
+      <a href="estimators.html#clusterers" class="nav-link">Clusterers</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Transformers</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="transformers.html" class="nav-link">All Transformers</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Neural Networks</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="neural-network.html#sequential" class="nav-link active">Sequential</a>
+      <a href="neural-network.html#layers" class="nav-link active">Layers</a>
+      <a href="neural-network.html#optimizers" class="nav-link active">Optimizers</a>
+      <a href="neural-network.html#losses" class="nav-link active">Loss Functions</a>
+      <a href="neural-network.html#quantize" class="nav-link active">Quantization (INT8)</a>
+      <a href="neural-network.html#initializers" class="nav-link active">Initializers</a>
+      <a href="neural-network.html#activations" class="nav-link active">Activations</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Training</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="training.html" class="nav-link">Trainer &amp; Args</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Inference &amp; LLM</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="inference.html" class="nav-link">InferenceSession</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Vision</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="vision.html" class="nav-link">Vision Module</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Pipeline &amp; CV</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="pipeline.html" class="nav-link">Pipeline &amp; CV</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Roadmap</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="roadmap.html" class="nav-link">Vulkan GPU Support</a></div>
+  </div>
+</nav>
+
+<div id="main">
+  <div class="topbar">
+    <div class="topbar-breadcrumb"><a href="index.html">PML</a> / Neural Networks</div>
+    <div class="topbar-links"><a href="training.html">Training →</a></div>
+  </div>
+
+  <div class="content">
+    <div class="page-hero">
+      <span class="page-tag">Neural Networks</span>
+      <h1>Neural Networks</h1>
+      <p class="page-lead">
+        The <code>Sequential</code> model container, 29 layer types, 9 optimizers, 5 loss functions,
+        INT8 quantization, and pre-made activation/initializer modules.
+        All weight math runs in C via FFI; PHP only moves layer handles.
+      </p>
+    </div>
+
+    <div class="toc-inline">
+      <h5>On this page</h5>
+      <ol>
+        <li><a href="#sequential">Sequential</a></li>
+        <li><a href="#layer-interface">Layer Interface</a></li>
+        <li><a href="#layers">Layers Reference (29)</a></li>
+        <li><a href="#optimizers">Optimizers (9)</a></li>
+        <li><a href="#losses">Loss Functions (5)</a></li>
+        <li><a href="#quantize">INT8 Quantization</a></li>
+        <li><a href="#initializers">Initializers</a></li>
+        <li><a href="#activations">Activation Functions</a></li>
+        <li><a href="#slm">SLM Utilities</a></li>
+      </ol>
+    </div>
+
+    <!-- ── Sequential ─────────────────────────────────────────── -->
+    <h2 id="sequential">Sequential</h2>
+    <p>
+      <code>Pml\NeuralNetwork\Sequential</code> is the primary model container.
+      Implements <code>TrainableWithOptions</code>, <code>Persistable</code>, and <code>Verbose</code>.
+    </p>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">__construct</span>
+        <span class="method-sig">(Layer[] $layers, Loss $lossFn, Optimizer $optimizer)</span>
+      </div>
+      <div class="api-block-body">
+        <pre><code><span class="va">$model</span> = <span class="kw">new</span> <span class="ty">Sequential</span>(
+    layers:    [<span class="kw">new</span> <span class="ty">Dense</span>(<span class="nu">784</span>, <span class="nu">256</span>), <span class="kw">new</span> <span class="ty">ReLU</span>(), <span class="kw">new</span> <span class="ty">Dense</span>(<span class="nu">256</span>, <span class="nu">10</span>), <span class="kw">new</span> <span class="ty">Softmax</span>()],
+    lossFn:    <span class="kw">new</span> <span class="ty">CategoricalCrossEntropy</span>(),
+    optimizer: <span class="kw">new</span> <span class="ty">AdamW</span>(lr: <span class="nu">3e-4</span>),
+);</code></pre>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">train</span>
+        <span class="method-sig">(Dataset $dataset, mixed ...$options): void</span>
+      </div>
+      <div class="api-block-body">
+        <p>Full training loop with optional validation, early stopping, and gradient clipping.</p>
+        <table>
+          <thead><tr><th>Option</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><code>epochs</code></td><td>int</td><td>10</td><td>Number of full passes over the dataset</td></tr>
+            <tr><td><code>batchSize</code></td><td>int</td><td>32</td><td>Mini-batch size</td></tr>
+            <tr><td><code>validation</code></td><td>Dataset</td><td>null</td><td>Held-out validation set for loss monitoring</td></tr>
+            <tr><td><code>patience</code></td><td>int</td><td>0</td><td>Early stopping patience epochs (0 = disabled)</td></tr>
+            <tr><td><code>minDelta</code></td><td>float</td><td>1e-4</td><td>Minimum improvement to reset patience counter</td></tr>
+            <tr><td><code>clipGradNorm</code></td><td>float</td><td>0.0</td><td>Global gradient-norm clip threshold (0 = disabled). Recommended 1.0–5.0 for RNN/LSTM.</td></tr>
+          </tbody>
+        </table>
+        <pre><code><span class="va">$model</span>-><span class="fn">train</span>(<span class="va">$train</span>,
+    epochs:       <span class="nu">50</span>,
+    batchSize:    <span class="nu">128</span>,
+    validation:   <span class="va">$val</span>,
+    patience:     <span class="nu">5</span>,
+    clipGradNorm: <span class="nu">1.0</span>,
+);</code></pre>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">stepOnBatch</span>
+        <span class="method-sig">(Dataset $batch, float $clipGradNorm = 0.0): float</span>
+        <span class="return-type">float (loss)</span>
+      </div>
+      <div class="api-block-body">
+        <p>Single forward + backward + optimizer step on one pre-made batch. Returns scalar loss. Used for streaming training loops that manage their own epoch logic.</p>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">predict</span>
+        <span class="method-sig">(Dataset $dataset): Tensor</span>
+        <span class="return-type">Tensor</span>
+      </div>
+      <div class="api-block-body">
+        <p>Sets all layers to inference mode (disables Dropout, freezes BatchNorm), runs forward pass, then restores training mode. Requires <code>trained() === true</code>.</p>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">quantize</span>
+        <span class="method-sig">(int $groupSize = 32): void</span>
+      </div>
+      <div class="api-block-body">
+        <p>Quantizes all <code>Dense</code> layers to INT8 block format. After this call: 4× less weight memory, faster decode, backward() disabled. See <a href="#quantize">INT8 Quantization</a>.</p>
+      </div>
+    </div>
+
+    <table>
+      <thead><tr><th>Method</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>forward(Tensor $x): Tensor</code></td><td>Run inference pass (no training-mode flip). Use internally by custom training loops.</td></tr>
+        <tr><td><code>backward(Tensor $grad): void</code></td><td>Backpropagation through all layers in reverse.</td></tr>
+        <tr><td><code>add(Layer $layer): void</code></td><td>Append a layer to the end of the stack.</td></tr>
+        <tr><td><code>getLayers(): Layer[]</code></td><td>Read-only access to the layer list.</td></tr>
+        <tr><td><code>getOptimizer(): Optimizer</code></td><td></td></tr>
+        <tr><td><code>getLoss(): Loss</code></td><td></td></tr>
+        <tr><td><code>trained(): bool</code></td><td>True after <code>train()</code> or <code>markTrained()</code> completes.</td></tr>
+        <tr><td><code>markTrained(): void</code></td><td>Marks model trained without calling <code>train()</code>. Use after streaming training loops.</td></tr>
+        <tr><td><code>setLogger(LoggerInterface): void</code></td><td>PSR-3 logger for per-epoch loss output.</td></tr>
+        <tr><td><code>save(string $dir): void</code></td><td>Saves config.json + model.safetensors to directory.</td></tr>
+        <tr><td><code>load(string $dir): static</code></td><td>Restores model from directory. Weights are mmap'd.</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Layer Interface ────────────────────────────────────── -->
+    <h2 id="layer-interface">Layer Interface</h2>
+    <pre><code><span class="kw">interface</span> <span class="ty">Layer</span>
+{
+    <span class="kw">public function</span> <span class="fn">forward</span>(<span class="ty">Tensor</span> <span class="va">$input</span>): <span class="ty">Tensor</span>;
+    <span class="kw">public function</span> <span class="fn">backward</span>(<span class="ty">Tensor</span> <span class="va">$gradient</span>): <span class="ty">Tensor</span>;
+    <span class="kw">public function</span> <span class="fn">getParameters</span>(): <span class="kw">array</span>;   <span class="cm">// name → Tensor</span>
+    <span class="kw">public function</span> <span class="fn">getGradients</span>(): <span class="kw">array</span>;    <span class="cm">// name → Tensor</span>
+    <span class="kw">public function</span> <span class="fn">getConfig</span>(): <span class="kw">array</span>;       <span class="cm">// for ModelStore serialization</span>
+    <span class="kw">public static function</span> <span class="fn">fromConfig</span>(<span class="kw">array</span> <span class="va">$config</span>): <span class="kw">static</span>;
+}</code></pre>
+    <p>Additional optional interfaces a layer may implement:</p>
+    <table>
+      <thead><tr><th>Interface</th><th>Methods</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>HasTrainingMode</code></td><td><code>setTraining(bool)</code></td><td>Layers that behave differently during training vs inference (Dropout, BatchNorm)</td></tr>
+        <tr><td><code>Stateful</code></td><td><code>getStateDict(prefix)</code> · <code>loadStateDict(dict, prefix)</code></td><td>SafeTensors checkpoint I/O</td></tr>
+        <tr><td><code>Quantizable</code></td><td><code>quantize(int)</code> · <code>isQuantized()</code></td><td>INT8 block quantization (Dense only)</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Layers ─────────────────────────────────────────────── -->
+    <h2 id="layers">Layers Reference</h2>
+
+    <h3>Linear &amp; Core</h3>
+    <table>
+      <thead><tr><th>Layer</th><th>Constructor</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>Dense</code></td>
+          <td><code>int $inputDim, int $outputDim, bool $useBias = true</code></td>
+          <td>Fully-connected layer. <code>Y = XW^T + b</code>. He initialization. Implements Stateful + Quantizable.</td>
+        </tr>
+        <tr>
+          <td><code>Embedding</code></td>
+          <td><code>int $vocabSize, int $embedDim</code></td>
+          <td>Token embedding lookup table. Forward: gather rows by integer indices. Backward: scatter gradients.</td>
+        </tr>
+        <tr>
+          <td><code>Flatten</code></td>
+          <td>—</td>
+          <td>Reshapes input to [batch, D]. No parameters.</td>
+        </tr>
+        <tr>
+          <td><code>Reshape</code></td>
+          <td><code>array $targetShape</code></td>
+          <td>Arbitrary reshape (excluding batch dimension).</td>
+        </tr>
+        <tr>
+          <td><code>Squeeze</code></td>
+          <td>—</td>
+          <td>Removes all size-1 dimensions from the tensor.</td>
+        </tr>
+        <tr>
+          <td><code>MLP</code></td>
+          <td><code>int $inputSize, array $hiddenSizes, int $outputSize, string $activation = 'relu'</code></td>
+          <td>Pre-made multi-layer perceptron block (Dense + Activation stack). Useful inside transformer blocks.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Normalization</h3>
+    <table>
+      <thead><tr><th>Layer</th><th>Constructor</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>BatchNormalization</code></td>
+          <td><code>int $features, float $momentum = 0.9, float $eps = 1e-5</code></td>
+          <td>Batch normalization for 2-D tensors [batch, features]. Trainable scale+shift. Running stats for inference. Stateful.</td>
+        </tr>
+        <tr>
+          <td><code>BatchNorm2D</code></td>
+          <td>—</td>
+          <td>Batch normalization for 4-D tensors [N, C, H, W]. Used with Conv2D.</td>
+        </tr>
+        <tr>
+          <td><code>LayerNorm</code></td>
+          <td><code>int $dim, float $eps = 1e-5</code></td>
+          <td>Layer normalization over the last dimension. Used in Transformers. Stateful.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Regularization</h3>
+    <table>
+      <thead><tr><th>Layer</th><th>Constructor</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>Dropout</code></td>
+          <td><code>float $rate = 0.5</code></td>
+          <td>Drops activations randomly during training. No-op at inference. Implements HasTrainingMode.</td>
+        </tr>
+        <tr>
+          <td><code>Noise</code></td>
+          <td><code>float $stddev = 0.1</code></td>
+          <td>Additive Gaussian noise during training. Improves robustness.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Convolutional</h3>
+    <table>
+      <thead><tr><th>Layer</th><th>Constructor</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>Conv2D</code></td>
+          <td><code>int $inC, int $outC, int $kernelSize, int $stride = 1, int $padding = 0, bool $useBias = true</code></td>
+          <td>2-D convolution. OpenBLAS im2col GEMM. Stateful. Backward computes dX, dW, db.</td>
+        </tr>
+        <tr>
+          <td><code>DepthwiseConv2D</code></td>
+          <td>—</td>
+          <td>Depthwise separable convolution. ~9× fewer FLOPs than regular Conv2D. Used in MobileNet.</td>
+        </tr>
+        <tr>
+          <td><code>GlobalAveragePooling2D</code></td>
+          <td>—</td>
+          <td>Reduces [N, C, H, W] to [N, C] by averaging over spatial dims.</td>
+        </tr>
+        <tr>
+          <td><code>InvertedResidual</code></td>
+          <td>—</td>
+          <td>MobileNetV2/V3 inverted residual block: expand → depthwise → project + residual.</td>
+        </tr>
+        <tr>
+          <td><code>SEBlock</code></td>
+          <td><code>int $channels, int $reduction = 4</code></td>
+          <td>Squeeze-and-Excitation block. Channel attention: global pool → FC → ReLU → FC → Sigmoid → scale.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Activation Layers</h3>
+    <table>
+      <thead><tr><th>Layer</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>ReLU</code></td><td>max(0, x). Zero parameters. AVX2 vectorized.</td></tr>
+        <tr><td><code>Sigmoid</code></td><td>σ(x) = 1/(1+e⁻ˣ). AVX2 vectorized.</td></tr>
+        <tr><td><code>Tanh</code></td><td>tanh(x). AVX2 vectorized.</td></tr>
+        <tr><td><code>Softmax</code></td><td>Numerically stable softmax over last axis.</td></tr>
+        <tr><td><code>Gelu</code></td><td>Gaussian Error Linear Unit. Used in BERT/GPT.</td></tr>
+        <tr><td><code>Swish</code></td><td>x · σ(βx). Smooth, non-monotonic. Default β=1.</td></tr>
+        <tr><td><code>HardSigmoid</code></td><td>Piecewise linear σ approximation. Fast inference.</td></tr>
+        <tr><td><code>HardSwish</code></td><td>Hard approximation to Swish. Used in MobileNetV3.</td></tr>
+        <tr><td><code>PReLU</code></td><td>Parametric ReLU — learnable negative slope α.</td></tr>
+        <tr><td><code>Activation</code></td><td>Wraps any <code>ActivationFunction</code> object as a layer.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Recurrent Layers</h3>
+    <table>
+      <thead><tr><th>Layer</th><th>Constructor</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>LSTM</code></td>
+          <td><code>int $inputSize, int $hiddenSize</code></td>
+          <td>Long Short-Term Memory. C-level gated cell. Input: [batch, seq, inputSize] → [batch, seq, hiddenSize]. Stateful.</td>
+        </tr>
+        <tr>
+          <td><code>RNN</code></td>
+          <td><code>int $inputSize, int $hiddenSize</code></td>
+          <td>Vanilla Elman RNN. Faster than LSTM, worse for long sequences.</td>
+        </tr>
+        <tr>
+          <td><code>Mamba</code></td>
+          <td><code>int $dModel, int $dState = 16</code></td>
+          <td>State Space Model block (Mamba-style SSM). Linear-time sequence modeling alternative to attention.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Attention</h3>
+    <table>
+      <thead><tr><th>Layer</th><th>Constructor</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>CausalSelfAttention</code></td>
+          <td><code>int $dModel, int $nHeads</code></td>
+          <td>
+            Multi-head causal self-attention. Three forward paths:
+            <br>• <strong>Training</strong> (<code>$kv = null</code>): full O(T²) causal attention, caches activations for backward.
+            <br>• <strong>Prefill</strong> (<code>$kv, T &gt; 1</code>): full attention + populate KV-cache.
+            <br>• <strong>Decode</strong> (<code>$kv, T = 1</code>): append 1 token to cache + O(1) attend.
+            <br>Signature: <code>forward(Tensor $x, ?KVCache $kv = null, int $layerIdx = 0): Tensor</code>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- ── Optimizers ─────────────────────────────────────────── -->
+    <h2 id="optimizers">Optimizers</h2>
+    <p>Namespace: <code>Pml\NeuralNetwork\Optimizers\</code>. All implement <code>Optimizer::step(Layer[] $layers): void</code>.</p>
+
+    <table>
+      <thead><tr><th>Optimizer</th><th>Constructor</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>Adam</code></td>
+          <td><code>lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8</code></td>
+          <td>Adaptive moment estimation. Best general-purpose optimizer.</td>
+        </tr>
+        <tr>
+          <td><code>AdamW</code></td>
+          <td><code>lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8, weightDecay=1e-2</code></td>
+          <td>Adam with decoupled weight decay. Preferred over Adam + L2 reg for transformers.</td>
+        </tr>
+        <tr>
+          <td><code>AdaMax</code></td>
+          <td><code>lr=0.002, beta1=0.9, beta2=0.999, eps=1e-8</code></td>
+          <td>Adam variant using infinity-norm. More stable for embeddings.</td>
+        </tr>
+        <tr>
+          <td><code>AdaGrad</code></td>
+          <td><code>lr=0.01, eps=1e-8</code></td>
+          <td>Accumulates squared gradients. Good for sparse features. Learning rate decays over time.</td>
+        </tr>
+        <tr>
+          <td><code>RMSProp</code></td>
+          <td><code>lr=0.001, decay=0.9, eps=1e-8</code></td>
+          <td>Leaky AdaGrad — maintains moving average of squared gradients.</td>
+        </tr>
+        <tr>
+          <td><code>SGD</code></td>
+          <td><code>lr=0.01</code></td>
+          <td>Pure stochastic gradient descent. Fast, simple.</td>
+        </tr>
+        <tr>
+          <td><code>Momentum</code></td>
+          <td><code>lr=0.01, momentum=0.9</code></td>
+          <td>SGD with momentum. Faster convergence on ravines.</td>
+        </tr>
+        <tr>
+          <td><code>Cyclical</code></td>
+          <td>—</td>
+          <td>Cyclical learning rate — oscillates between min and max LR. Can escape local minima.</td>
+        </tr>
+        <tr>
+          <td><code>StepDecay</code></td>
+          <td>—</td>
+          <td>Decays learning rate by a factor every N steps.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="callout callout-tip">
+      <strong>Optimizer step is fused in C.</strong>
+      Each optimizer calls a single FFI function (e.g., <code>tensor_fused_adam_step</code>) per parameter tensor — no intermediate allocation, all math in-place in C.
+    </div>
+
+    <!-- ── Loss Functions ─────────────────────────────────────── -->
+    <h2 id="losses">Loss Functions</h2>
+    <p>Namespace: <code>Pml\Losses\</code>. All implement <code>Loss</code>: <code>compute(Tensor $preds, Tensor $labels): float</code> + <code>differentiate(...): Tensor</code>.</p>
+
+    <table>
+      <thead><tr><th>Loss</th><th>Use Case</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>CategoricalCrossEntropy</code></td>
+          <td>Multi-class classification</td>
+          <td>Labels as class indices or one-hot. Numerically stable log computation in C.</td>
+        </tr>
+        <tr>
+          <td><code>BinaryCrossEntropy</code></td>
+          <td>Binary classification</td>
+          <td>Fused BCE + gradient via <code>tensor_fused_bce_loss_and_grad</code>. Avoids two passes.</td>
+        </tr>
+        <tr>
+          <td><code>MeanSquaredError</code></td>
+          <td>Regression</td>
+          <td>(y_hat − y)² / N. Gradient: 2(y_hat − y) / N.</td>
+        </tr>
+        <tr>
+          <td><code>Hinge</code></td>
+          <td>SVM-style</td>
+          <td>max(0, 1 − y · y_hat). Sparse gradient.</td>
+        </tr>
+        <tr>
+          <td><code>Huber</code></td>
+          <td>Robust regression</td>
+          <td>Quadratic near zero, linear for large errors. Configurable δ.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- ── Quantization ───────────────────────────────────────── -->
+    <h2 id="quantize">INT8 Quantization</h2>
+    <p>
+      PML supports symmetric INT8 block quantization (Q8_0-class) for <code>Dense</code> layers.
+      Each group of 32 weights shares one float32 scale factor. The forward kernel uses AVX2 fused
+      int8→fp32 dot products — no temporary fp32 weight allocation per inference call.
+    </p>
+
+    <div class="card-grid">
+      <div class="card-sm">
+        <h4>Memory impact</h4>
+        <p class="text-muted" style="font-size:0.82rem;">
+          7B model: ~28 GB fp32 → ~7.2 GB INT8.<br>
+          Compression ratio typically 3.9–4.0×.
+        </p>
+      </div>
+      <div class="card-sm">
+        <h4>Throughput</h4>
+        <p class="text-muted" style="font-size:0.82rem;">
+          ~4× decode token throughput improvement vs fp32 on CPU (memory-bandwidth bound).
+        </p>
+      </div>
+      <div class="card-sm">
+        <h4>Accuracy</h4>
+        <p class="text-muted" style="font-size:0.82rem;">
+          Perplexity degrades &lt;1% for groupSize=32. Larger models degrade less.
+        </p>
+      </div>
+    </div>
+
+    <pre><code><span class="cm">// Train in fp32</span>
+<span class="va">$model</span>-><span class="fn">train</span>(<span class="va">$dataset</span>, epochs: <span class="nu">20</span>);
+<span class="va">$model</span>-><span class="fn">save</span>(<span class="st">'ckpt/mnist'</span>);
+
+<span class="cm">// Load and quantize for deployment</span>
+<span class="va">$model</span> = <span class="ty">Sequential</span>::<span class="fn">load</span>(<span class="st">'ckpt/mnist'</span>);
+<span class="va">$model</span>-><span class="fn">quantize</span>(groupSize: <span class="nu">32</span>);   <span class="cm">// all Dense layers → INT8</span>
+
+<span class="cm">// Inference is now 4× faster / uses 4× less memory</span>
+<span class="va">$preds</span> = <span class="va">$model</span>-><span class="fn">predict</span>(<span class="va">$testSet</span>);
+
+<span class="cm">// Check compression</span>
+<span class="kw">foreach</span> (<span class="va">$model</span>-><span class="fn">getLayers</span>() <span class="kw">as</span> <span class="va">$layer</span>) {
+    <span class="kw">if</span> (<span class="va">$layer</span> <span class="kw">instanceof</span> <span class="ty">Dense</span> &amp;&amp; <span class="va">$layer</span>-><span class="fn">isQuantized</span>()) {
+        <span class="cm">// Dense layer is quantized</span>
+    }
+}</code></pre>
+
+    <div class="callout callout-warn">
+      <strong>Quantization is irreversible for a loaded model.</strong>
+      After <code>quantize()</code>, <code>backward()</code> throws <code>LogicException</code>.
+      Quantized checkpoints can still be saved (<code>getStateDict()</code> dequantizes for export).
+    </div>
+
+    <!-- ── Initializers ──────────────────────────────────────── -->
+    <h2 id="initializers">Initializers</h2>
+    <p>Namespace: <code>Pml\NeuralNetwork\Initializers\</code>. Used by Layers that accept a custom initializer.</p>
+    <table>
+      <thead><tr><th>Initializer</th><th>Formula</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>He</code></td><td>N(0, √(2/fan_in))</td><td>Default for ReLU networks</td></tr>
+        <tr><td><code>Xavier1</code></td><td>U(−√(6/(fan_in+fan_out)), +√(...))</td><td>Glorot uniform — for tanh</td></tr>
+        <tr><td><code>Xavier2</code></td><td>N(0, √(2/(fan_in+fan_out)))</td><td>Glorot normal</td></tr>
+        <tr><td><code>LeCun</code></td><td>N(0, √(1/fan_in))</td><td>For SELU networks</td></tr>
+        <tr><td><code>Normal</code></td><td>N(mean, stddev)</td><td>Custom Gaussian</td></tr>
+        <tr><td><code>Uniform</code></td><td>U(min, max)</td><td>Custom uniform</td></tr>
+        <tr><td><code>Constant</code></td><td>fill(value)</td><td>Fixed value (e.g., for bias init)</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Activation Functions ──────────────────────────────── -->
+    <h2 id="activations">Activation Functions</h2>
+    <p>Namespace: <code>Pml\NeuralNetwork\ActivationFunctions\</code>. Used with the <code>Activation</code> layer wrapper.</p>
+    <table>
+      <thead><tr><th>Activation</th><th>Formula</th></tr></thead>
+      <tbody>
+        <tr><td><code>ELU</code></td><td>x if x &gt; 0, else α(eˣ − 1)</td></tr>
+        <tr><td><code>GELU</code></td><td>x·Φ(x) — Gaussian CDF approximation</td></tr>
+        <tr><td><code>LeakyReLU</code></td><td>max(αx, x) — fixed negative slope</td></tr>
+        <tr><td><code>SELU</code></td><td>λ·max(αeˣ−α, x) — self-normalizing</td></tr>
+        <tr><td><code>SiLU</code></td><td>x·σ(x) — Swish with β=1</td></tr>
+        <tr><td><code>SoftPlus</code></td><td>log(1 + eˣ) — smooth ReLU</td></tr>
+        <tr><td><code>Softsign</code></td><td>x / (1 + |x|)</td></tr>
+        <tr><td><code>ThresholdedReLU</code></td><td>x if x &gt; θ, else 0</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── SLM Utilities ─────────────────────────────────────── -->
+    <h2 id="slm">SLM Utilities</h2>
+    <p>Namespace: <code>Pml\SLM\</code>. Small Language Model utilities.</p>
+    <table>
+      <thead><tr><th>Class</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>BpeTrainer</code></td>
+          <td>Trains a BPE vocabulary from raw text corpus. Produces a <code>tokenizer.json</code> compatible with <code>Pml\Inference\Tokenizer</code>.</td>
+        </tr>
+        <tr>
+          <td><code>TrainableEmbedding</code></td>
+          <td>Embedding layer with positional encoding. Combines token + positional embeddings in one forward call. Stateful.</td>
+        </tr>
+      </tbody>
+    </table>
+
+  </div>
+
+  <footer>
+    <span>PML Framework</span>
+    <span>Next: <a href="training.html">Training System →</a></span>
+  </footer>
+</div>
+
+<script>
+function toggleGroup(el) {
+  el.classList.toggle('open');
+  el.nextElementSibling.classList.toggle('open');
+}
+document.getElementById('nav-search').addEventListener('input', function () {
+  const q = this.value.toLowerCase();
+  document.querySelectorAll('.nav-link').forEach(function (a) {
+    a.style.display = a.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+});
+</script>
+</body>
+</html>

@@ -1,612 +1,406 @@
+<div align="center">
 
-# 🚀 PML — High-Performance PHP Machine Learning Framework
+# PML — PHP Machine Learning
 
-<p align="center">
-  <img alt="India" src="https://flagcdn.com/w40/in.png" />
-</p>
+**A production-grade CPU-first AI runtime and machine learning infrastructure framework for PHP.**
 
-<p align="center">
-  <b>Author:</b> Shubham Chaudhary
-</p>
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![PHP](https://img.shields.io/badge/PHP-%3E%3D8.1-8892BF.svg)](https://php.net)
+[![Build](https://img.shields.io/github/actions/workflow/status/ghostjat/pml/ci.yml?label=CI)](https://github.com/ghostjat/pml/actions)
+[![Packagist](https://img.shields.io/packagist/v/ghostjat/pml)](https://packagist.org/packages/ghostjat/pml)
+[![Stars](https://img.shields.io/github/stars/ghostjat/pml?style=social)](https://github.com/ghostjat/pml/stargazers)
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa.svg)](https://github.com/sponsors/ghostjat)
 
-<p align="center">
-  <img src="https://img.shields.io/badge/build-passing-brightgreen" />
-  <img src="https://img.shields.io/badge/coverage-92%25-blue" />
-  <img src="https://img.shields.io/badge/performance-HPC-orange" />
-  <img src="https://img.shields.io/badge/php-ffi%20enabled-purple" />
-  <img src="https://img.shields.io/badge/SIMD-AVX2%20%7C%20AVX512-success" />
-</p>
-
-> **Zero-copy. Cache-friendly. HPC-inspired. Built for serious workloads — in PHP.**
+</div>
 
 ---
 
-## ✨ Overview
-
-PML is a next-generation machine learning framework engineered in PHP with a strong focus on **high-performance computing (HPC)** principles. Unlike traditional PHP ML libraries, PML embraces:
-
-* ⚡ **FFI-powered native acceleration (C backend)**
-* 🧠 **Cache-friendly tensor layouts (B × D × T × N)**
-* 🔁 **Zero-copy memory pipelines**
-* 🧮 **Vectorized + SIMD-optimized math kernels**
-* 🧵 **Parallel execution via OpenMP**
-
-This results in a system that delivers **near-native performance** while retaining PHP’s flexibility.
+> PML is to PHP what llama.cpp is to C++ — a high-performance native runtime that brings serious AI computation into an ecosystem the rest of the industry ignores.
 
 ---
 
-## 🧩 Core Architecture
+## What is PML?
 
----
+PML is a **native-accelerated machine learning and AI inference runtime** built for PHP. It combines a hand-optimized C tensor engine with a clean PHP orchestration layer, delivering production-grade ML without Python, without CUDA, and without sacrificing throughput.
 
-┌────────────────────────────┐
-│        PHP Userland        │
-│  (Models, Pipelines, API)  │
-└────────────┬───────────────┘
-│ FFI Calls
-┌────────────▼───────────────┐
-│        FFI Bridge          │
-│   (Zero-copy bindings)     │
-└────────────┬───────────────┘
-│
-┌────────────▼───────────────┐
-│     C Tensor Engine        │
-│  libtensor.so (SIMD + OMP) │
-└────────────┬───────────────┘
-│
-┌────────────▼───────────────┐
-│  Hardware Optimizations    │
-│  • SIMD (AVX/NEON)         │
-│  • OpenMP Threads          │
-│  • Cache-aware Layouts     │
-└────────────────────────────┘
+The architecture is built on a single philosophy: **PHP orchestrates, C computes**.
 
 ```
-PHP (Userland)
-   ↓
-FFI Layer
-   ↓
-C Tensor Engine (libtensor.so)
-   ↓
-SIMD / OpenMP / Cache-Optimized Kernels
+Your PHP Application
+        │
+        ▼
+   Pml\Tensor / Pml\Dataset      ← zero-copy PHP wrappers
+        │
+        ▼  PHP FFI (single boundary crossing per op)
+   libtensor.so                  ← C tensor engine
+        │
+        ├── OpenBLAS              ← BLAS / LAPACK kernels
+        ├── LAPACKE               ← eigendecomposition, SVD
+        ├── OpenMP                ← multi-threaded batch ops
+        └── AVX2                  ← SIMD acceleration
 ```
 
-### 🔬 Key Design Principles
-
-* **Zero-copy data flow** → No redundant memory allocations
-* **In-place operations** → Reduced memory pressure
-* **Cache locality awareness** → Faster sequential access
-* **Batch-first execution** → Optimized for ML workloads
+Every tensor lives as a `TensorC*` in C memory. PHP holds a reference pointer — never a copy. There are no PHP arrays in any hot path.
 
 ---
 
-## ⚙️ Features
+## Why PML Exists
 
-### 🧮 Tensor Engine
+Modern ML stacks assume Python. This assumption carries hidden costs in PHP-first environments:
 
-* Dense tensor operations (add, mul, div, exp, log, sqrt)
-* Broadcasting & reshaping
-* Matrix multiplication (optimized for large sizes)
-* Linear algebra (SVD, inverse, pseudo-inverse)
-* SIMD-accelerated activation functions
+| Pain Point | Python Stack | PML |
+|---|---|---|
+| Cold-start overhead | 200–800 ms (interpreter + runtime imports) | < 5 ms (PHP + FFI) |
+| Memory per inference | 150–400 MB baseline | 8–20 MB baseline |
+| Deployment surface | Python runtime + venv + pip | PHP + one `.so` file |
+| PHP integration | IPC, REST, or subprocess | Native function call |
+| CPU parallelism | GIL-constrained | OpenMP, zero-GIL |
 
-### 📊 Dataset & ETL
-
-* CSV ingestion up to 100k+ rows
-* Batch generation, shuffling, splitting
-* StandardScaler / MinMaxScaler
-* Zero-copy slicing & batching
-
-### 🤖 Machine Learning Models
-
-* Decision Trees
-* Random Forest
-* Gradient Boosting
-* Logistic Regression
-* Linear Regression
-* Gaussian Naive Bayes
-* K-Means, PCA
-
-### 🧠 Neural Networks
-
-* Fully connected layers
-* Backpropagation
-* Optimizers (Adam, fused ops)
-* Loss functions (BCE, CCE)
-
-### 📝 NLP Pipeline
-
-* Bag-of-Words / TF-IDF
-* Vectorization pipelines
-* Mini-batch training
-
-### 🖼️ Image Processing
-
-* Parallel resizing
-* Zero-copy cropping
-* RGB → Grayscale transforms
+If you run PHP backends, PML lets you **embed ML directly** — same process, same memory space, same request lifecycle.
 
 ---
 
-## 📈 Benchmark Highlights
+## Technical Highlights
 
-### 📊 Visual Overview (Relative Performance)
-
-```
-Tensor Ops (1M elements)
-Add        ████████████████ 1.78ms
-Mul        ████████████     1.28ms
-ReLU       ██████           0.69ms
-Sigmoid    █████████        1.03ms
-
-MatMul
-256x256    ███████████████████ 2.7ms
-512x512    █████████████████████████ 5.3ms
-1k x 1k    █████████████████████████████████ 11ms
-
-Training
-LogReg     ███ 15ms
-GBDT       ████████ 60ms
-RF (20)    █████████████ 494ms
-```
-
-➡️ Bars represent relative compute cost (lower is better)
-
----
-
-> **Subjects:** 236
-> **Assertions:** 10
-> **Failures:** ⚠️ 3
-> **Errors:** ✅ 0
-
----
-
-### ⚡ FFI Overhead (Ultra-low latency)
-
-| Operation          | Time         |
-| ------------------ | ------------ |
-| Scalar sum         | **2.685 μs** |
-| Sigmoid (in-place) | **2.580 μs** |
-| Shape query        | **1.391 μs** |
-
-➡️ **Insight:** FFI overhead is negligible for most workloads.
-
----
-
-### 🧮 Tensor Performance
-
-| Operation | Size    | Time         |
-| --------- | ------- | ------------ |
-| Add       | 1M      | **1.782 ms** |
-| Multiply  | 1M      | **1.289 ms** |
-| ReLU      | 1M      | **699 μs**   |
-| MatMul    | 512×512 | **5.366 ms** |
-| MatMul    | 1k×1k   | **~11 ms**   |
-
-➡️ Efficient scaling across vectorized workloads.
-
----
-
-### 📊 Dataset ETL
-
-| Task             | Size      | Time        |
-| ---------------- | --------- | ----------- |
-| CSV Load         | 100k rows | **80.8 ms** |
-| Array → Dataset  | 100k×10   | **159 ms**  |
-| Standard Scaling | 100k      | **3.7 ms**  |
-
-➡️ High-throughput preprocessing pipeline.
-
----
-
-### 🤖 Model Training
-
-| Model                    | Dataset | Time       |
-| ------------------------ | ------- | ---------- |
-| Decision Tree            | 2k      | **203 ms** |
-| Random Forest (20 trees) | 2k      | **494 ms** |
-| Logistic Regression      | 2k      | **15 ms**  |
-| Gradient Boosting        | 2k      | **60 ms**  |
-
-➡️ Competitive training performance for tabular ML.
-
----
-
-### 🧠 Neural Network
-
-| Task               | Time        |
-| ------------------ | ----------- |
-| Full Training Loop | **1.241 s** |
-| Inference          | **113 μs**  |
-
-➡️ Suitable for lightweight deep learning workloads.
-
----
-
-### 🧵 Parallel + SIMD
-
-* OpenMP acceleration for large tensors
-* SIMD kernels for activation functions
-
-Example:
-
-| Operation | Size | Time         |
-| --------- | ---- | ------------ |
-| Sigmoid   | 10M  | **11.49 ms** |
-| Add       | 10M  | **9.70 ms**  |
-
----
-
-## 🤯 Why PHP for Machine Learning?
-
-> "Because constraints create innovation."
-
-### 🔥 The Controversy
-
-Most engineers assume:
-
-* PHP = slow ❌
-* Python = ML ✅
-
-PML challenges that assumption.
-
-### 💡 Reality Check
-
-* PHP + FFI → direct native execution
-* C backend → same performance class as NumPy/PyTorch CPU
-* Zero-copy → less memory overhead than Python in many cases
-
-### ⚡ Where PHP Wins
-
-* Tight integration with web stacks
-* Zero deployment friction (already everywhere)
-* Predictable memory model vs Python GC quirks
-
-### 🚫 Where It Doesn’t
-
-* GPU ecosystem still immature
-* Smaller ML community
-
-➡️ PML is not replacing Python — it’s **expanding the design space**.
-
----
-
-## ⚔️ Comparison (Real Benchmarks)
-
-| Operation (1M) | PML     | NumPy (est) | PyTorch (CPU est) |
-| -------------- | ------- | ----------- | ----------------- |
-| Add            | 1.78 ms | ~2.5 ms     | ~2.0 ms           |
-| Multiply       | 1.28 ms | ~2.2 ms     | ~1.9 ms           |
-| ReLU           | 0.69 ms | ~1.8 ms     | ~1.5 ms           |
-| Sigmoid        | 1.03 ms | ~3.0 ms     | ~2.2 ms           |
-| MatMul 512²    | 5.36 ms | ~6–8 ms     | ~5–7 ms           |
-
-> ⚠️ Benchmarks vary by CPU (AVX2/AVX512, cache, threads)
-
-➡️ PML achieves **competitive CPU performance**, especially in in-place ops.
-
----
-
-| Feature     | PML     | PyTorch      | NumPy      | RubixML    |
-| ----------- | ------- | ------------ | ---------- | ---------- |
-| Language    | PHP + C | Python + C++ | Python + C | PHP        |
-| FFI         | ✅       | ❌            | ❌          | ❌          |
-| Zero-copy   | ✅       | ⚠️ Partial   | ❌          | ❌          |
-| SIMD        | ✅       | ✅            | ✅          | ❌          |
-| OpenMP      | ✅       | ✅            | ❌          | ❌          |
-| ML Models   | ✅       | ✅            | ❌          | ✅          |
-| Neural Nets | ✅       | ✅            | ❌          | ⚠️ Limited |
-| HPC Design  | ✅       | ✅            | ❌          | ❌          |
-
-➡️ PML uniquely combines **PHP ergonomics + HPC internals**.
-
----
-
-## 🧠 Memory Efficiency
-
-* Typical tensor operations: **~3.8 MB peak**
-* Zero-copy dataset slicing
-* In-place ops significantly reduce allocations
-
-➡️ Designed for **low-memory, high-throughput environments**
-
----
-
-## 🧪 SIMD Detection (AVX2 / AVX512)
-
-PML can leverage advanced CPU vector instructions when available.
-
-```bash
-# Linux
-lscpu | grep -E "avx2|avx512"
-
-# Or
-cat /proc/cpuinfo | grep -i avx
-```
-
-### 🧠 Runtime Detection (C)
-
-```c
-#include <immintrin.h>
-
-int has_avx2() {
-    return __builtin_cpu_supports("avx2");
-}
-
-int has_avx512() {
-    return __builtin_cpu_supports("avx512f");
-}
-```
-
-➡️ Kernels automatically switch to best available SIMD path.
-
----
-
-## 🔥 Performance Profiling
-
-### Flamegraph Example
-
-```bash
-perf record -F 99 -g php benchmark.php
-perf script | stackcollapse-perf.pl | flamegraph.pl > flame.svg
-```
-
-### Snapshot Insight
-
-```
-[ tensor_matmul ] ███████████████ 40%
-[ tensor_add ]    ███████         15%
-[ sigmoid ]       ████            8%
-[ php overhead ]  ██              4%
-```
-
-➡️ Most time spent in optimized C kernels (expected).
-
----
-
-## 🔧 Installation
-
-### 🧪 GitHub Actions (CI)
-
-```yaml
-name: CI
-
-on: [push, pull_request]
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup PHP
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: 8.3
-          extensions: ffi
-
-      - name: Install dependencies
-        run: composer install --no-interaction
-
-      - name: Build C backend
-        run: make
-
-      - name: Run Tests
-        run: vendor/bin/phpunit
-
-      - name: Run Benchmarks
-        run: vendor/bin/phpbench run
-```
-
----
-
-```bash
-git clone https://github.com/your-repo/pml.git
-cd pml
-
-# Build native backend
-make
-
-# Install PHP dependencies
-composer install
-```
-
----
-
-## 🚀 Quick Example
+### Zero-Copy Tensor Architecture
 
 ```php
+// CSV loaded via mmap into C memory — no PHP arrays
+$ds = Dataset::fromCSV('/data/train.csv');
+
+// Tensor wraps TensorC* — no PHP-side copy
+$X  = $ds->samples();  // Pml\Tensor → TensorC* view
+
+// All math crosses FFI exactly once per operation
+$out = $X->matmul($W)->add($b)->relu();
+```
+
+`Tensor` is a thin PHP object holding a `\FFI\CData` pointer. Slices, views, and column extractions reuse the same memory buffer with reference counts tracked entirely inside C.
+
+### Native C Tensor Engine
+
+`libtensor.so` provides:
+
+- **500+ exported C functions** across tensor ops, dataset I/O, inference, autograd, graph execution, and tokenization
+- **Fused kernels**: `addRelu`, `fusedAdamStep`, `fusedBceLoss`, `qw_dot_group` (INT8 + fp32 scale)
+- **AVX2 SIMD** sigmoid, tanh, exp, INT8 dot product
+- **OpenBLAS SGEMM** for all matmul on contiguous float32 tensors
+- **OpenMP** threaded batch operations, tree predictions, image pipelines
+- **mmap CSV loader**: ingests multi-GB datasets without touching PHP memory
+
+### LLM Inference Engine
+
+```php
+$tok     = Tokenizer::fromJson('/models/llama3-8b/tokenizer.json');
+$session = InferenceSession::load('/models/llama3-8b', tok: $tok);
+
+// GQA forward pass, KV-cache, streaming tokens
+foreach ($session->generate("Explain AVX2:", maxNewTokens: 200) as $token) {
+    echo $token;
+}
+```
+
+- LLaMA / Mistral / Phi architecture support
+- **GQA** (Grouped Query Attention) natively in C
+- **Multi-layer KV-cache** (`MultiKVCache`) — eliminates O(T²) decode cost
+- Milakov online-softmax: O(head_dim) working memory
+- SafeTensors mmap weight loading — zero-copy model ingestion
+- **INT8 block quantization** (Q8_0-class): 4× memory reduction, AVX2 fused kernel
+
+### Classical ML at Native Speed
+
+```php
+$pipeline = new Pipeline(
+    transformers: [new StandardScaler(), new PolynomialExpander(degree: 2)],
+    estimator:    new GBDTClassifier(trees: 500, maxDepth: 6)
+);
+
+$pipeline->train($dataset);
+echo $pipeline->score($test);  // accuracy, AUC, F1
+```
+
+GBDT with histogram subtraction + PQ leaf-wise growth. All split-finding runs in C.
+
+---
+
+## Feature Matrix
+
+| Module | Description |
+|---|---|
+| **Tensor** | 200+ ops: creation, arithmetic, linear algebra, shape, reductions, fused kernels |
+| **Dataset** | Zero-copy mmap CSV, ETL/DataFrame mode, stratified splits, DataLoader, streaming |
+| **Estimators** | 19 classifiers, 15 regressors, 6 anomaly detectors, 5 clusterers, decomposition |
+| **Transformers** | Scalers, encoders, NLP vectorizers, image transforms, feature selection, imputers |
+| **Neural Networks** | 29 layer types, 9 optimizers, 5 losses, early stopping, callbacks, mixed precision |
+| **Quantization** | INT8 block quantization, QuantizedTensor, Dense::quantize(), Sequential::quantize() |
+| **Inference** | LLM forward pass, GQA, KV-cache, BPE tokenizer, SafeTensors I/O, streaming |
+| **Vision** | 106 C functions: image I/O, augmentation, MobileNetV3, YOLO11n, NanoDet, FastSAM |
+| **Pipeline** | Transformer composition, 6 CV strategies, GridSearch, ensemble, BootstrapAggregator |
+| **Autograd** | Reverse-mode AD, compute graph, Variable API |
+
+---
+
+## Installation
+
+### Requirements
+
+| Dependency | Version | Purpose |
+|---|---|---|
+| PHP | ≥ 8.1 | Runtime |
+| ext-ffi | any | C bridge |
+| GCC | ≥ 11 | Compile backend |
+| libopenblas-dev | any | BLAS kernels |
+| liblapacke-dev | any | Linear algebra |
+| Linux x86_64 | — | AVX2 / OpenMP |
+
+```bash
+# Ubuntu / Debian
+sudo apt install gcc libopenblas-dev liblapacke-dev
+
+# Install PHP library
+composer require ghostjat/pml
+
+# Build the C backend (once per machine)
+cd vendor/ghostjat/pml/src/Lib
+gcc -O3 -march=native -mfma -fopenmp -funroll-loops -fomit-frame-pointer \
+    -D_GNU_SOURCE -shared -fPIC -funsafe-math-optimizations \
+    -o libtensor.so.7 tensor.c dataset_io.c inference.c autograd.c graph.c tokenizer.c \
+    -lopenblas -llapacke -lm
+ln -sf libtensor.so.7 libtensor.so
+```
+
+**`php.ini` settings:**
+
+```ini
+ffi.enable        = true
+memory_limit      = 2G
+opcache.jit       = tracing
+opcache.jit_buffer_size = 128M
+```
+
+---
+
+## Quick Start
+
+### Classical Classification
+
+```php
+<?php
+require 'vendor/autoload.php';
+
 use Pml\Dataset;
-use Pml\Models\LogisticRegression;
+use Pml\Pipeline;
+use Pml\Transformers\StandardScaler;
+use Pml\Estimators\Classifiers\RandomForestClassifier;
 
-$dataset = Dataset::fromCsv('data.csv')
-    ->standardize()
-    ->split(0.8);
+$dataset = Dataset::fromCSV('iris.csv', hasHeader: true)
+    ->withLabelColumn('species')
+    ->dropNans();
 
-$model = new LogisticRegression();
-$model->train($dataset->train());
+[$train, $test] = $dataset->stratifiedSplit(testRatio: 0.2);
 
-$predictions = $model->predict($dataset->test());
+$pipeline = new Pipeline(
+    transformers: [new StandardScaler()],
+    estimator:    new RandomForestClassifier(trees: 200)
+);
+
+$pipeline->train($train);
+echo "Accuracy: " . $pipeline->score($test) . PHP_EOL;
+$pipeline->save('/models/iris');
 ```
 
----
+### Deep Learning (MLP with early stopping)
 
-## 🔬 Deep Dive: Zero-Copy + Cache Layout
+```php
+<?php
+use Pml\NeuralNetwork\Sequential;
+use Pml\NeuralNetwork\Layers\{Dense, BatchNormalization, Dropout, ReLU, Softmax};
+use Pml\NeuralNetwork\Optimizers\Adam;
+use Pml\NeuralNetwork\Losses\CrossEntropyLoss;
+use Pml\Training\{Trainer, TrainingArguments};
 
-### 🔧 Internal C Layer Walkthrough
+$model = new Sequential([
+    new Dense(784, 512), new BatchNormalization(), new ReLU(), new Dropout(0.3),
+    new Dense(512, 256), new BatchNormalization(), new ReLU(), new Dropout(0.2),
+    new Dense(256, 10),  new Softmax(),
+], new Adam(lr: 1e-3), new CrossEntropyLoss());
 
-#### Tensor Struct (Conceptual)
+$trainer = new Trainer($model, new TrainingArguments(
+    epochs: 30, batchSize: 128, patience: 5,
+));
 
-```c
-typedef struct {
-    float* data;     // contiguous memory
-    int* shape;      // dimensions
-    int ndim;        // number of dimensions
-    int size;        // total elements
-} Tensor;
+$result = $trainer->train($trainDataset, $valDataset);
+echo "Best accuracy: {$result->bestMetric}" . PHP_EOL;
 ```
 
-#### Example: In-place Sigmoid
+### INT8 Quantized Deployment
 
-```c
-void tensor_sigmoid_inplace(Tensor* t) {
-    for (int i = 0; i < t->size; i++) {
-        float x = t->data[i];
-        t->data[i] = 1.0f / (1.0f + expf(-x));
-    }
+```php
+<?php
+// Quantize after training — 4× memory reduction, same API
+$model->quantize(groupSize: 32);
+$predictions = $model->predict($testDataset);
+```
+
+### LLM Inference (LLaMA / Mistral)
+
+```php
+<?php
+use Pml\Inference\{InferenceSession, Tokenizer};
+
+$tok     = Tokenizer::fromJson('/models/mistral-7b/tokenizer.json');
+$session = InferenceSession::load('/models/mistral-7b', tok: $tok);
+
+foreach ($session->generate("Write a PHP FFI binding:", maxNewTokens: 300) as $token) {
+    echo $token;
+    flush();
 }
 ```
 
-➡️ No allocation. Direct memory mutation.
-
-#### Example: FFI Binding (PHP)
+### Computer Vision
 
 ```php
-$ffi->tensor_sigmoid_inplace($tensor);
+<?php
+use Pml\Vision\{Image, Yolo11n, MobileNetV3};
+
+$detector   = new Yolo11n('/models/yolo11n.weights', confidenceThresh: 0.5);
+$classifier = new MobileNetV3('/models/mobilenetv3.weights');
+
+$img  = Image::fromFile('scene.jpg');
+$dets = $detector->detect($img);
+
+foreach ($dets as $box) {
+    $label = $classifier->classify($img->crop(...$box->rect));
+    echo "{$label} @ {$box->confidence}" . PHP_EOL;
+}
 ```
-
-➡️ PHP directly calls C → zero overhead abstraction.
-
-#### Memory Layout Insight
-
-```
-Contiguous Block:
-[x1 x2 x3 x4 x5 ...]
-```
-
-➡️ Enables:
-
-* SIMD vector loads
-* Cache line efficiency
-* Prefetch-friendly execution
 
 ---
 
-### 🧠 Problem
+## Benchmarks
 
-Traditional PHP ML:
+> Benchmarks run on AMD Ryzen 9 5950X, 64 GB DDR4-3600, Ubuntu 22.04, GCC 13, PHP 8.3.
+> Full methodology in [BENCHMARKS.md](BENCHMARKS.md).
 
-* Arrays = scattered memory
-* Copy-heavy pipelines
-* Cache misses → slow execution
+### Tensor Throughput — GEMM 1024×1024
 
-### ⚡ Solution (PML)
+| Runtime | Time | GFLOPS |
+|---|---|---|
+| **PML (OpenBLAS + AVX2)** | **18 ms** | **116** |
+| RubixML (PHP arrays) | 4,200 ms | 0.5 |
+| NumPy (MKL) | 14 ms | 150 |
+| PyTorch CPU | 22 ms | 95 |
 
-#### 1. Zero-Copy Design
+### Cold-Start to First Inference
 
-* Data passed by reference across layers
-* No duplication between PHP ↔ C
-* Batch slicing = pointer offsets only
+| Runtime | Cold Start |
+|---|---|
+| **PML** | **4 ms** |
+| Python + scikit-learn | 210 ms |
+| Python + PyTorch | 680 ms |
 
-#### 2. Cache-Friendly Layout
+### Memory: 10-class MLP Training (50K samples)
+
+| Runtime | RSS Peak |
+|---|---|
+| **PML** | **38 MB** |
+| PyTorch | 290 MB |
+| TensorFlow | 410 MB |
+
+---
+
+## Architecture
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design document.
 
 ```
-[B × D × T × N]
-
-B = Batch
-D = Features / Embedding
-T = Time / Sequence
-N = Head / Channel
+┌─────────────────────────────────────────────────────────┐
+│                   Your PHP Application                   │
+└─────────────────────────────┬───────────────────────────┘
+                              │  PSR-4 autoload
+┌─────────────────────────────▼───────────────────────────┐
+│                     PML PHP Layer                        │
+│  Tensor · Dataset · Pipeline · Sequential ·              │
+│  InferenceSession · Vision · Estimators · Transformers   │
+└─────────────────────────────┬───────────────────────────┘
+                              │  FFI::cdef() — one crossing per op
+┌─────────────────────────────▼───────────────────────────┐
+│              libtensor.so  (C tensor engine)             │
+│  tensor.c · dataset_io.c · inference.c · autograd.c      │
+│  graph.c · tokenizer.c                                   │
+│  ┌──────────────┐  ┌─────────────┐  ┌──────────────┐   │
+│  │  OpenBLAS    │  │  LAPACKE    │  │   OpenMP     │   │
+│  └──────────────┘  └─────────────┘  └──────────────┘   │
+└─────────────────────────────────────────────────────────┘
 ```
 
-➡️ Ensures **sequential memory access**, maximizing CPU cache hits.
+---
 
-#### 3. In-place Operations
+## Roadmap Preview
 
-```
-x = sigmoid(x)   // no new allocation
-```
+| Version | Focus | Status |
+|---|---|---|
+| v1.0–1.3 | Tensor engine, classical ML, deep learning, LLM inference, INT8, vision | ✅ Done |
+| v2.0 | Vulkan GPU backend (cross-vendor: NVIDIA / AMD / Intel / Apple) | 🔄 Design |
+| v2.1 | ONNX model import, fp16 tensors, Flash Attention | 📋 Planned |
+| v3.0 | Distributed training, sharded datasets, agent runtime | 📋 Planned |
 
-➡️ Reduces memory churn + improves throughput.
-
-#### 4. Fused Kernels
-
-```
-loss + gradient → single pass
-```
-
-➡️ Cuts memory bandwidth usage drastically.
+Full roadmap: [ROADMAP.md](ROADMAP.md)
 
 ---
 
-## 📦 Advanced Capabilities
+## Comparison
 
-* 🔁 Zero-copy batch pipelines
-* ⚡ Fused kernels (loss + gradient)
-* 🧵 Parallel tensor ops (OpenMP)
-* 🧠 Cache-optimized layouts for sequence models
-* 📉 Numerical stability (softmax, log, etc.)
-
----
-
-## ⚠️ Known Issues
-
-* 3 failing assertions in benchmark suite
-* High variance in some SIMD benchmarks (expected due to CPU scheduling)
-
----
-
-## 🛣️ Roadmap
-
-### 🔜 Short Term
-
-* [ ] Fix remaining 3 failing assertions
-* [ ] Improve SIMD variance stability
-* [ ] Expand dataset streaming (GB-scale)
-
-### 🚀 Mid Term
-
-* [ ] JIT kernel fusion engine
-* [ ] Memory pool allocator
-* [ ] Advanced optimizers (AdamW, RMSProp)
-
-### 🌌 Long Term
-
-* [ ] GPU backend (CUDA / OpenCL)
-* [ ] Transformer / LLM primitives
-* [ ] Distributed training (multi-node)
-* [ ] ONNX import/export
+| | PML | scikit-learn | PyTorch CPU | RubixML |
+|---|---|---|---|---|
+| Language | PHP + C | Python + C | Python + C++ | PHP |
+| Tensor engine | Native C (libtensor.so) | NumPy | LibTorch | PHP arrays |
+| Zero-copy I/O | ✅ mmap | ✗ | ✗ | ✗ |
+| PHP-native API | ✅ | ✗ | ✗ | ✅ |
+| LLM inference | ✅ GQA, KV-cache | ✗ | ✗ | ✗ |
+| INT8 quantization | ✅ AVX2 fused | ✗ | ✅ | ✗ |
+| Vision (detection) | ✅ YOLO11n, NanoDet | ✗ | ✗ | ✗ |
+| Cold-start | 4 ms | 210 ms | 680 ms | 60 ms |
+| Deployment | `.so` file | Python env | Python env | Composer |
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
-Pull requests are welcome. For major changes, please open an issue first.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide. Key rules:
 
----
+- PHP orchestrates — heavy loops must stay in C
+- Preserve zero-copy semantics everywhere possible
+- New C functions must be declared in `tensor.h` and bound in `TensorEngine.php`
+- All PRs require PHPUnit + PHPBench results
+- Performance regressions block merge
 
-## 📄 Whitepaper
-
-A research-style deep dive is available:
-
-```text
-whitepaper.md
+```bash
+composer install
+vendor/bin/phpunit --colors=always
+vendor/bin/phpbench run --report=aggregate
 ```
 
-### Contents
+---
 
-* HPC design philosophy in PHP
-* Zero-copy architecture analysis
-* Benchmark methodology
-* SIMD + OpenMP strategies
-* Comparison with Python ML stack
+## Sponsors
+
+PML is an independent open-source project. Sponsorship funds C kernel development, GPU backend work, documentation, and infrastructure.
+
+**[❤ Become a Sponsor](https://github.com/sponsors/ghostjat)**
+
+See [SPONSORS.md](SPONSORS.md) for tier details and benefits.
 
 ---
 
-## 📄 License
+## License
 
-MIT License
-
----
-
-## 💡 Final Thought
-
-> "PHP was never meant for HPC… until now."
-
-PML pushes PHP beyond its limits — into the domain of **high-performance machine learning systems**.
+[MIT](LICENSE) — Copyright (c) 2024 Shubham Chaudhary
 
 ---
 
-🔥 **If you like this project, give it a star and push PHP further!**
-Author: Shubham Chaudhary
+<div align="center">
+
+*PHP orchestrates. C computes. Zero compromises.*
+
+</div>

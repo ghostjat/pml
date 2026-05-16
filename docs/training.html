@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Training System — PML Framework</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav id="sidebar">
+  <div class="sidebar-header">
+    <a href="index.html" class="logo">PML Framework</a>
+    <div class="version">v7.0 · PHP 8.2+ · FFI/C Backend</div>
+  </div>
+  <div class="sidebar-search"><input type="text" id="nav-search" placeholder="Filter pages..." autocomplete="off"></div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Overview</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="index.html" class="nav-link">Home</a>
+      <a href="getting-started.html" class="nav-link">Getting Started</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Core</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="tensor.html" class="nav-link">Tensor</a>
+      <a href="dataset.html" class="nav-link">Dataset &amp; DataFrame</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Estimators</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="estimators.html#classifiers" class="nav-link">Classifiers</a>
+      <a href="estimators.html#regressors" class="nav-link">Regressors</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Transformers</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="transformers.html" class="nav-link">All Transformers</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Neural Networks</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="neural-network.html" class="nav-link">Sequential &amp; Layers</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Training</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="training.html#trainer" class="nav-link active">Trainer</a>
+      <a href="training.html#args" class="nav-link active">TrainingArguments</a>
+      <a href="training.html#lr" class="nav-link active">LR Scheduler</a>
+      <a href="training.html#scaler" class="nav-link active">GradScaler</a>
+      <a href="training.html#early" class="nav-link active">Early Stopping</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Inference &amp; LLM</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="inference.html" class="nav-link">InferenceSession</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Vision</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="vision.html" class="nav-link">Vision Module</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Pipeline &amp; CV</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="pipeline.html" class="nav-link">Pipeline &amp; CV</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Roadmap</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="roadmap.html" class="nav-link">Vulkan GPU Support</a></div>
+  </div>
+</nav>
+
+<div id="main">
+  <div class="topbar">
+    <div class="topbar-breadcrumb"><a href="index.html">PML</a> / Training System</div>
+    <div class="topbar-links"><a href="inference.html">Inference →</a></div>
+  </div>
+
+  <div class="content">
+    <div class="page-hero">
+      <span class="page-tag">Training</span>
+      <h1>Training System</h1>
+      <p class="page-lead">
+        The high-level <code>Trainer</code> + <code>TrainingArguments</code> API orchestrates
+        epoch loops, LR scheduling, early stopping, gradient clipping, checkpointing, and callbacks
+        for <code>Sequential</code> models.
+      </p>
+    </div>
+
+    <div class="toc-inline">
+      <h5>On this page</h5>
+      <ol>
+        <li><a href="#trainer">Trainer</a></li>
+        <li><a href="#args">TrainingArguments</a></li>
+        <li><a href="#lr">LRScheduler</a></li>
+        <li><a href="#scaler">GradScaler</a></li>
+        <li><a href="#early">EarlyStopping</a></li>
+        <li><a href="#callbacks">Callbacks</a></li>
+        <li><a href="#result">TrainingResult</a></li>
+        <li><a href="#example">Full Example</a></li>
+      </ol>
+    </div>
+
+    <!-- ── Trainer ─────────────────────────────────────────────── -->
+    <h2 id="trainer">Trainer</h2>
+    <p>
+      <code>Pml\Training\Trainer</code> is the high-level training orchestrator.
+      It wraps a <code>Sequential</code> model and a <code>TrainingArguments</code> config,
+      runs the epoch loop, calls LR scheduler, handles early stopping, saves checkpoints,
+      and fires callbacks at each lifecycle event.
+    </p>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">__construct</span>
+        <span class="method-sig">(Sequential $model, TrainingArguments $args)</span>
+      </div>
+      <div class="api-block-body">
+        <p>Binds the model and args. If the model's optimizer implements <code>LearningRateAware</code>, the LR is synced to <code>$args->learningRate</code> immediately.</p>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">train</span>
+        <span class="method-sig">(Dataset $dataset, ?Dataset $validation = null): TrainingResult</span>
+      </div>
+      <div class="api-block-body">
+        <p>Runs the full training loop. Returns a <code>TrainingResult</code> with loss history and best-epoch metadata.</p>
+        <pre><code><span class="va">$args</span> = <span class="kw">new</span> <span class="ty">TrainingArguments</span>(
+    epochs:       <span class="nu">30</span>,
+    batchSize:    <span class="nu">128</span>,
+    learningRate: <span class="nu">3e-4</span>,
+    lrSchedule:   <span class="st">'cosine'</span>,
+    patience:     <span class="nu">5</span>,
+    outputDir:    <span class="st">'ckpt/run1'</span>,
+);
+
+<span class="va">$trainer</span> = <span class="kw">new</span> <span class="ty">Trainer</span>(<span class="va">$model</span>, <span class="va">$args</span>);
+<span class="va">$trainer</span>-><span class="fn">addCallback</span>(<span class="kw">new</span> <span class="ty">MyCallback</span>());
+<span class="va">$result</span> = <span class="va">$trainer</span>-><span class="fn">train</span>(<span class="va">$trainDs</span>, <span class="va">$valDs</span>);</code></pre>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">addCallback</span>
+        <span class="method-sig">(TrainerCallback $callback): void</span>
+      </div>
+      <div class="api-block-body">
+        <p>Registers a callback. Multiple callbacks can be added; they fire in registration order.</p>
+      </div>
+    </div>
+
+    <!-- ── TrainingArguments ───────────────────────────────────── -->
+    <h2 id="args">TrainingArguments</h2>
+    <p>Value object holding all training hyperparameters. All properties are <code>readonly</code>.</p>
+
+    <table>
+      <thead><tr><th>Property</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>epochs</code></td><td>int</td><td>10</td><td>Training epochs</td></tr>
+        <tr><td><code>batchSize</code></td><td>int</td><td>32</td><td>Mini-batch size</td></tr>
+        <tr><td><code>patience</code></td><td>int</td><td>0</td><td>Early stopping patience (0 = disabled)</td></tr>
+        <tr><td><code>minDelta</code></td><td>float</td><td>1e-4</td><td>Minimum improvement to reset patience counter</td></tr>
+        <tr><td><code>learningRate</code></td><td>float</td><td>0.001</td><td>Initial learning rate</td></tr>
+        <tr><td><code>lrSchedule</code></td><td>string</td><td>'none'</td><td><code>'none'</code> · <code>'cosine'</code> · <code>'step'</code> · <code>'linear'</code></td></tr>
+        <tr><td><code>lrDecay</code></td><td>float</td><td>0.1</td><td>Decay factor for <code>'step'</code> schedule</td></tr>
+        <tr><td><code>lrStepSize</code></td><td>int</td><td>5</td><td>Epochs between LR drops (step schedule)</td></tr>
+        <tr><td><code>warmupEpochs</code></td><td>int</td><td>0</td><td>Linear warm-up epochs from 0 → learningRate</td></tr>
+        <tr><td><code>mixedPrecision</code></td><td>bool</td><td>false</td><td>Scaffold for future AMP support</td></tr>
+        <tr><td><code>outputDir</code></td><td>?string</td><td>null</td><td>Directory for checkpoints (null = no auto-save)</td></tr>
+      </tbody>
+    </table>
+
+    <pre><code><span class="va">$args</span> = <span class="kw">new</span> <span class="ty">TrainingArguments</span>(
+    epochs:        <span class="nu">100</span>,
+    batchSize:     <span class="nu">64</span>,
+    learningRate:  <span class="nu">1e-3</span>,
+    lrSchedule:    <span class="st">'cosine'</span>,
+    warmupEpochs:  <span class="nu">5</span>,
+    patience:      <span class="nu">10</span>,
+    outputDir:     <span class="st">'ckpt/mymodel'</span>,
+);</code></pre>
+
+    <!-- ── LRScheduler ────────────────────────────────────────── -->
+    <h2 id="lr">LRScheduler</h2>
+    <p>
+      <code>Pml\Training\LRScheduler</code> adjusts the optimizer's learning rate each epoch
+      based on the schedule set in <code>TrainingArguments</code>.
+      Used internally by <code>Trainer</code>; you can also use it directly in custom loops.
+    </p>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">__construct</span>
+        <span class="method-sig">(Sequential $model, TrainingArguments $args)</span>
+      </div>
+      <div class="api-block-body">
+        <p>Binds to the model's optimizer. Only works if the optimizer implements <code>LearningRateAware</code>.</p>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">step</span>
+        <span class="method-sig">(int $epoch, int $totalEpochs): void</span>
+      </div>
+      <div class="api-block-body">
+        <p>Computes the LR for the current epoch and sets it on the optimizer. Call at the start of each epoch.</p>
+      </div>
+    </div>
+
+    <h4>Schedule formulas</h4>
+    <table>
+      <thead><tr><th>Schedule</th><th>Formula</th></tr></thead>
+      <tbody>
+        <tr><td><code>none</code></td><td>LR unchanged</td></tr>
+        <tr><td><code>cosine</code></td><td>lr × ½(1 + cos(π × epoch/totalEpochs))</td></tr>
+        <tr><td><code>step</code></td><td>lr × decay^(epoch / stepSize)</td></tr>
+        <tr><td><code>linear</code></td><td>lr × (1 − epoch/totalEpochs)</td></tr>
+      </tbody>
+    </table>
+
+    <p>All schedules are preceded by a linear warm-up if <code>warmupEpochs &gt; 0</code>.</p>
+
+    <!-- ── GradScaler ─────────────────────────────────────────── -->
+    <h2 id="scaler">GradScaler</h2>
+    <p>
+      <code>Pml\Training\GradScaler</code> implements dynamic loss scaling for mixed-precision training.
+      Currently a scaffold — useful for fp32 training on systems that benefit from gradient scaling
+      to prevent underflow. Full fp16/bf16 support requires GPU backend.
+    </p>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">__construct</span>
+        <span class="method-sig">(bool $enabled = false, float $initScale = 65536.0, float $growthFactor = 2.0, float $backoffFactor = 0.5, int $growthInterval = 2000)</span>
+      </div>
+      <div class="api-block-body">
+        <p>Loss scaling is disabled by default. Enable for mixed-precision training.</p>
+      </div>
+    </div>
+
+    <table>
+      <thead><tr><th>Method</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>scale(Tensor $lossGrad): Tensor</code></td><td>Multiplies gradient by current scale factor</td></tr>
+        <tr><td><code>unscaleAndStep(Optimizer $opt, Layer[] $layers): void</code></td><td>Unscales all gradients, checks for NaN/Inf, then calls optimizer step if valid</td></tr>
+        <tr><td><code>update(): void</code></td><td>Adjusts scale factor: grows if no overflow for <code>growthInterval</code> steps, backs off on overflow</td></tr>
+        <tr><td><code>currentScale(): float</code></td><td>Current scale value</td></tr>
+        <tr><td><code>isEnabled(): bool</code></td><td></td></tr>
+      </tbody>
+    </table>
+
+    <pre><code><span class="va">$scaler</span> = <span class="kw">new</span> <span class="ty">GradScaler</span>(enabled: <span class="kw">true</span>);
+
+<span class="kw">foreach</span> (<span class="va">$loader</span>-><span class="fn">batches</span>() <span class="kw">as</span> <span class="va">$batch</span>) {
+    <span class="va">$preds</span> = <span class="va">$model</span>-><span class="fn">forward</span>(<span class="va">$batch</span>-><span class="fn">samples</span>());
+    <span class="va">$grad</span>  = <span class="va">$model</span>-><span class="fn">getLoss</span>()-><span class="fn">differentiate</span>(<span class="va">$preds</span>, <span class="va">$batch</span>-><span class="fn">labels</span>());
+    <span class="va">$grad</span>  = <span class="va">$scaler</span>-><span class="fn">scale</span>(<span class="va">$grad</span>);
+    <span class="va">$model</span>-><span class="fn">backward</span>(<span class="va">$grad</span>);
+    <span class="va">$scaler</span>-><span class="fn">unscaleAndStep</span>(<span class="va">$model</span>-><span class="fn">getOptimizer</span>(), <span class="va">$model</span>-><span class="fn">getLayers</span>());
+    <span class="va">$scaler</span>-><span class="fn">update</span>();
+}</code></pre>
+
+    <!-- ── EarlyStopping ───────────────────────────────────────── -->
+    <h2 id="early">EarlyStopping</h2>
+    <p>
+      <code>Pml\NeuralNetwork\EarlyStopping</code> monitors a metric (typically validation loss)
+      and signals when training should stop. Used internally by <code>Sequential::train()</code>
+      and <code>Trainer</code>. Can also be used standalone in custom loops.
+    </p>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">__construct</span>
+        <span class="method-sig">(int $patience, string $mode = 'min', float $minDelta = 1e-4)</span>
+      </div>
+      <div class="api-block-body">
+        <p><code>mode</code>: <code>'min'</code> for loss (lower is better), <code>'max'</code> for accuracy.</p>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">update</span>
+        <span class="method-sig">(float $metric): int</span>
+        <span class="return-type">int (signal)</span>
+      </div>
+      <div class="api-block-body">
+        <p>Returns one of three constants:</p>
+        <table>
+          <thead><tr><th>Constant</th><th>Value</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>EarlyStopping::IMPROVED</code></td><td>1</td><td>Metric improved — save a checkpoint</td></tr>
+            <tr><td><code>EarlyStopping::CONTINUE</code></td><td>0</td><td>No improvement, but still within patience</td></tr>
+            <tr><td><code>EarlyStopping::STOP</code></td><td>-1</td><td>Patience exhausted — stop training</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <table>
+      <thead><tr><th>Method</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>getBestMetric(): float</code></td><td>Best metric value seen so far</td></tr>
+        <tr><td><code>getCounter(): int</code></td><td>Epochs since last improvement</td></tr>
+        <tr><td><code>reset(): void</code></td><td>Resets counter and best metric</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Callbacks ──────────────────────────────────────────── -->
+    <h2 id="callbacks">Callbacks</h2>
+    <p>Implement <code>Pml\Training\TrainerCallback</code> to hook into training lifecycle events:</p>
+
+    <pre><code><span class="kw">interface</span> <span class="ty">TrainerCallback</span>
+{
+    <span class="kw">public function</span> <span class="fn">onTrainBegin</span>(<span class="ty">TrainingArguments</span> <span class="va">$args</span>, <span class="kw">int</span> <span class="va">$steps</span>): <span class="kw">void</span>;
+    <span class="kw">public function</span> <span class="fn">onEpochBegin</span>(<span class="kw">int</span> <span class="va">$epoch</span>, <span class="kw">int</span> <span class="va">$epochs</span>): <span class="kw">void</span>;
+    <span class="kw">public function</span> <span class="fn">onBatchEnd</span>(<span class="kw">int</span> <span class="va">$step</span>, <span class="kw">float</span> <span class="va">$batchLoss</span>): <span class="kw">void</span>;
+    <span class="kw">public function</span> <span class="fn">onEpochEnd</span>(<span class="kw">int</span> <span class="va">$epoch</span>, <span class="kw">float</span> <span class="va">$trainLoss</span>, ?<span class="kw">float</span> <span class="va">$valLoss</span>): <span class="kw">void</span>;
+    <span class="kw">public function</span> <span class="fn">onTrainEnd</span>(<span class="ty">TrainingResult</span> <span class="va">$result</span>): <span class="kw">void</span>;
+}</code></pre>
+
+    <pre><code><span class="kw">class</span> <span class="ty">WandbCallback</span> <span class="kw">implements</span> <span class="ty">TrainerCallback</span>
+{
+    <span class="kw">public function</span> <span class="fn">onEpochEnd</span>(<span class="kw">int</span> <span class="va">$epoch</span>, <span class="kw">float</span> <span class="va">$trainLoss</span>, ?<span class="kw">float</span> <span class="va">$valLoss</span>): <span class="kw">void</span>
+    {
+        <span class="cm">// Log to W&B, TensorBoard, Redis, etc.</span>
+        <span class="fn">file_put_contents</span>(<span class="st">'logs/loss.ndjson'</span>,
+            <span class="fn">json_encode</span>([<span class="st">'epoch'</span> => <span class="va">$epoch</span>, <span class="st">'train'</span> => <span class="va">$trainLoss</span>, <span class="st">'val'</span> => <span class="va">$valLoss</span>]) . <span class="st">"\n"</span>,
+            <span class="va">FILE_APPEND</span>
+        );
+    }
+
+    <span class="kw">public function</span> <span class="fn">onTrainBegin</span>(<span class="ty">TrainingArguments</span> <span class="va">$args</span>, <span class="kw">int</span> <span class="va">$steps</span>): <span class="kw">void</span> {}
+    <span class="kw">public function</span> <span class="fn">onEpochBegin</span>(<span class="kw">int</span> <span class="va">$e</span>, <span class="kw">int</span> <span class="va">$t</span>): <span class="kw">void</span> {}
+    <span class="kw">public function</span> <span class="fn">onBatchEnd</span>(<span class="kw">int</span> <span class="va">$s</span>, <span class="kw">float</span> <span class="va">$l</span>): <span class="kw">void</span> {}
+    <span class="kw">public function</span> <span class="fn">onTrainEnd</span>(<span class="ty">TrainingResult</span> <span class="va">$r</span>): <span class="kw">void</span> {}
+}</code></pre>
+
+    <!-- ── TrainingResult ─────────────────────────────────────── -->
+    <h2 id="result">TrainingResult</h2>
+    <p>Returned by <code>Trainer::train()</code>.</p>
+    <table>
+      <thead><tr><th>Property</th><th>Type</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>trainLossHistory</code></td><td><code>float[]</code></td><td>Per-epoch average training loss</td></tr>
+        <tr><td><code>valLossHistory</code></td><td><code>float[]</code></td><td>Per-epoch validation loss (if validation provided)</td></tr>
+        <tr><td><code>bestEpoch</code></td><td><code>int</code></td><td>Epoch where best validation loss occurred</td></tr>
+        <tr><td><code>bestValLoss</code></td><td><code>float</code></td><td>Best validation loss value</td></tr>
+        <tr><td><code>stoppedEarly</code></td><td><code>bool</code></td><td>Whether early stopping triggered</td></tr>
+        <tr><td><code>totalEpochs</code></td><td><code>int</code></td><td>Actual epochs run</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Full Example ───────────────────────────────────────── -->
+    <h2 id="example">Full Example</h2>
+    <pre><code><span class="kw">use</span> <span class="ty">Pml\NeuralNetwork\Sequential</span>;
+<span class="kw">use</span> <span class="ty">Pml\NeuralNetwork\Layers\{Dense, LayerNorm, Gelu, Dropout}</span>;
+<span class="kw">use</span> <span class="ty">Pml\NeuralNetwork\Optimizers\AdamW</span>;
+<span class="kw">use</span> <span class="ty">Pml\Losses\CategoricalCrossEntropy</span>;
+<span class="kw">use</span> <span class="ty">Pml\Training\{Trainer, TrainingArguments}</span>;
+<span class="kw">use</span> <span class="ty">Pml\Dataset</span>;
+
+<span class="va">$model</span> = <span class="kw">new</span> <span class="ty">Sequential</span>(
+    layers: [
+        <span class="kw">new</span> <span class="ty">Dense</span>(<span class="nu">512</span>, <span class="nu">256</span>),
+        <span class="kw">new</span> <span class="ty">LayerNorm</span>(<span class="nu">256</span>),
+        <span class="kw">new</span> <span class="ty">Gelu</span>(),
+        <span class="kw">new</span> <span class="ty">Dropout</span>(<span class="nu">0.1</span>),
+        <span class="kw">new</span> <span class="ty">Dense</span>(<span class="nu">256</span>, <span class="nu">10</span>),
+    ],
+    lossFn:    <span class="kw">new</span> <span class="ty">CategoricalCrossEntropy</span>(),
+    optimizer: <span class="kw">new</span> <span class="ty">AdamW</span>(learningRate: <span class="nu">3e-4</span>, weightDecay: <span class="nu">0.01</span>),
+);
+
+<span class="va">$args</span> = <span class="kw">new</span> <span class="ty">TrainingArguments</span>(
+    epochs:       <span class="nu">50</span>,
+    batchSize:    <span class="nu">256</span>,
+    learningRate: <span class="nu">3e-4</span>,
+    lrSchedule:   <span class="st">'cosine'</span>,
+    warmupEpochs: <span class="nu">3</span>,
+    patience:     <span class="nu">8</span>,
+    outputDir:    <span class="st">'ckpt/mnist'</span>,
+);
+
+<span class="va">$trainer</span> = <span class="kw">new</span> <span class="ty">Trainer</span>(<span class="va">$model</span>, <span class="va">$args</span>);
+<span class="va">$trainer</span>-><span class="fn">addCallback</span>(<span class="kw">new</span> <span class="ty">WandbCallback</span>());
+
+<span class="va">$result</span> = <span class="va">$trainer</span>-><span class="fn">train</span>(<span class="va">$trainDs</span>, <span class="va">$valDs</span>);
+
+<span class="fn">printf</span>(<span class="st">"Best epoch: %d, Best val loss: %.4f, Stopped early: %s\n"</span>,
+    <span class="va">$result</span>-><span class="va">bestEpoch</span>,
+    <span class="va">$result</span>-><span class="va">bestValLoss</span>,
+    <span class="va">$result</span>-><span class="va">stoppedEarly</span> ? <span class="st">'yes'</span> : <span class="st">'no'</span>
+);</code></pre>
+
+  </div>
+
+  <footer>
+    <span>PML Framework</span>
+    <span>Next: <a href="inference.html">Inference &amp; LLM →</a></span>
+  </footer>
+</div>
+
+<script>
+function toggleGroup(el) {
+  el.classList.toggle('open');
+  el.nextElementSibling.classList.toggle('open');
+}
+document.getElementById('nav-search').addEventListener('input', function () {
+  const q = this.value.toLowerCase();
+  document.querySelectorAll('.nav-link').forEach(function (a) {
+    a.style.display = a.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+});
+</script>
+</body>
+</html>

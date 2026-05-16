@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pipeline &amp; Cross-Validation — PML Framework</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav id="sidebar">
+  <div class="sidebar-header">
+    <a href="index.html" class="logo">PML Framework</a>
+    <div class="version">v7.0 · PHP 8.2+ · FFI/C Backend</div>
+  </div>
+  <div class="sidebar-search"><input type="text" id="nav-search" placeholder="Filter pages..." autocomplete="off"></div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Overview</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="index.html" class="nav-link">Home</a>
+      <a href="getting-started.html" class="nav-link">Getting Started</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Core</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="tensor.html" class="nav-link">Tensor</a>
+      <a href="dataset.html" class="nav-link">Dataset &amp; DataFrame</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Estimators</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="estimators.html#classifiers" class="nav-link">Classifiers</a>
+      <a href="estimators.html#regressors" class="nav-link">Regressors</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Transformers</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="transformers.html" class="nav-link">All Transformers</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Neural Networks</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="neural-network.html" class="nav-link">Sequential &amp; Layers</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Training</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="training.html" class="nav-link">Trainer &amp; Args</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Inference &amp; LLM</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="inference.html" class="nav-link">InferenceSession</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Vision</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="vision.html" class="nav-link">Vision Module</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Pipeline &amp; CV</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="pipeline.html#pipeline" class="nav-link active">Pipeline</a>
+      <a href="pipeline.html#cv" class="nav-link active">Cross-Validation</a>
+      <a href="pipeline.html#ensemble" class="nav-link active">Ensemble</a>
+      <a href="pipeline.html#autograd" class="nav-link active">Autograd</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Roadmap</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="roadmap.html" class="nav-link">Vulkan GPU Support</a></div>
+  </div>
+</nav>
+
+<div id="main">
+  <div class="topbar">
+    <div class="topbar-breadcrumb"><a href="index.html">PML</a> / Pipeline &amp; Cross-Validation</div>
+    <div class="topbar-links"><a href="roadmap.html">Roadmap →</a></div>
+  </div>
+
+  <div class="content">
+    <div class="page-hero">
+      <span class="page-tag">Pipeline</span>
+      <h1>Pipeline, Cross-Validation &amp; Autograd</h1>
+      <p class="page-lead">
+        The <code>Pipeline</code> chains transformers with a terminal estimator.
+        Six cross-validation strategies for model evaluation.
+        An autograd engine for custom gradient computations outside of <code>Sequential</code>.
+      </p>
+    </div>
+
+    <div class="toc-inline">
+      <h5>On this page</h5>
+      <ol>
+        <li><a href="#pipeline">Pipeline</a></li>
+        <li><a href="#cv">Cross-Validation</a></li>
+        <li><a href="#generators">Dataset Generators</a></li>
+        <li><a href="#ensemble">Ensemble Methods</a></li>
+        <li><a href="#autograd">Autograd</a></li>
+      </ol>
+    </div>
+
+    <!-- ── Pipeline ───────────────────────────────────────────── -->
+    <h2 id="pipeline">Pipeline</h2>
+    <p>
+      <code>Pml\Pipeline</code> chains zero or more <code>Transformer</code> steps followed by a terminal
+      <code>Learner</code>. On <code>train()</code>, transformers are fit on the training data in order;
+      on <code>predict()</code>, the same transformers are applied before calling the estimator.
+      Implements <code>Learner</code> and <code>Persistable</code> — it can be saved and loaded atomically.
+    </p>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">__construct</span>
+        <span class="method-sig">(Transformer[] $transformers, Learner $estimator)</span>
+      </div>
+      <div class="api-block-body">
+        <pre><code><span class="va">$pipeline</span> = <span class="kw">new</span> <span class="ty">Pipeline</span>(
+    transformers: [
+        <span class="kw">new</span> <span class="ty">Imputer</span>(),
+        <span class="kw">new</span> <span class="ty">StandardScaler</span>(),
+        <span class="kw">new</span> <span class="ty">SelectKBest</span>(k: <span class="nu">15</span>),
+    ],
+    estimator: <span class="kw">new</span> <span class="ty">GBDTClassifier</span>(nEstimators: <span class="nu">200</span>),
+);</code></pre>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">train</span>
+        <span class="method-sig">(Dataset $dataset, mixed ...$args): void</span>
+      </div>
+      <div class="api-block-body">
+        <p>Fits each transformer in sequence (each on the output of the previous), then trains the estimator on the final transformed dataset. Extra <code>$args</code> are forwarded to the estimator's <code>train()</code>.</p>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">predict</span>
+        <span class="method-sig">(Dataset $dataset): Tensor</span>
+      </div>
+      <div class="api-block-body">
+        <p>Applies each transformer's <code>transform()</code> (NOT <code>fit()</code>) in sequence, then calls the estimator's <code>predict()</code>.</p>
+      </div>
+    </div>
+
+    <table>
+      <thead><tr><th>Method</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>trained(): bool</code></td><td>Whether <code>train()</code> has been called</td></tr>
+        <tr><td><code>save(string $dir): void</code></td><td>Serializes all transformer parameters and estimator weights to <code>$dir/</code></td></tr>
+        <tr><td><code>load(string $dir): static</code></td><td>Restores a saved pipeline</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout callout-info">
+      <strong>SMOTE in a Pipeline</strong>
+      Some transformers (SMOTE, TomekLinks) modify the <em>number of rows</em>.
+      They must come before the estimator and will only fire during <code>train()</code> — not <code>predict()</code>.
+      Pipeline handles this correctly: transformers receive the accumulated dataset including new rows.
+    </div>
+
+    <!-- ── Cross-Validation ───────────────────────────────────── -->
+    <h2 id="cv">Cross-Validation</h2>
+    <p>Namespace: <code>Pml\CrossValidation\</code></p>
+
+    <table>
+      <thead><tr><th>Class</th><th>Constructor</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>KFold</code></td>
+          <td><code>int $k = 5</code></td>
+          <td>Shuffled K-fold. Returns average metric across folds.</td>
+        </tr>
+        <tr>
+          <td><code>StratifiedKFold</code></td>
+          <td><code>int $k = 5</code></td>
+          <td>Stratified K-fold — preserves class proportions in each fold. Preferred for classification.</td>
+        </tr>
+        <tr>
+          <td><code>HoldOut</code></td>
+          <td><code>float $ratio = 0.2</code></td>
+          <td>Single train/test split. Fastest — use for large datasets.</td>
+        </tr>
+        <tr>
+          <td><code>MonteCarlo</code></td>
+          <td><code>int $rounds = 5, float $ratio = 0.2</code></td>
+          <td>Repeated random splits (Monte Carlo cross-validation). More stable than single holdout.</td>
+        </tr>
+        <tr>
+          <td><code>LeavePOut</code></td>
+          <td><code>int $p = 1</code></td>
+          <td>Leave-P-Out. Exhaustive but O(N^p) — only practical for tiny datasets or LOO (p=1).</td>
+        </tr>
+        <tr>
+          <td><code>KFoldOOF</code></td>
+          <td><code>int $k = 5</code></td>
+          <td>Generates out-of-fold predictions for stacking. Returns <code>[$oofPreds, $scores]</code>.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <pre><code><span class="kw">use</span> <span class="ty">Pml\CrossValidation\StratifiedKFold</span>;
+
+<span class="va">$cv</span>     = <span class="kw">new</span> <span class="ty">StratifiedKFold</span>(k: <span class="nu">5</span>);
+<span class="va">$scores</span> = <span class="va">$cv</span>-><span class="fn">test</span>(<span class="kw">new</span> <span class="ty">GBDTClassifier</span>(), <span class="va">$dataset</span>, metric: <span class="st">'accuracy'</span>);
+
+<span class="fn">printf</span>(<span class="st">"CV Accuracy: %.3f ± %.3f\n"</span>,
+    <span class="fn">array_sum</span>(<span class="va">$scores</span>) / <span class="fn">count</span>(<span class="va">$scores</span>),
+    <span class="fn">sqrt</span>(<span class="fn">array_sum</span>(<span class="fn">array_map</span>(<span class="kw">fn</span>(<span class="va">$s</span>) => <span class="fn">pow</span>(<span class="va">$s</span> - <span class="fn">array_sum</span>(<span class="va">$scores</span>)/<span class="fn">count</span>(<span class="va">$scores</span>), <span class="nu">2</span>), <span class="va">$scores</span>)) / <span class="fn">count</span>(<span class="va">$scores</span>))
+);</code></pre>
+
+    <pre><code><span class="cm">// Out-of-fold predictions for stacking</span>
+<span class="kw">use</span> <span class="ty">Pml\CrossValidation\KFoldOOF</span>;
+
+<span class="va">$oof</span> = <span class="kw">new</span> <span class="ty">KFoldOOF</span>(k: <span class="nu">5</span>);
+[<span class="va">$oofPreds</span>, <span class="va">$scores</span>] = <span class="va">$oof</span>-><span class="fn">run</span>(
+    <span class="kw">fn</span>() => <span class="kw">new</span> <span class="ty">GBDTClassifier</span>(nEstimators: <span class="nu">200</span>),
+    <span class="va">$dataset</span>
+);
+<span class="cm">// $oofPreds: Tensor [N] — predictions for every sample in the dataset</span></code></pre>
+
+    <!-- ── Generators ─────────────────────────────────────────── -->
+    <h2 id="generators">Dataset Generators</h2>
+    <p>Namespace: <code>Pml\Datasets\Generators\</code>. Useful for testing and prototyping.</p>
+    <table>
+      <thead><tr><th>Generator</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>Blob</code></td><td>Gaussian blobs. Multiple clusters, configurable separation.</td></tr>
+        <tr><td><code>Circle</code></td><td>Concentric circles. Binary classification benchmark.</td></tr>
+        <tr><td><code>HalfMoon</code></td><td>Two interleaved half-moon shapes. Classic non-linear benchmark.</td></tr>
+        <tr><td><code>Hyperplane</code></td><td>Linearly separable data. For regression or linear classifier validation.</td></tr>
+        <tr><td><code>SwissRoll</code></td><td>3-D Swiss roll manifold. For manifold learning and t-SNE demos.</td></tr>
+        <tr><td><code>Agglomerate</code></td><td>Agglomerated clusters with variable density.</td></tr>
+      </tbody>
+    </table>
+    <pre><code><span class="kw">use</span> <span class="ty">Pml\Datasets\Generators\HalfMoon</span>;
+
+<span class="va">$gen</span> = <span class="kw">new</span> <span class="ty">HalfMoon</span>(n: <span class="nu">1000</span>, noise: <span class="nu">0.1</span>);
+<span class="va">$ds</span>  = <span class="va">$gen</span>-><span class="fn">generate</span>();   <span class="cm">// Dataset with 1000 labeled samples</span></code></pre>
+
+    <!-- ── Ensemble ───────────────────────────────────────────── -->
+    <h2 id="ensemble">Ensemble Methods</h2>
+
+    <h3>BootstrapAggregator</h3>
+    <pre><code><span class="kw">use</span> <span class="ty">Pml\BootstrapAggregator</span>;
+
+<span class="va">$bag</span> = <span class="kw">new</span> <span class="ty">BootstrapAggregator</span>(
+    base:        <span class="kw">new</span> <span class="ty">DecisionTreeClassifier</span>(maxDepth: <span class="nu">10</span>),
+    nEstimators: <span class="nu">50</span>,
+    ratio:       <span class="nu">0.8</span>,  <span class="cm">// bootstrap sample size</span>
+);
+<span class="va">$bag</span>-><span class="fn">train</span>(<span class="va">$dataset</span>);
+<span class="va">$preds</span> = <span class="va">$bag</span>-><span class="fn">predict</span>(<span class="va">$testSet</span>);</code></pre>
+
+    <h3>StackingRegressor</h3>
+    <pre><code><span class="kw">use</span> <span class="ty">Pml\Ensemble\StackingRegressor</span>;
+
+<span class="va">$stacker</span> = <span class="kw">new</span> <span class="ty">StackingRegressor</span>(
+    estimators: [
+        <span class="kw">new</span> <span class="ty">GBDTRegressor</span>(nEstimators: <span class="nu">100</span>),
+        <span class="kw">new</span> <span class="ty">Ridge</span>(alpha: <span class="nu">1.0</span>),
+        <span class="kw">new</span> <span class="ty">KNNRegressor</span>(k: <span class="nu">10</span>),
+    ],
+    metaEstimator: <span class="kw">new</span> <span class="ty">LinearRegression</span>(),
+    folds: <span class="nu">5</span>,
+);
+<span class="va">$stacker</span>-><span class="fn">train</span>(<span class="va">$dataset</span>);
+<span class="va">$preds</span> = <span class="va">$stacker</span>-><span class="fn">predict</span>(<span class="va">$testSet</span>);</code></pre>
+
+    <!-- ── Autograd ───────────────────────────────────────────── -->
+    <h2 id="autograd">Autograd</h2>
+    <p>
+      <code>Pml\Autograd\Variable</code> wraps a <code>Tensor</code> and builds a dynamic compute graph
+      via a C-backed <code>Tape</code>. Use for custom gradient computations outside of <code>Sequential</code>.
+    </p>
+    <div class="callout callout-warn">
+      <strong>Partial implementation.</strong>
+      The autograd engine currently supports 5 operations: <code>add</code>, <code>mul</code>, <code>matmul</code>, <code>relu</code>, and <code>backward()</code>. For full training loops, use <code>Sequential</code> which has a complete hand-written backward pass in C.
+    </div>
+
+    <pre><code><span class="kw">use</span> <span class="ty">Pml\Autograd\Variable</span>;
+<span class="kw">use</span> <span class="ty">Pml\Tensor</span>;
+
+<span class="va">$x</span> = <span class="kw">new</span> <span class="ty">Variable</span>(<span class="ty">Tensor</span>::<span class="fn">fromArray</span>([[<span class="nu">1.0</span>, <span class="nu">2.0</span>]]), requiresGrad: <span class="kw">true</span>);
+<span class="va">$W</span> = <span class="kw">new</span> <span class="ty">Variable</span>(<span class="ty">Tensor</span>::<span class="fn">randomNormal</span>([<span class="nu">2</span>, <span class="nu">4</span>]),   requiresGrad: <span class="kw">true</span>);
+
+<span class="va">$y</span> = <span class="va">$x</span>-><span class="fn">matmul</span>(<span class="va">$W</span>)-><span class="fn">relu</span>();
+<span class="va">$y</span>-><span class="fn">backward</span>();
+
+<span class="va">$dW</span> = <span class="va">$W</span>-><span class="fn">grad</span>();   <span class="cm">// dL/dW</span>
+<span class="va">$dx</span> = <span class="va">$x</span>-><span class="fn">grad</span>();   <span class="cm">// dL/dx</span></code></pre>
+
+    <table>
+      <thead><tr><th>Method</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>add(Variable $other): Variable</code></td><td>Elementwise addition, tracked</td></tr>
+        <tr><td><code>mul(Variable $other): Variable</code></td><td>Elementwise multiply, tracked</td></tr>
+        <tr><td><code>matmul(Variable $other): Variable</code></td><td>Matrix multiply, tracked</td></tr>
+        <tr><td><code>relu(): Variable</code></td><td>ReLU activation, tracked</td></tr>
+        <tr><td><code>backward(): void</code></td><td>Backprop from this node through the tape</td></tr>
+        <tr><td><code>data(): Tensor</code></td><td>Forward value tensor</td></tr>
+        <tr><td><code>grad(): ?Tensor</code></td><td>Gradient tensor (populated after backward)</td></tr>
+        <tr><td><code>requiresGrad(): bool</code></td><td>Whether gradients are tracked for this Variable</td></tr>
+      </tbody>
+    </table>
+
+  </div>
+
+  <footer>
+    <span>PML Framework</span>
+    <span>Next: <a href="roadmap.html">Vulkan GPU Roadmap →</a></span>
+  </footer>
+</div>
+
+<script>
+function toggleGroup(el) {
+  el.classList.toggle('open');
+  el.nextElementSibling.classList.toggle('open');
+}
+document.getElementById('nav-search').addEventListener('input', function () {
+  const q = this.value.toLowerCase();
+  document.querySelectorAll('.nav-link').forEach(function (a) {
+    a.style.display = a.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+});
+</script>
+</body>
+</html>

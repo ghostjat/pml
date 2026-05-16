@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Estimators — PML Framework</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav id="sidebar">
+  <div class="sidebar-header">
+    <a href="index.html" class="logo">PML Framework</a>
+    <div class="version">v7.0 · PHP 8.2+ · FFI/C Backend</div>
+  </div>
+  <div class="sidebar-search"><input type="text" id="nav-search" placeholder="Filter pages..." autocomplete="off"></div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Overview</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="index.html" class="nav-link">Home</a>
+      <a href="getting-started.html" class="nav-link">Getting Started</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Core</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="tensor.html" class="nav-link">Tensor</a>
+      <a href="dataset.html" class="nav-link">Dataset &amp; DataFrame</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Estimators</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="estimators.html#classifiers" class="nav-link active">Classifiers</a>
+      <a href="estimators.html#regressors" class="nav-link active">Regressors</a>
+      <a href="estimators.html#anomaly" class="nav-link active">Anomaly Detectors</a>
+      <a href="estimators.html#clusterers" class="nav-link active">Clusterers</a>
+      <a href="estimators.html#decomposition" class="nav-link active">Decomposition</a>
+      <a href="estimators.html#meta" class="nav-link active">Meta Estimators</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Transformers</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="transformers.html" class="nav-link">All Transformers</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Neural Networks</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="neural-network.html" class="nav-link">Sequential &amp; Layers</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Training</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="training.html" class="nav-link">Trainer &amp; Args</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Inference &amp; LLM</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="inference.html" class="nav-link">InferenceSession</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Vision</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="vision.html" class="nav-link">Vision Module</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Pipeline &amp; CV</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="pipeline.html" class="nav-link">Pipeline &amp; CV</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Roadmap</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="roadmap.html" class="nav-link">Vulkan GPU Support</a></div>
+  </div>
+</nav>
+
+<div id="main">
+  <div class="topbar">
+    <div class="topbar-breadcrumb"><a href="index.html">PML</a> / Estimators</div>
+    <div class="topbar-links"><a href="transformers.html">Transformers →</a></div>
+  </div>
+
+  <div class="content">
+    <div class="page-hero">
+      <span class="page-tag">Estimators</span>
+      <h1>Estimators</h1>
+      <p class="page-lead">
+        45 estimators covering classification, regression, anomaly detection, clustering,
+        dimensionality reduction, and meta-estimation. All implement the <code>Learner</code> interface
+        (<code>train(Dataset)</code> + <code>predict(Dataset)</code>).
+      </p>
+    </div>
+
+    <div class="toc-inline">
+      <h5>On this page</h5>
+      <ol>
+        <li><a href="#interfaces">Estimator Interfaces</a></li>
+        <li><a href="#classifiers">Classifiers (19)</a></li>
+        <li><a href="#regressors">Regressors (15)</a></li>
+        <li><a href="#anomaly">Anomaly Detectors (6)</a></li>
+        <li><a href="#clusterers">Clusterers (5)</a></li>
+        <li><a href="#decomposition">Decomposition</a></li>
+        <li><a href="#meta">Meta Estimators</a></li>
+        <li><a href="#example">Usage Example</a></li>
+      </ol>
+    </div>
+
+    <!-- ── Interfaces ─────────────────────────────────────────── -->
+    <h2 id="interfaces">Estimator Interfaces</h2>
+    <table>
+      <thead><tr><th>Interface</th><th>Methods</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>Estimator</code></td><td><code>type(): EstimatorType</code></td><td>Root interface for all estimators</td></tr>
+        <tr><td><code>Learner</code></td><td><code>train(Dataset): void</code> · <code>predict(Dataset): Tensor</code></td><td>Supervised and unsupervised learners</td></tr>
+        <tr><td><code>Probabilistic</code></td><td><code>predictProba(Dataset): Tensor</code></td><td>Returns class probability matrix [N, C]</td></tr>
+        <tr><td><code>Scoring</code></td><td><code>score(Dataset): float</code></td><td>Returns accuracy (classifiers) or R² (regressors)</td></tr>
+        <tr><td><code>Online</code></td><td><code>partialFit(Dataset): void</code></td><td>Incremental / streaming training</td></tr>
+        <tr><td><code>RanksFeatures</code></td><td><code>featureImportances(): Tensor</code></td><td>Returns per-feature importance scores</td></tr>
+        <tr><td><code>Verbose</code></td><td><code>setLogger(LoggerInterface): void</code></td><td>PSR-3 training progress logging</td></tr>
+        <tr><td><code>Persistable</code></td><td><code>save(string): void</code> · <code>load(string): static</code></td><td>Checkpoint save/load via SafeTensors</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Classifiers ────────────────────────────────────────── -->
+    <h2 id="classifiers">Classifiers</h2>
+    <p>Namespace: <code>Pml\Estimators\Classifiers\</code></p>
+
+    <table>
+      <thead><tr><th>Class</th><th>Constructor Parameters</th><th>Interfaces</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>GBDTClassifier</code></td>
+          <td><code>nEstimators=100, maxDepth=4, numBins=255, lr=0.1, lambda=1.0, minChildWeight=1, subSample=1.0, colSampleByTree=1.0</code></td>
+          <td><span class="tag tag-blue">Scoring</span> <span class="tag tag-green">RanksFeatures</span></td>
+          <td>Histogram-based leaf-wise GBDT (LightGBM-style). C-level trees.</td>
+        </tr>
+        <tr>
+          <td><code>RandomForestClassifier</code></td>
+          <td><code>nEstimators=100, maxDepth=10, minSamplesSplit=2</code></td>
+          <td><span class="tag tag-blue">Scoring</span></td>
+          <td>Bagged CART trees, random feature subsets. Parallelized over trees.</td>
+        </tr>
+        <tr>
+          <td><code>ExtraTreesClassifier</code></td>
+          <td><code>nEstimators=100, maxDepth=10, minSamplesSplit=2</code></td>
+          <td><span class="tag tag-blue">Scoring</span></td>
+          <td>Extremely randomized trees — random split thresholds, lower variance.</td>
+        </tr>
+        <tr>
+          <td><code>DecisionTreeClassifier</code></td>
+          <td><code>maxDepth=10, minSamplesSplit=2, maxFeatures=null</code></td>
+          <td><span class="tag tag-blue">Scoring</span></td>
+          <td>CART with Gini impurity. C-level split search.</td>
+        </tr>
+        <tr>
+          <td><code>LogisticRegression</code></td>
+          <td><code>epochs=100, learningRate=0.01, batchSize=32</code></td>
+          <td><span class="tag tag-blue">Scoring</span> <span class="tag tag-purple">Probabilistic</span></td>
+          <td>Binary or multi-class via softmax. Mini-batch SGD.</td>
+        </tr>
+        <tr>
+          <td><code>SoftmaxClassifier</code></td>
+          <td><code>epochs, learningRate, batchSize, lambda</code></td>
+          <td><span class="tag tag-purple">Probabilistic</span></td>
+          <td>Multi-class linear classifier with L2 regularization.</td>
+        </tr>
+        <tr>
+          <td><code>SVC</code></td>
+          <td><code>c=1.0, epochs=100, learningRate=0.01, batchSize=32</code></td>
+          <td><span class="tag tag-blue">Scoring</span></td>
+          <td>Linear SVM with hinge loss. SGD optimization.</td>
+        </tr>
+        <tr>
+          <td><code>MLPClassifier</code></td>
+          <td><code>hidden=[100], epochs=100, batchSize=32, learningRate=0.001, dropout=0.0</code></td>
+          <td><span class="tag tag-blue">Scoring</span> <span class="tag tag-purple">Probabilistic</span></td>
+          <td>Multi-layer perceptron using Sequential internally. ReLU activations.</td>
+        </tr>
+        <tr>
+          <td><code>AdaBoostClassifier</code></td>
+          <td><code>nEstimators=50, learningRate=1.0</code></td>
+          <td><span class="tag tag-blue">Scoring</span></td>
+          <td>SAMME algorithm with DecisionTree weak learners.</td>
+        </tr>
+        <tr>
+          <td><code>LogitBoost</code></td>
+          <td><code>nEstimators, learningRate, maxDepth</code></td>
+          <td><span class="tag tag-purple">Probabilistic</span></td>
+          <td>Gradient boosting with logistic loss. Probabilistic outputs.</td>
+        </tr>
+        <tr>
+          <td><code>GaussianNB</code></td>
+          <td>—</td>
+          <td><span class="tag tag-purple">Probabilistic</span></td>
+          <td>Gaussian Naive Bayes. C-level log-likelihood computation.</td>
+        </tr>
+        <tr>
+          <td><code>BernoulliNB</code></td>
+          <td><code>alpha=1.0</code></td>
+          <td><span class="tag tag-purple">Probabilistic</span></td>
+          <td>For binary feature vectors. Laplace smoothing.</td>
+        </tr>
+        <tr>
+          <td><code>MultinomialNB</code></td>
+          <td><code>alpha=1.0</code></td>
+          <td><span class="tag tag-purple">Probabilistic</span></td>
+          <td>For count features (e.g., TF-IDF). Laplace smoothing.</td>
+        </tr>
+        <tr>
+          <td><code>CategoricalNB</code></td>
+          <td><code>alpha=1.0</code></td>
+          <td><span class="tag tag-purple">Probabilistic</span></td>
+          <td>For categorical integer-encoded features.</td>
+        </tr>
+        <tr>
+          <td><code>KNNClassifier</code></td>
+          <td><code>k=5</code></td>
+          <td><span class="tag tag-blue">Scoring</span> <span class="tag tag-purple">Probabilistic</span></td>
+          <td>Brute-force KNN via C pairwise-L2. O(N·D) per query.</td>
+        </tr>
+        <tr>
+          <td><code>KDNeighborsClassifier</code></td>
+          <td><code>k=5, leafSize=30</code></td>
+          <td><span class="tag tag-blue">Scoring</span></td>
+          <td>KD-Tree based KNN. Faster for low-D (&lt;20 features).</td>
+        </tr>
+        <tr>
+          <td><code>RadiusNeighborsClassifier</code></td>
+          <td><code>radius=1.0</code></td>
+          <td><span class="tag tag-blue">Scoring</span></td>
+          <td>Classifies using all neighbors within a fixed radius.</td>
+        </tr>
+        <tr>
+          <td><code>OneVsRest</code></td>
+          <td><code>prototype: Learner</code></td>
+          <td><span class="tag tag-blue">Scoring</span></td>
+          <td>Wraps any binary classifier for multi-class OVR decomposition.</td>
+        </tr>
+        <tr>
+          <td><code>VotingClassifier</code></td>
+          <td><code>estimators: Learner[]</code></td>
+          <td><span class="tag tag-blue">Scoring</span></td>
+          <td>Majority-vote ensemble. Optionally soft-vote with Probabilistic members.</td>
+        </tr>
+        <tr>
+          <td><code>DummyClassifier</code></td>
+          <td>—</td>
+          <td></td>
+          <td>Returns the most frequent class label. Baseline.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- ── Regressors ─────────────────────────────────────────── -->
+    <h2 id="regressors">Regressors</h2>
+    <p>Namespace: <code>Pml\Estimators\Regression\</code></p>
+
+    <table>
+      <thead><tr><th>Class</th><th>Constructor Parameters</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>GBDTRegressor</code></td>
+          <td><code>nEstimators=100, maxDepth=4, numBins=255, lr=0.1, lambda=1.0</code></td>
+          <td>Histogram leaf-wise GBDT with MSE loss. Same C kernel as GBDTClassifier.</td>
+        </tr>
+        <tr>
+          <td><code>GradientBoostingRegressor</code></td>
+          <td><code>nEstimators, learningRate, maxDepth, loss</code></td>
+          <td>Stage-wise gradient boosting with pluggable loss (MSE, Huber, MAE).</td>
+        </tr>
+        <tr>
+          <td><code>RandomForestRegressor</code></td>
+          <td>— (see classifier)</td>
+          <td><em>Alias for ExtraTreeRegressor ensemble.</em></td>
+        </tr>
+        <tr>
+          <td><code>ExtraTreeRegressor</code></td>
+          <td><code>nEstimators, maxDepth, minSamplesSplit</code></td>
+          <td>Extremely randomized regression trees.</td>
+        </tr>
+        <tr>
+          <td><code>DecisionTreeRegressor</code></td>
+          <td><code>maxDepth=3, minSamplesSplit=2, maxFeatures=null</code></td>
+          <td>CART with MSE criterion.</td>
+        </tr>
+        <tr>
+          <td><code>LinearRegression</code></td>
+          <td>—</td>
+          <td>Closed-form OLS via LAPACKE SGELSD. O(D³) — for small D only.</td>
+        </tr>
+        <tr>
+          <td><code>Ridge</code></td>
+          <td><code>alpha=1.0, epochs=100, learningRate=0.01, batchSize=32</code></td>
+          <td>L2-regularized linear regression. Mini-batch SGD.</td>
+        </tr>
+        <tr>
+          <td><code>Lasso</code></td>
+          <td><code>alpha=1.0, epochs=100, learningRate=0.01, batchSize=32</code></td>
+          <td>L1-regularized via subgradient SGD. Produces sparse weights.</td>
+        </tr>
+        <tr>
+          <td><code>ElasticNet</code></td>
+          <td><code>alpha=1.0, l1Ratio=0.5, epochs=100, learningRate=0.01, batchSize=32</code></td>
+          <td>Combines L1 + L2 regularization.</td>
+        </tr>
+        <tr>
+          <td><code>Adaline</code></td>
+          <td><code>epochs, learningRate, batchSize</code></td>
+          <td>Adaptive linear neuron. Mini-batch gradient descent, MSE loss.</td>
+        </tr>
+        <tr>
+          <td><code>MLPRegressor</code></td>
+          <td><code>hidden=[100], epochs=100, batchSize=32, learningRate=0.001</code></td>
+          <td>Deep MLP for regression. Outputs continuous values via linear head.</td>
+        </tr>
+        <tr>
+          <td><code>SVR</code></td>
+          <td><code>c, epsilon, kernel, epochs, learningRate</code></td>
+          <td>ε-insensitive SVR. Hinge loss SGD with RBF or linear kernel.</td>
+        </tr>
+        <tr>
+          <td><code>KNNRegressor</code></td>
+          <td><code>k=5</code></td>
+          <td>KNN regression — average of k nearest target values.</td>
+        </tr>
+        <tr>
+          <td><code>KDNeighborsRegressor</code></td>
+          <td><code>k=5</code></td>
+          <td>KD-Tree KNN regression.</td>
+        </tr>
+        <tr>
+          <td><code>VotingRegressor</code></td>
+          <td><code>estimators: Learner[]</code></td>
+          <td>Average predictions from an ensemble of regressors.</td>
+        </tr>
+        <tr>
+          <td><code>DummyRegressor</code></td>
+          <td>—</td>
+          <td>Returns training label mean. Baseline.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- ── Anomaly Detectors ───────────────────────────────────── -->
+    <h2 id="anomaly">Anomaly Detectors</h2>
+    <p>Namespace: <code>Pml\Estimators\AnomalyDetectors\</code></p>
+    <p>Anomaly detectors implement <code>Learner</code>. <code>predict()</code> returns a Tensor of labels: <code>1.0</code> = inlier, <code>-1.0</code> = outlier.</p>
+
+    <table>
+      <thead><tr><th>Class</th><th>Constructor Parameters</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>IsolationForest</code></td>
+          <td><code>nEstimators=100, sampleSize=256, contamination=0.1</code></td>
+          <td>Builds random isolation trees. Anomaly score via average path length. C-accelerated.</td>
+        </tr>
+        <tr>
+          <td><code>LocalOutlierFactor</code></td>
+          <td><code>k=20</code></td>
+          <td>LOF score based on local reachability density vs k neighbors.</td>
+        </tr>
+        <tr>
+          <td><code>GaussianMLE</code></td>
+          <td><code>threshold=-10.0</code></td>
+          <td>Fits a multivariate Gaussian. Points below log-likelihood threshold are anomalies.</td>
+        </tr>
+        <tr>
+          <td><code>OneClassSVM</code></td>
+          <td><code>nu=0.1, kernel=RBF(0.1), epochs=100, learningRate=0.01</code></td>
+          <td>One-class SVM with RBF or linear kernel. SGD optimization.</td>
+        </tr>
+        <tr>
+          <td><code>Loda</code></td>
+          <td><code>nProjections=100, bins=10</code></td>
+          <td>Lightweight Online Detector of Anomalies. Random projections + histogram density.</td>
+        </tr>
+        <tr>
+          <td><code>RobustZScore</code></td>
+          <td><code>threshold=3.5</code></td>
+          <td>Modified Z-Score using median absolute deviation. Robust to outliers in the reference.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- ── Clusterers ─────────────────────────────────────────── -->
+    <h2 id="clusterers">Clusterers</h2>
+    <p>Namespace: <code>Pml\Estimators\Clusterers\</code></p>
+    <p>Clusterers implement <code>Learner</code>. <code>predict()</code> returns cluster index labels.</p>
+
+    <table>
+      <thead><tr><th>Class</th><th>Constructor Parameters</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>KMeans</code></td>
+          <td><code>k=3, maxIter=300, tolerance=1e-4</code></td>
+          <td>Lloyd's algorithm. Centroid init via KMeans++ seeder. C-level assignment and update.</td>
+        </tr>
+        <tr>
+          <td><code>GaussianMixture</code></td>
+          <td><code>k=3, maxIter=100, tolerance=1e-4</code></td>
+          <td>EM algorithm for GMM. Soft cluster assignments. Uses LAPACKE for covariance inversion.</td>
+        </tr>
+        <tr>
+          <td><code>FuzzyCMeans</code></td>
+          <td><code>k=3, fuzziness=2.0, maxIter=300, tolerance=1e-4</code></td>
+          <td>Fuzzy / soft clustering. Fuzziness m &gt; 1; higher m = softer boundaries.</td>
+        </tr>
+        <tr>
+          <td><code>DBSCAN</code></td>
+          <td><code>epsilon=0.5, minSamples=5</code></td>
+          <td>Density-based. No pre-specified k. Marks noise points as label <code>-1</code>.</td>
+        </tr>
+        <tr>
+          <td><code>MeanShift</code></td>
+          <td><code>bandwidth=1.0, maxIter=100, tolerance=1e-4</code></td>
+          <td>Non-parametric; finds cluster centers as density peaks. Automatically determines k.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>KMeans Seeders</h3>
+    <p>Pass via <code>seeder:</code> parameter to KMeans or GaussianMixture:</p>
+    <table>
+      <thead><tr><th>Seeder</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>PlusPlus</code></td><td>KMeans++ — default, reduces poor initializations</td></tr>
+        <tr><td><code>KMC2</code></td><td>Fast KMeans++ approximation — O(k) vs O(Nk)</td></tr>
+        <tr><td><code>Random</code></td><td>Uniform random seeding — fast but prone to bad local minima</td></tr>
+        <tr><td><code>Preset</code></td><td>Fixed user-supplied centroids</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Decomposition ──────────────────────────────────────── -->
+    <h2 id="decomposition">Decomposition &amp; Manifold</h2>
+    <table>
+      <thead><tr><th>Class</th><th>Namespace</th><th>Parameters</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>PrincipalComponentAnalysis</code></td>
+          <td><code>Estimators\Decomposition\</code></td>
+          <td><code>nComponents=2</code></td>
+          <td>Full SVD via LAPACKE. Returns loadings, explained variance ratio.</td>
+        </tr>
+        <tr>
+          <td><code>TSNE</code></td>
+          <td><code>Estimators\Manifold\</code></td>
+          <td><code>nComponents=2, perplexity=30, lr=200, maxIter=1000</code></td>
+          <td>t-SNE via Barnes-Hut approximation. For visualization. O(N log N) per iter.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- ── Meta Estimators ────────────────────────────────────── -->
+    <h2 id="meta">Meta Estimators</h2>
+    <table>
+      <thead><tr><th>Class</th><th>Namespace</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>GridSearch</code></td>
+          <td><code>Estimators\Meta\</code></td>
+          <td>Exhaustive hyperparameter search over a parameter grid. Trains one model per combination.</td>
+        </tr>
+        <tr>
+          <td><code>RandomSearch</code></td>
+          <td><code>Estimators\Meta\</code></td>
+          <td>Random hyperparameter sampling — faster than grid for large spaces.</td>
+        </tr>
+        <tr>
+          <td><code>PlattScaler</code></td>
+          <td><code>Estimators\Meta\</code></td>
+          <td>Wraps any classifier and calibrates probability outputs via Platt scaling (logistic regression on decision scores).</td>
+        </tr>
+        <tr>
+          <td><code>BootstrapAggregator</code></td>
+          <td><code>Pml\</code></td>
+          <td>Bagging meta-estimator. Wraps any Learner, trains N copies on bootstrap samples, averages/votes predictions.</td>
+        </tr>
+        <tr>
+          <td><code>CommitteeMachine</code></td>
+          <td><code>Pml\</code></td>
+          <td>Weighted ensemble of experts. Weights are updated based on per-expert validation error.</td>
+        </tr>
+        <tr>
+          <td><code>StackingRegressor</code></td>
+          <td><code>Pml\Ensemble\</code></td>
+          <td>Stacked generalization: base estimators → meta-regressor trained on OOF predictions.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- ── Example ──────────────────────────────────────────────── -->
+    <h2 id="example">Usage Example</h2>
+    <pre><code><span class="kw">use</span> <span class="ty">Pml\Estimators\Classifiers\GBDTClassifier</span>;
+<span class="kw">use</span> <span class="ty">Pml\Dataset</span>;
+
+<span class="cm">// Train</span>
+<span class="va">$clf</span> = <span class="kw">new</span> <span class="ty">GBDTClassifier</span>(
+    nEstimators: <span class="nu">300</span>,
+    maxDepth:    <span class="nu">6</span>,
+    lr:          <span class="nu">0.05</span>,
+    lambda:      <span class="nu">1.0</span>,
+    subSample:   <span class="nu">0.8</span>,
+);
+<span class="va">$clf</span>-><span class="fn">train</span>(<span class="va">$trainSet</span>);
+
+<span class="cm">// Predict</span>
+<span class="va">$preds</span> = <span class="va">$clf</span>-><span class="fn">predict</span>(<span class="va">$testSet</span>);   <span class="cm">// Tensor [N] of class indices</span>
+<span class="va">$score</span> = <span class="va">$clf</span>-><span class="fn">score</span>(<span class="va">$testSet</span>);     <span class="cm">// float accuracy</span>
+
+<span class="cm">// Feature importance</span>
+<span class="va">$fi</span> = <span class="va">$clf</span>-><span class="fn">featureImportances</span>();   <span class="cm">// Tensor [D]</span>
+
+<span class="cm">// Save / load</span>
+<span class="va">$clf</span>-><span class="fn">save</span>(<span class="st">'models/gbdt/'</span>);
+<span class="va">$clf2</span> = <span class="ty">GBDTClassifier</span>::<span class="fn">load</span>(<span class="st">'models/gbdt/'</span>);</code></pre>
+
+    <pre><code><span class="cm">// Cross-validation with any estimator</span>
+<span class="kw">use</span> <span class="ty">Pml\CrossValidation\StratifiedKFold</span>;
+
+<span class="va">$cv</span>     = <span class="kw">new</span> <span class="ty">StratifiedKFold</span>(k: <span class="nu">5</span>);
+<span class="va">$scores</span> = <span class="va">$cv</span>-><span class="fn">score</span>(<span class="kw">new</span> <span class="ty">GBDTClassifier</span>(), <span class="va">$dataset</span>);
+<span class="fn">echo</span> <span class="st">"Mean CV accuracy: "</span> . <span class="fn">array_sum</span>(<span class="va">$scores</span>) / <span class="fn">count</span>(<span class="va">$scores</span>);</code></pre>
+
+    <pre><code><span class="cm">// Hyperparameter search</span>
+<span class="kw">use</span> <span class="ty">Pml\Estimators\Meta\GridSearch</span>;
+
+<span class="va">$gs</span> = <span class="kw">new</span> <span class="ty">GridSearch</span>(
+    estimator: <span class="kw">new</span> <span class="ty">GBDTClassifier</span>(),
+    grid: [
+        <span class="st">'nEstimators'</span> => [<span class="nu">100</span>, <span class="nu">200</span>, <span class="nu">300</span>],
+        <span class="st">'maxDepth'</span>    => [<span class="nu">4</span>, <span class="nu">6</span>, <span class="nu">8</span>],
+        <span class="st">'lr'</span>          => [<span class="nu">0.05</span>, <span class="nu">0.1</span>],
+    ],
+    metric: <span class="st">'accuracy'</span>,
+    cv:     <span class="nu">3</span>,
+);
+<span class="va">$gs</span>-><span class="fn">train</span>(<span class="va">$dataset</span>);
+<span class="fn">echo</span> <span class="st">"Best params: "</span>; <span class="fn">print_r</span>(<span class="va">$gs</span>-><span class="fn">bestParams</span>());</code></pre>
+
+  </div>
+
+  <footer>
+    <span>PML Framework</span>
+    <span>Next: <a href="transformers.html">Transformers →</a></span>
+  </footer>
+</div>
+
+<script>
+function toggleGroup(el) {
+  el.classList.toggle('open');
+  el.nextElementSibling.classList.toggle('open');
+}
+document.getElementById('nav-search').addEventListener('input', function () {
+  const q = this.value.toLowerCase();
+  document.querySelectorAll('.nav-link').forEach(function (a) {
+    a.style.display = a.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+});
+</script>
+</body>
+</html>

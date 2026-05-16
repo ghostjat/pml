@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Transformers — PML Framework</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav id="sidebar">
+  <div class="sidebar-header">
+    <a href="index.html" class="logo">PML Framework</a>
+    <div class="version">v7.0 · PHP 8.2+ · FFI/C Backend</div>
+  </div>
+  <div class="sidebar-search"><input type="text" id="nav-search" placeholder="Filter pages..." autocomplete="off"></div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Overview</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="index.html" class="nav-link">Home</a>
+      <a href="getting-started.html" class="nav-link">Getting Started</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Core</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="tensor.html" class="nav-link">Tensor</a>
+      <a href="dataset.html" class="nav-link">Dataset &amp; DataFrame</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Estimators</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="estimators.html#classifiers" class="nav-link">Classifiers</a>
+      <a href="estimators.html#regressors" class="nav-link">Regressors</a>
+      <a href="estimators.html#anomaly" class="nav-link">Anomaly Detectors</a>
+      <a href="estimators.html#clusterers" class="nav-link">Clusterers</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Transformers</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="transformers.html#scalers" class="nav-link active">Scalers &amp; Normalizers</a>
+      <a href="transformers.html#encoding" class="nav-link active">Encoding</a>
+      <a href="transformers.html#text" class="nav-link active">Text</a>
+      <a href="transformers.html#image" class="nav-link active">Image</a>
+      <a href="transformers.html#feature" class="nav-link active">Feature Selection</a>
+      <a href="transformers.html#imputers" class="nav-link active">Imputers</a>
+      <a href="transformers.html#imbalance" class="nav-link active">Class Imbalance</a>
+      <a href="transformers.html#other" class="nav-link active">Other</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Neural Networks</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="neural-network.html" class="nav-link">Sequential &amp; Layers</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Training</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="training.html" class="nav-link">Trainer &amp; Args</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Inference &amp; LLM</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="inference.html" class="nav-link">InferenceSession</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Vision</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="vision.html" class="nav-link">Vision Module</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Pipeline &amp; CV</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="pipeline.html" class="nav-link">Pipeline &amp; CV</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Roadmap</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="roadmap.html" class="nav-link">Vulkan GPU Support</a></div>
+  </div>
+</nav>
+
+<div id="main">
+  <div class="topbar">
+    <div class="topbar-breadcrumb"><a href="index.html">PML</a> / Transformers</div>
+    <div class="topbar-links"><a href="neural-network.html">Neural Networks →</a></div>
+  </div>
+
+  <div class="content">
+    <div class="page-hero">
+      <span class="page-tag">Transformers</span>
+      <h1>Transformers</h1>
+      <p class="page-lead">
+        44 data transformers covering scaling, encoding, text vectorization, image transforms,
+        feature selection, imputation, and class-imbalance correction.
+        All implement the <code>Transformer</code> interface.
+      </p>
+    </div>
+
+    <div class="toc-inline">
+      <h5>On this page</h5>
+      <ol>
+        <li><a href="#interface">Transformer Interface</a></li>
+        <li><a href="#scalers">Scalers &amp; Normalizers</a></li>
+        <li><a href="#encoding">Encoding</a></li>
+        <li><a href="#text">Text Vectorizers</a></li>
+        <li><a href="#image">Image Transformers</a></li>
+        <li><a href="#feature">Feature Selection &amp; Projection</a></li>
+        <li><a href="#imputers">Imputers</a></li>
+        <li><a href="#imbalance">Class Imbalance</a></li>
+        <li><a href="#other">Other Transformers</a></li>
+        <li><a href="#example">Pipeline Example</a></li>
+      </ol>
+    </div>
+
+    <!-- ── Interface ──────────────────────────────────────────── -->
+    <h2 id="interface">Transformer Interface</h2>
+    <p>All transformers implement <code>Pml\Interfaces\Transformer</code>:</p>
+    <pre><code><span class="kw">interface</span> <span class="ty">Transformer</span>
+{
+    <span class="kw">public function</span> <span class="fn">fit</span>(<span class="ty">Dataset</span> <span class="va">$dataset</span>): <span class="kw">void</span>;
+    <span class="kw">public function</span> <span class="fn">transform</span>(<span class="ty">Dataset</span> <span class="va">$dataset</span>): <span class="ty">Dataset</span>;
+    <span class="kw">public function</span> <span class="fn">fitTransform</span>(<span class="ty">Dataset</span> <span class="va">$dataset</span>): <span class="ty">Dataset</span>;  <span class="cm">// default: fit + transform</span>
+}</code></pre>
+    <p>Transformers that implement <code>Stateful</code> additionally support <code>getStateDict()</code> / <code>loadStateDict()</code> for SafeTensors checkpoint I/O.</p>
+
+    <!-- ── Scalers ─────────────────────────────────────────────── -->
+    <h2 id="scalers">Scalers &amp; Normalizers</h2>
+    <p>Namespace: <code>Pml\Transformers\</code></p>
+
+    <table>
+      <thead><tr><th>Class</th><th>Parameters</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>StandardScaler</code></td>
+          <td>—</td>
+          <td>Subtracts mean, divides by std. μ=0, σ=1 per feature. Most common default.</td>
+        </tr>
+        <tr>
+          <td><code>ZScaleStandardizer</code></td>
+          <td><code>center=true</code></td>
+          <td>Same as StandardScaler but optionally skips centering (for sparse data).</td>
+        </tr>
+        <tr>
+          <td><code>MinMaxScaler</code></td>
+          <td><code>min=0.0, max=1.0</code></td>
+          <td>Scales each feature to [min, max]. Sensitive to outliers.</td>
+        </tr>
+        <tr>
+          <td><code>MaxAbsScaler</code></td>
+          <td>—</td>
+          <td>Divides by the maximum absolute value. Preserves sparsity.</td>
+        </tr>
+        <tr>
+          <td><code>RobustScaler</code></td>
+          <td>—</td>
+          <td>Centers by median, scales by IQR. Robust to outliers.</td>
+        </tr>
+        <tr>
+          <td><code>L1Normalizer</code></td>
+          <td>—</td>
+          <td>Normalizes each sample to unit L1 norm.</td>
+        </tr>
+        <tr>
+          <td><code>L2Normalizer</code></td>
+          <td>—</td>
+          <td>Normalizes each sample to unit L2 norm.</td>
+        </tr>
+        <tr>
+          <td><code>PowerTransformer</code></td>
+          <td>—</td>
+          <td>Yeo-Johnson or Box-Cox power transform to make features more Gaussian-like. Uses C-level fit.</td>
+        </tr>
+        <tr>
+          <td><code>QuantileTransformer</code></td>
+          <td><code>nQuantiles=1000</code></td>
+          <td>Maps to uniform or normal distribution via quantile landmarks. C-accelerated.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- ── Encoding ───────────────────────────────────────────── -->
+    <h2 id="encoding">Encoding</h2>
+    <table>
+      <thead><tr><th>Class</th><th>Parameters</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>OrdinalEncoder</code></td>
+          <td><code>columns=[]</code></td>
+          <td>Maps string categories to integer codes per column. Deterministic sort order.</td>
+        </tr>
+        <tr>
+          <td><code>OneHotLabelEncoder</code></td>
+          <td>—</td>
+          <td>Expands integer class labels to binary one-hot vectors. For multi-class output encoding.</td>
+        </tr>
+        <tr>
+          <td><code>CategoricalEncoder</code></td>
+          <td>—</td>
+          <td>Encodes string feature columns as integer indices. Stores vocabulary per column.</td>
+        </tr>
+        <tr>
+          <td><code>BooleanConverter</code></td>
+          <td>—</td>
+          <td>Converts boolean/string boolean values (<code>'true'/'false'</code>, <code>'yes'/'no'</code>) to 0.0/1.0.</td>
+        </tr>
+        <tr>
+          <td><code>NumericStringConverter</code></td>
+          <td>—</td>
+          <td>Parses numeric string columns (<code>'3.14'</code>) to float. NaN for non-parsable values.</td>
+        </tr>
+        <tr>
+          <td><code>IntervalDiscretizer</code></td>
+          <td><code>bins=5</code></td>
+          <td>Bins continuous features into equal-width intervals. Returns integer bin indices.</td>
+        </tr>
+        <tr>
+          <td><code>TargetEncoder</code></td>
+          <td>—</td>
+          <td>Replaces categorical levels with the target mean (smoothed). Must call <code>fit()</code> with labels present.</td>
+        </tr>
+        <tr>
+          <td><code>PolynomialExpander</code></td>
+          <td>—</td>
+          <td>Adds polynomial and interaction features. degree=2 by default.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- ── Text ──────────────────────────────────────────────── -->
+    <h2 id="text">Text Vectorizers</h2>
+    <table>
+      <thead><tr><th>Class</th><th>Parameters</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>WordCountVectorizer</code></td>
+          <td><code>maxFeatures=null, textColumn='text'</code></td>
+          <td>Bag-of-words counts. Builds a vocabulary on <code>fit()</code>, outputs sparse-like count matrix.</td>
+        </tr>
+        <tr>
+          <td><code>TfIdfTransformer</code></td>
+          <td>—</td>
+          <td>Transforms raw term counts to TF-IDF weights. Apply after WordCountVectorizer.</td>
+        </tr>
+        <tr>
+          <td><code>BM25Transformer</code></td>
+          <td><code>k1=1.2, b=0.75</code></td>
+          <td>BM25 ranking weighting. Better than TF-IDF for information retrieval tasks.</td>
+        </tr>
+        <tr>
+          <td><code>TokenHashingVectorizer</code></td>
+          <td>—</td>
+          <td>Hashing trick vectorizer — no vocabulary stored. Fixed output dim, collision-tolerant.</td>
+        </tr>
+        <tr>
+          <td><code>TextNormalizer</code></td>
+          <td>—</td>
+          <td>Lowercases, removes punctuation, trims whitespace. ASCII-only.</td>
+        </tr>
+        <tr>
+          <td><code>MultibyteTextNormalizer</code></td>
+          <td><code>stripDiacritics=false</code></td>
+          <td>Unicode-aware text normalization. Optionally strips diacritics (accents).</td>
+        </tr>
+        <tr>
+          <td><code>HtmlStripper</code></td>
+          <td>—</td>
+          <td>Strips HTML tags from text columns.</td>
+        </tr>
+        <tr>
+          <td><code>StopWordFilter</code></td>
+          <td><code>stopWords: string[]</code></td>
+          <td>Removes specified stop words from tokenized text.</td>
+        </tr>
+        <tr>
+          <td><code>RegexFilter</code></td>
+          <td>—</td>
+          <td>Removes tokens matching a regex pattern from text columns.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- ── Image ─────────────────────────────────────────────── -->
+    <h2 id="image">Image Transformers</h2>
+    <table>
+      <thead><tr><th>Class</th><th>Parameters</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>ImageResizer</code></td>
+          <td><code>targetWidth, targetHeight</code></td>
+          <td>Bilinear resize for image datasets stored as pixel rows.</td>
+        </tr>
+        <tr>
+          <td><code>ImageCropper</code></td>
+          <td><code>xOffset, yOffset, width, height</code></td>
+          <td>Fixed-region crop from image tensor.</td>
+        </tr>
+        <tr>
+          <td><code>ImageRotator</code></td>
+          <td>—</td>
+          <td>Random rotation augmentation (configurable angle range).</td>
+        </tr>
+        <tr>
+          <td><code>ImageVectorizer</code></td>
+          <td><code>maxPixelValue=255.0</code></td>
+          <td>Flattens image tensors to 1-D feature vectors and scales pixel values to [0, 1].</td>
+        </tr>
+        <tr>
+          <td><code>ColorSpaceConverter</code></td>
+          <td>—</td>
+          <td>Converts between RGB, HSV, LAB color spaces.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- ── Feature Selection ─────────────────────────────────── -->
+    <h2 id="feature">Feature Selection &amp; Projection</h2>
+    <table>
+      <thead><tr><th>Class</th><th>Parameters</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>VarianceThreshold</code></td>
+          <td><code>minVariance=1e-4</code></td>
+          <td>Removes features whose variance falls below the threshold. Fast unsupervised selection.</td>
+        </tr>
+        <tr>
+          <td><code>SelectKBest</code></td>
+          <td><code>k=10</code></td>
+          <td>Selects K features with highest ANOVA F-score (supervised). Requires labeled dataset.</td>
+        </tr>
+        <tr>
+          <td><code>PrincipalComponentAnalysis</code></td>
+          <td><code>nComponents: int</code></td>
+          <td>PCA via SVD. Projects features to the top-k principal components.</td>
+        </tr>
+        <tr>
+          <td><code>LinearDiscriminantAnalysis</code></td>
+          <td><code>nComponents=null</code></td>
+          <td>Supervised dimensionality reduction maximizing class separability. nComponents ≤ (C−1).</td>
+        </tr>
+        <tr>
+          <td><code>TruncatedSVD</code></td>
+          <td><code>nComponents=2</code></td>
+          <td>Latent Semantic Analysis — SVD without mean centering. Suitable for sparse matrices.</td>
+        </tr>
+        <tr>
+          <td><code>GaussianRandomProjector</code></td>
+          <td><code>nComponents=100</code></td>
+          <td>Random Gaussian projection for fast approximate dimensionality reduction (Johnson-Lindenstrauss).</td>
+        </tr>
+        <tr>
+          <td><code>SparseRandomProjector</code></td>
+          <td>—</td>
+          <td>Sparse sign random projection — memory-efficient alternative to Gaussian projection.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- ── Imputers ───────────────────────────────────────────── -->
+    <h2 id="imputers">Imputers</h2>
+    <table>
+      <thead><tr><th>Class</th><th>Parameters</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>Imputer</code></td>
+          <td>—</td>
+          <td>Simple imputer: fills missing values with column mean, median, most frequent, or a constant. Configurable per strategy.</td>
+        </tr>
+        <tr>
+          <td><code>KNNImputer</code></td>
+          <td><code>k=5</code></td>
+          <td>Imputes missing values using the mean of K nearest (non-missing) neighbors. More accurate, slower.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- ── Class Imbalance ────────────────────────────────────── -->
+    <h2 id="imbalance">Class Imbalance</h2>
+    <table>
+      <thead><tr><th>Class</th><th>Parameters</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>SMOTE</code></td>
+          <td><code>amount=100, k=5</code></td>
+          <td>Synthetic Minority Over-sampling. Generates synthetic minority-class samples by interpolating between K nearest neighbors.</td>
+        </tr>
+        <tr>
+          <td><code>TomekLinks</code></td>
+          <td>—</td>
+          <td>Under-sampling by removing majority-class samples that form Tomek links (near-boundary pairs).</td>
+        </tr>
+        <tr>
+          <td><code>NeighborhoodClearing</code></td>
+          <td><code>k=3</code></td>
+          <td>Edited Nearest Neighbors — removes borderline samples. Cleans decision boundary.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- ── Other ─────────────────────────────────────────────── -->
+    <h2 id="other">Other Transformers</h2>
+    <table>
+      <thead><tr><th>Class</th><th>Parameters</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>LambdaFunction</code></td>
+          <td><code>fn: callable</code></td>
+          <td>Wraps any PHP callable as a stateless transformer. Useful for custom feature engineering steps.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- ── Example ─────────────────────────────────────────────── -->
+    <h2 id="example">Pipeline Example</h2>
+    <pre><code><span class="kw">use</span> <span class="ty">Pml\Pipeline</span>;
+<span class="kw">use</span> <span class="ty">Pml\Transformers\StandardScaler</span>;
+<span class="kw">use</span> <span class="ty">Pml\Transformers\Imputer</span>;
+<span class="kw">use</span> <span class="ty">Pml\Transformers\OrdinalEncoder</span>;
+<span class="kw">use</span> <span class="ty">Pml\Transformers\SelectKBest</span>;
+<span class="kw">use</span> <span class="ty">Pml\Transformers\SMOTE</span>;
+<span class="kw">use</span> <span class="ty">Pml\Estimators\Classifiers\GBDTClassifier</span>;
+
+<span class="va">$pipeline</span> = <span class="kw">new</span> <span class="ty">Pipeline</span>([
+    <span class="kw">new</span> <span class="ty">OrdinalEncoder</span>(columns: [<span class="st">'gender'</span>, <span class="st">'city'</span>]),
+    <span class="kw">new</span> <span class="ty">Imputer</span>(),                        <span class="cm">// fill NaNs with column mean</span>
+    <span class="kw">new</span> <span class="ty">StandardScaler</span>(),
+    <span class="kw">new</span> <span class="ty">SelectKBest</span>(k: <span class="nu">20</span>),              <span class="cm">// keep top-20 ANOVA features</span>
+    <span class="kw">new</span> <span class="ty">SMOTE</span>(amount: <span class="nu">150</span>, k: <span class="nu">5</span>),       <span class="cm">// oversample minority class</span>
+    <span class="kw">new</span> <span class="ty">GBDTClassifier</span>(nEstimators: <span class="nu">200</span>),
+]);
+
+<span class="va">$pipeline</span>-><span class="fn">train</span>(<span class="va">$trainSet</span>);
+<span class="va">$preds</span> = <span class="va">$pipeline</span>-><span class="fn">predict</span>(<span class="va">$testSet</span>);</code></pre>
+
+    <pre><code><span class="cm">// Text classification pipeline</span>
+<span class="kw">use</span> <span class="ty">Pml\Transformers\TextNormalizer</span>;
+<span class="kw">use</span> <span class="ty">Pml\Transformers\StopWordFilter</span>;
+<span class="kw">use</span> <span class="ty">Pml\Transformers\WordCountVectorizer</span>;
+<span class="kw">use</span> <span class="ty">Pml\Transformers\TfIdfTransformer</span>;
+<span class="kw">use</span> <span class="ty">Pml\Estimators\Classifiers\MultinomialNB</span>;
+
+<span class="va">$pipeline</span> = <span class="kw">new</span> <span class="ty">Pipeline</span>([
+    <span class="kw">new</span> <span class="ty">TextNormalizer</span>(),
+    <span class="kw">new</span> <span class="ty">StopWordFilter</span>([<span class="st">'the'</span>, <span class="st">'a'</span>, <span class="st">'is'</span>, <span class="st">'are'</span>]),
+    <span class="kw">new</span> <span class="ty">WordCountVectorizer</span>(maxFeatures: <span class="nu">10_000</span>),
+    <span class="kw">new</span> <span class="ty">TfIdfTransformer</span>(),
+    <span class="kw">new</span> <span class="ty">MultinomialNB</span>(alpha: <span class="nu">0.1</span>),
+]);
+
+<span class="va">$pipeline</span>-><span class="fn">train</span>(<span class="va">$trainSet</span>);
+<span class="va">$sentiment</span> = <span class="va">$pipeline</span>-><span class="fn">predict</span>(<span class="va">$testSet</span>);</code></pre>
+
+    <div class="callout callout-info">
+      <strong>Stateless vs Stateful Transformers</strong>
+      Scalers, encoders, and vectorizers compute their parameters on <code>fit()</code> and store them.
+      You must <code>fit()</code> on training data only, then <code>transform()</code> on test data.
+      The <code>fitTransform()</code> shortcut does both in one call (training data only).
+    </div>
+
+  </div>
+
+  <footer>
+    <span>PML Framework</span>
+    <span>Next: <a href="neural-network.html">Neural Networks →</a></span>
+  </footer>
+</div>
+
+<script>
+function toggleGroup(el) {
+  el.classList.toggle('open');
+  el.nextElementSibling.classList.toggle('open');
+}
+document.getElementById('nav-search').addEventListener('input', function () {
+  const q = this.value.toLowerCase();
+  document.querySelectorAll('.nav-link').forEach(function (a) {
+    a.style.display = a.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+});
+</script>
+</body>
+</html>

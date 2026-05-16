@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tensor — PML Framework</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav id="sidebar">
+  <div class="sidebar-header">
+    <a href="index.html" class="logo">PML Framework</a>
+    <div class="version">v7.0 · PHP 8.2+ · FFI/C Backend</div>
+  </div>
+  <div class="sidebar-search"><input type="text" id="nav-search" placeholder="Filter pages..." autocomplete="off"></div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Overview</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="index.html" class="nav-link">Home</a>
+      <a href="getting-started.html" class="nav-link">Getting Started</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Core</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="tensor.html" class="nav-link active">Tensor</a>
+      <a href="dataset.html" class="nav-link">Dataset &amp; DataFrame</a>
+      <a href="tensor.html#arena" class="nav-link">Arena (Memory Pool)</a>
+      <a href="tensor.html#quantized" class="nav-link">QuantizedTensor</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Estimators</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="estimators.html#classifiers" class="nav-link">Classifiers</a>
+      <a href="estimators.html#regressors" class="nav-link">Regressors</a>
+      <a href="estimators.html#anomaly" class="nav-link">Anomaly Detectors</a>
+      <a href="estimators.html#clusterers" class="nav-link">Clusterers</a>
+      <a href="estimators.html#decomposition" class="nav-link">Decomposition</a>
+      <a href="estimators.html#meta" class="nav-link">Meta Estimators</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Transformers</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="transformers.html" class="nav-link">All Transformers</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Neural Networks</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="neural-network.html" class="nav-link">Sequential &amp; Layers</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Training</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="training.html" class="nav-link">Trainer &amp; Args</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Inference &amp; LLM</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="inference.html" class="nav-link">InferenceSession</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Vision</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="vision.html" class="nav-link">Vision Module</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Pipeline &amp; CV</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="pipeline.html" class="nav-link">Pipeline &amp; Cross-Validation</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Roadmap</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="roadmap.html" class="nav-link">Vulkan GPU Support</a></div>
+  </div>
+</nav>
+
+<div id="main">
+  <div class="topbar">
+    <div class="topbar-breadcrumb"><a href="index.html">PML</a> / <a href="tensor.html">Core</a> / Tensor</div>
+    <div class="topbar-links">
+      <a href="dataset.html">Dataset →</a>
+    </div>
+  </div>
+
+  <div class="content">
+    <div class="page-hero">
+      <span class="page-tag">Core</span>
+      <h1>Tensor</h1>
+      <p class="page-lead">
+        The fundamental data structure of PML. A <code>Tensor</code> is a PHP object that holds a pointer to a
+        C-allocated, 64-byte aligned, contiguous float32 (or int32/int64) buffer.
+        All math is executed in C. PHP never copies the raw bytes.
+      </p>
+    </div>
+
+    <div class="toc-inline">
+      <h5>On this page</h5>
+      <ol>
+        <li><a href="#memory">Memory Model</a></li>
+        <li><a href="#creation">Creation</a></li>
+        <li><a href="#properties">Properties &amp; Shape</a></li>
+        <li><a href="#indexing">Indexing &amp; Views</a></li>
+        <li><a href="#arithmetic">Arithmetic</a></li>
+        <li><a href="#inplace">In-place Operations</a></li>
+        <li><a href="#elementwise">Unary / Element-wise</a></li>
+        <li><a href="#reduction">Reductions</a></li>
+        <li><a href="#linalg">Linear Algebra</a></li>
+        <li><a href="#shape">Shape Ops</a></li>
+        <li><a href="#fused">Fused Kernels</a></li>
+        <li><a href="#io">Serialization</a></li>
+        <li><a href="#arena">Arena — Memory Pool</a></li>
+        <li><a href="#quantized">QuantizedTensor (INT8)</a></li>
+      </ol>
+    </div>
+
+    <!-- ── Memory Model ──────────────────────────────────────────── -->
+    <h2 id="memory">Memory Model</h2>
+    <p>
+      Each <code>Tensor</code> wraps a <code>TensorC*</code> pointer. The C struct holds a
+      <code>float*</code> (64-byte aligned via <code>posix_memalign</code>), shape info,
+      stride info, total element count, and a reference-count field used for views.
+      PHP's <code>__destruct()</code> decrements the ref-count; memory is freed when it reaches zero.
+    </p>
+    <div class="callout callout-info">
+      <strong>Zero-Copy View Rule</strong>
+      <code>view()</code>, <code>row()</code>, <code>col()</code>, <code>slice()</code>, and
+      <code>transpose()</code> return <em>views</em> — they do not allocate new C memory.
+      Operations that require contiguous memory (BLAS calls, saves) will call
+      <code>contiguous()</code> internally or throw.
+    </div>
+
+    <!-- ── Creation ──────────────────────────────────────────────── -->
+    <h2 id="creation">Creation</h2>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">zeros</span>
+        <span class="method-sig">static (int ...$shape): Tensor</span>
+      </div>
+      <div class="api-block-body">
+        <p>Allocates a zero-filled tensor with the given shape.</p>
+        <pre><code><span class="va">$t</span> = <span class="ty">Tensor</span>::<span class="fn">zeros</span>(<span class="nu">3</span>, <span class="nu">4</span>);   <span class="cm">// [3, 4] of 0.0</span></code></pre>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">ones</span>
+        <span class="method-sig">static (int ...$shape): Tensor</span>
+      </div>
+      <div class="api-block-body">
+        <p>Allocates a one-filled tensor.</p>
+        <pre><code><span class="va">$t</span> = <span class="ty">Tensor</span>::<span class="fn">ones</span>(<span class="nu">8</span>);</code></pre>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">randomNormal</span>
+        <span class="method-sig">static (array $shape, float $mean = 0.0, float $stddev = 1.0, ?CData $arena = null): Tensor</span>
+      </div>
+      <div class="api-block-body">
+        <p>Samples from N(mean, stddev²). Used by Dense, Embedding, and most initializers. Can allocate from an Arena.</p>
+        <pre><code><span class="va">$W</span> = <span class="ty">Tensor</span>::<span class="fn">randomNormal</span>([<span class="nu">512</span>, <span class="nu">256</span>], <span class="nu">0.0</span>, <span class="fn">sqrt</span>(<span class="nu">2.0</span>/<span class="nu">256</span>));</code></pre>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">randomUniform</span>
+        <span class="method-sig">static (array $shape, float $min = 0.0, float $max = 1.0, ?CData $arena = null): Tensor</span>
+      </div>
+      <div class="api-block-body">
+        <p>Uniform random in [min, max).</p>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">range</span>
+        <span class="method-sig">static (float $start, float $end, float $step = 1.0): Tensor</span>
+      </div>
+      <div class="api-block-body">
+        <p>1-D arange, equivalent to NumPy <code>np.arange(start, end, step)</code>.</p>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">linspace</span>
+        <span class="method-sig">static (float $start, float $end, int $steps): Tensor</span>
+      </div>
+      <div class="api-block-body">
+        <p>Evenly spaced values including both endpoints.</p>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">fromArray</span>
+        <span class="method-sig">static (array $data, int $dtype = DTYPE_FLOAT32): Tensor</span>
+      </div>
+      <div class="api-block-body">
+        <p>Copies a nested PHP array into a new C tensor. Supports 1-D and 2-D arrays. Do not use on large datasets — prefer <code>Dataset::fromCsv()</code> for files.</p>
+        <pre><code><span class="va">$t</span> = <span class="ty">Tensor</span>::<span class="fn">fromArray</span>([[<span class="nu">1.0</span>, <span class="nu">2.0</span>], [<span class="nu">3.0</span>, <span class="nu">4.0</span>]]);</code></pre>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">emptyLike</span>
+        <span class="method-sig">static (Tensor $t): Tensor</span>
+      </div>
+      <div class="api-block-body">
+        <p>Allocates an uninitialised tensor with the same shape and dtype as <code>$t</code>. Faster than <code>zeros</code> when the buffer will be fully overwritten.</p>
+      </div>
+    </div>
+
+    <!-- ── Properties ─────────────────────────────────────────────── -->
+    <h2 id="properties">Properties &amp; Shape</h2>
+    <table>
+      <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>shape()</code></td><td><code>int[]</code></td><td>Array of dimension sizes, e.g. <code>[64, 128]</code></td></tr>
+        <tr><td><code>ndim()</code></td><td><code>int</code></td><td>Number of dimensions</td></tr>
+        <tr><td><code>size()</code></td><td><code>int</code></td><td>Total element count (product of all dims)</td></tr>
+        <tr><td><code>dtype()</code></td><td><code>int</code></td><td><code>DTYPE_FLOAT32</code>, <code>DTYPE_INT32</code>, or <code>DTYPE_INT64</code></td></tr>
+        <tr><td><code>isContiguous()</code></td><td><code>bool</code></td><td>True if strides match a row-major layout</td></tr>
+      </tbody>
+    </table>
+
+    <h4>Data-type constants</h4>
+    <pre><code><span class="ty">Tensor</span>::<span class="va">DTYPE_FLOAT32</span>   <span class="cm">// 0 — default, 32-bit float</span>
+<span class="ty">Tensor</span>::<span class="va">DTYPE_INT32</span>     <span class="cm">// 1 — 32-bit integer</span>
+<span class="ty">Tensor</span>::<span class="va">DTYPE_INT64</span>     <span class="cm">// 2 — 64-bit integer (token ids)</span></code></pre>
+
+    <!-- ── Indexing ─────────────────────────────────────────────── -->
+    <h2 id="indexing">Indexing &amp; Views</h2>
+    <div class="callout callout-tip">
+      <strong>All view operations are O(1)</strong> — they change strides and offset, not data.
+      If you then need contiguous data (e.g., for a BLAS call) use <code>contiguous()</code>.
+    </div>
+    <table>
+      <thead><tr><th>Method</th><th>Signature</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>view()</code></td><td><code>(): self</code></td><td>View with same data pointer, increments ref-count</td></tr>
+        <tr><td><code>row(int $r)</code></td><td><code>(): self</code></td><td>View of one row of a 2-D tensor → 1-D</td></tr>
+        <tr><td><code>col(int $c)</code></td><td><code>(): self</code></td><td>View of one column (non-contiguous stride)</td></tr>
+        <tr><td><code>slice(int $axis, int $start, int $len)</code></td><td><code>(): self</code></td><td>Sub-tensor slice along an axis</td></tr>
+        <tr><td><code>sliceStep(int $axis, int $start, int $end, int $step)</code></td><td><code>(): self</code></td><td>Strided slice (like Python <code>a[::2]</code>)</td></tr>
+        <tr><td><code>copy()</code></td><td><code>(): self</code></td><td>Deep copy — allocates new C memory</td></tr>
+        <tr><td><code>contiguous()</code></td><td><code>(): self</code></td><td>Returns self if already contiguous, else copies to contiguous buffer</td></tr>
+        <tr><td><code>fill(float $val)</code></td><td><code>(): self</code></td><td>Fills all elements in-place, returns self</td></tr>
+        <tr><td><code>copyFrom(Tensor $src)</code></td><td><code>(): void</code></td><td>Overwrites this tensor's data with <code>$src</code> (shapes must match)</td></tr>
+        <tr><td><code>toFlatArray()</code></td><td><code>(): float[]</code></td><td>Copies C memory into a PHP array — avoid in hot paths</td></tr>
+        <tr><td><code>buffer()</code></td><td><code>(): CData</code></td><td>Raw <code>float*</code> CData pointer for zero-copy FFI interop</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Arithmetic ─────────────────────────────────────────────── -->
+    <h2 id="arithmetic">Arithmetic (returns new Tensor)</h2>
+    <table>
+      <thead><tr><th>Method</th><th>Operation</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>add(Tensor $b)</code></td><td>A + B</td><td>Broadcasting supported</td></tr>
+        <tr><td><code>sub(Tensor $b)</code></td><td>A − B</td><td></td></tr>
+        <tr><td><code>mul(Tensor $b)</code></td><td>A ⊙ B</td><td>Element-wise (Hadamard)</td></tr>
+        <tr><td><code>div(Tensor $b)</code></td><td>A ÷ B</td><td></td></tr>
+        <tr><td><code>pow(Tensor $b)</code></td><td>A^B</td><td>Element-wise power</td></tr>
+        <tr><td><code>addScalar(float $v)</code></td><td>A + v</td><td></td></tr>
+        <tr><td><code>mulScalar(float $v)</code></td><td>A × v</td><td></td></tr>
+        <tr><td><code>clip(float $min, float $max)</code></td><td>clamp(A)</td><td></td></tr>
+        <tr><td><code>lessScalar(float $v)</code></td><td>A &lt; v → {0,1}</code></td><td>Boolean mask as float</td></tr>
+        <tr><td><code>greaterScalar(float $v)</code></td><td>A &gt; v → {0,1}</code></td><td></td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── In-place ─────────────────────────────────────────────── -->
+    <h2 id="inplace">In-place Operations</h2>
+    <p>All in-place methods modify the tensor and return <code>$this</code> for chaining. No heap allocation.</p>
+    <table>
+      <thead><tr><th>Method</th><th>Operation</th></tr></thead>
+      <tbody>
+        <tr><td><code>addInplace(Tensor $b)</code></td><td>A += B</td></tr>
+        <tr><td><code>subInplace(Tensor $b)</code></td><td>A -= B</td></tr>
+        <tr><td><code>mulInplace(Tensor $b)</code></td><td>A *= B</td></tr>
+        <tr><td><code>divInplace(Tensor $b)</code></td><td>A /= B</td></tr>
+        <tr><td><code>addScalarInplace(float $v)</code></td><td>A += v</td></tr>
+        <tr><td><code>mulScalarInplace(float $v)</code></td><td>A *= v</td></tr>
+        <tr><td><code>clampInplace(float $lo, float $hi)</code></td><td>A = clamp(A, lo, hi)</td></tr>
+        <tr><td><code>expInplace()</code></td><td>A = exp(A)</td></tr>
+        <tr><td><code>logInplace()</code></td><td>A = log(A)</td></tr>
+        <tr><td><code>sqrtInplace()</code></td><td>A = sqrt(A)</td></tr>
+        <tr><td><code>sigmoidInplace()</code></td><td>A = σ(A)</td></tr>
+        <tr><td><code>tanhInplace()</code></td><td>A = tanh(A)</td></tr>
+        <tr><td><code>reluInplace()</code></td><td>A = max(0, A)</td></tr>
+        <tr><td><code>rowSoftmaxInplace()</code></td><td>Softmax over last axis, numerically stable</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Element-wise ─────────────────────────────────────────── -->
+    <h2 id="elementwise">Unary / Element-wise (returns new Tensor)</h2>
+    <div class="card-grid">
+      <div class="card-sm">
+        <h4>Math</h4>
+        <p class="text-mono text-muted" style="font-size:0.78rem;">
+          sqrt() · square() · abs() · sign() · exp() · log() · log1p() · round() · floor() · ceil()
+        </p>
+      </div>
+      <div class="card-sm">
+        <h4>Trig</h4>
+        <p class="text-mono text-muted" style="font-size:0.78rem;">
+          sin() · cos() · tan() · asin() · acos() · atan()
+        </p>
+      </div>
+      <div class="card-sm">
+        <h4>Activations</h4>
+        <p class="text-mono text-muted" style="font-size:0.78rem;">
+          sigmoid() · tanh() · relu() · gelu() · silu() · elu() · selu() · softplus() · mish()
+        </p>
+      </div>
+      <div class="card-sm">
+        <h4>Norm</h4>
+        <p class="text-mono text-muted" style="font-size:0.78rem;">
+          softmax(int $axis) · logSoftmax(int $axis) · layerNorm(Tensor $g, Tensor $b, float $eps)
+        </p>
+      </div>
+    </div>
+
+    <!-- ── Reduction ─────────────────────────────────────────────── -->
+    <h2 id="reduction">Reductions</h2>
+    <table>
+      <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>sum()</code></td><td><code>float</code></td><td>Sum of all elements</td></tr>
+        <tr><td><code>mean()</code></td><td><code>float</code></td><td>Mean of all elements</td></tr>
+        <tr><td><code>max()</code></td><td><code>float</code></td><td>Global maximum</td></tr>
+        <tr><td><code>min()</code></td><td><code>float</code></td><td>Global minimum</td></tr>
+        <tr><td><code>sumAxis(int $axis)</code></td><td><code>Tensor</code></td><td>Reduces along axis, removes that dim</td></tr>
+        <tr><td><code>meanAxis(int $axis)</code></td><td><code>Tensor</code></td><td>Mean along axis</td></tr>
+        <tr><td><code>maxAxis(int $axis)</code></td><td><code>Tensor</code></td><td>Max along axis</td></tr>
+        <tr><td><code>minAxis(int $axis)</code></td><td><code>Tensor</code></td><td>Min along axis</td></tr>
+        <tr><td><code>argmax()</code></td><td><code>int</code></td><td>Global argmax (flat index)</td></tr>
+        <tr><td><code>argmaxAxis(int $axis)</code></td><td><code>Tensor</code></td><td>Argmax along axis (int32 result)</td></tr>
+        <tr><td><code>argmin()</code></td><td><code>int</code></td><td>Global argmin</td></tr>
+        <tr><td><code>std(bool $bessel = true)</code></td><td><code>float</code></td><td>Standard deviation</td></tr>
+        <tr><td><code>variance(bool $bessel = true)</code></td><td><code>float</code></td><td>Variance</td></tr>
+        <tr><td><code>normL2()</code></td><td><code>float</code></td><td>L2 norm</td></tr>
+        <tr><td><code>sumAxisInto(Tensor $src, int $axis)</code></td><td><code>void</code></td><td>Zero-allocation sum: writes result into pre-allocated tensor</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Linear Algebra ─────────────────────────────────────────── -->
+    <h2 id="linalg">Linear Algebra</h2>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">matmul</span>
+        <span class="method-sig">(Tensor $b, bool $transposeA = false, bool $transposeB = false): Tensor</span>
+        <span class="return-type">Tensor</span>
+      </div>
+      <div class="api-block-body">
+        <p>General matrix multiply via OpenBLAS SGEMM. Supports batched matmul for 3-D tensors (batch × M × K) × (batch × K × N).</p>
+        <pre><code><span class="va">$C</span> = <span class="va">$A</span>-><span class="fn">matmul</span>(<span class="va">$B</span>);              <span class="cm">// [M,K] × [K,N] → [M,N]</span>
+<span class="va">$C</span> = <span class="va">$A</span>-><span class="fn">matmul</span>(<span class="va">$B</span>, <span class="kw">true</span>);       <span class="cm">// A^T × B</span></code></pre>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">matmulInto</span>
+        <span class="method-sig">(Tensor $a, Tensor $b, bool $transposeA = false, bool $transposeB = false): void</span>
+      </div>
+      <div class="api-block-body">
+        <p>Zero-allocation GEMM: writes result into <code>$this</code> (pre-allocated buffer). Used by Dense::backward() to reuse gradient buffers across steps.</p>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">linear</span>
+        <span class="method-sig">(Tensor $W, ?Tensor $bias = null): Tensor</span>
+        <span class="return-type">Tensor</span>
+      </div>
+      <div class="api-block-body">
+        <p>Fused <code>X @ W^T + bias</code> in one BLAS call. Used by Dense::forward(). Shape: X[batch, in] × W[out, in]^T → [batch, out].</p>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">pairwiseSqL2</span>
+        <span class="method-sig">static (Tensor $A, Tensor $B): Tensor</span>
+        <span class="return-type">Tensor [N, M]</span>
+      </div>
+      <div class="api-block-body">
+        <p>Squared Euclidean distance matrix between every pair of rows. Used by KNN, DBSCAN, KMeans. O(NM·D) via BLAS.</p>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">ridgeSolve</span>
+        <span class="method-sig">static (Tensor $X, Tensor $y, float $lambda = 1.0): Tensor</span>
+        <span class="return-type">Tensor [D]</span>
+      </div>
+      <div class="api-block-body">
+        <p>Closed-form Ridge regression: W = (X^T X + λI)⁻¹ X^T y via LAPACKE SGESV.</p>
+      </div>
+    </div>
+
+    <table>
+      <thead><tr><th>Method</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>svd(): array</code></td><td>Returns <code>[U, S, Vt]</code> via LAPACKE SGESVD. Used by PCA, TruncatedSVD, LDA.</td></tr>
+        <tr><td><code>dot(Tensor $b): float</code></td><td>1-D inner product</td></tr>
+        <tr><td><code>outer(Tensor $b): Tensor</code></td><td>Outer product → 2-D matrix</td></tr>
+        <tr><td><code>norm(int $ord = 2): float</code></td><td>Vector or matrix norm</td></tr>
+        <tr><td><code>addRelu(Tensor $b): Tensor</code></td><td>Fused (A + B) then ReLU — one kernel, no intermediate tensor</td></tr>
+        <tr><td><code>mulAdd(Tensor $B, Tensor $C): Tensor</code></td><td>Fused A⊙B + C (FMA)</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Shape ops ─────────────────────────────────────────────── -->
+    <h2 id="shape">Shape Ops</h2>
+    <table>
+      <thead><tr><th>Method</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>reshape(int ...$shape)</code></td><td>Returns view with new shape (must have same element count)</td></tr>
+        <tr><td><code>flatten()</code></td><td>Reshape to 1-D</td></tr>
+        <tr><td><code>expandDims(int $axis)</code></td><td>Insert size-1 dimension at <code>$axis</code></td></tr>
+        <tr><td><code>squeeze()</code></td><td>Remove all size-1 dimensions</td></tr>
+        <tr><td><code>transpose()</code></td><td>2-D matrix transpose (view, no copy)</td></tr>
+        <tr><td><code>transposeNd(array $axes)</code></td><td>N-D permutation, e.g. <code>[1,0,2]</code></td></tr>
+        <tr><td><code>swapaxes(int $a, int $b)</code></td><td>Swap two axes</td></tr>
+        <tr><td><code>concat(Tensor $b, int $axis = 0)</code></td><td>Concatenate two tensors along an axis</td></tr>
+        <tr><td><code>stack(array $tensors, int $axis = 0)</code></td><td>Stack list of tensors into new dimension</td></tr>
+        <tr><td><code>split(int $chunks, int $axis = 0)</code></td><td>Split into N equal chunks along axis</td></tr>
+        <tr><td><code>pad(array $padding, float $val = 0.0)</code></td><td>Zero/constant pad on any axis</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Fused Kernels ─────────────────────────────────────────── -->
+    <h2 id="fused">Fused Kernels</h2>
+    <p>These are hand-written C kernels that combine multiple operations to avoid intermediate tensors:</p>
+    <table>
+      <thead><tr><th>Method</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>fusedBceLossAndGrad(Tensor $preds, Tensor $targets, ?Tensor $grads)</code></td><td>Binary cross-entropy loss + gradient in one pass</td></tr>
+        <tr><td><code>fusedAdamStep(Tensor $p, Tensor $g, Tensor $m, Tensor $v, float $lr, ...)</code></td><td>Adam optimizer step — no intermediate allocation</td></tr>
+        <tr><td><code>fusedAdamWStep(...)</code></td><td>AdamW (decoupled weight decay)</td></tr>
+        <tr><td><code>fusedSgdStep(Tensor $p, Tensor $g, float $lr)</code></td><td>SGD weight update</td></tr>
+        <tr><td><code>fusedRmsPropStep(...)</code></td><td>RMSProp update</td></tr>
+        <tr><td><code>fusedAdaGradStep(...)</code></td><td>AdaGrad update</td></tr>
+        <tr><td><code>configureThreading(int $omp, int $blas = 1)</code></td><td>Set OpenMP and OpenBLAS thread counts at runtime</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── I/O ─────────────────────────────────────────────────── -->
+    <h2 id="io">Serialization</h2>
+    <table>
+      <thead><tr><th>Method</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>save(string $filepath)</code></td><td>Write tensor to a raw binary file (<code>.tensor</code>)</td></tr>
+        <tr><td><code>load(string $filepath)</code></td><td>Read tensor from raw binary file</td></tr>
+        <tr><td><code>saveSafetensors(string $path, string $header, Tensor[] $tensors)</code></td><td>Write HuggingFace SafeTensors format (multiple tensors)</td></tr>
+        <tr><td><code>datasetFromCsv(string $path, int $labelCol, bool $header)</code></td><td>mmap CSV → [Tensor $X, Tensor $y]. Never loads full file into PHP heap.</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Arena ─────────────────────────────────────────────────── -->
+    <h2 id="arena">Arena — Memory Pool</h2>
+    <p>
+      <code>Arena</code> is a bump-pointer memory pool backed by a single <code>malloc</code> call.
+      Allocating from an Arena is O(1) with no per-object overhead.
+      All tensors allocated from an Arena are freed at once when <code>reset()</code> or
+      <code>__destruct()</code> is called — ideal for per-batch scratch memory.
+    </p>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">__construct</span>
+        <span class="method-sig">(int $capacityBytes = 32 * 1024 * 1024)</span>
+      </div>
+      <div class="api-block-body">
+        <p>Pre-allocates the arena buffer. Default is 32 MB. Choose a size that fits your largest batch.</p>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">tensor</span>
+        <span class="method-sig">(array $shape, int $dtype = DTYPE_FLOAT32): Tensor</span>
+        <span class="return-type">Tensor</span>
+      </div>
+      <div class="api-block-body">
+        <p>Bump-allocates a tensor from the pool. O(1), no malloc. The returned Tensor is only valid until <code>reset()</code>.</p>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">reset</span>
+        <span class="method-sig">(): void</span>
+      </div>
+      <div class="api-block-body">
+        <p>Resets the bump pointer to the start. All previously allocated tensors are invalid after this call.</p>
+      </div>
+    </div>
+
+    <pre><code><span class="kw">use</span> <span class="ty">Pml\Lib\Arena</span>;
+<span class="kw">use</span> <span class="ty">Pml\Tensor</span>;
+
+<span class="va">$arena</span> = <span class="kw">new</span> <span class="ty">Arena</span>(<span class="nu">64</span> * <span class="nu">1024</span> * <span class="nu">1024</span>); <span class="cm">// 64 MB pool</span>
+
+<span class="kw">foreach</span> (<span class="va">$batches</span> <span class="kw">as</span> <span class="va">$batch</span>) {
+    <span class="cm">// Scratch tensors allocated from the pool — no malloc</span>
+    <span class="va">$tmp1</span> = <span class="ty">Tensor</span>::<span class="fn">randomNormal</span>([<span class="nu">128</span>, <span class="nu">256</span>], arena: <span class="va">$arena</span>-><span class="fn">ptr</span>());
+    <span class="va">$tmp2</span> = <span class="va">$arena</span>-><span class="fn">tensor</span>([<span class="nu">128</span>, <span class="nu">256</span>]);
+
+    <span class="cm">// ... compute ...</span>
+
+    <span class="va">$arena</span>-><span class="fn">reset</span>(); <span class="cm">// reclaim all scratch memory instantly</span>
+}</code></pre>
+
+    <!-- ── QuantizedTensor ─────────────────────────────────────── -->
+    <h2 id="quantized">QuantizedTensor (INT8 Block Quantization)</h2>
+    <p>
+      <code>QuantizedTensor</code> wraps a <code>QuantizedWeight*</code> C struct: an INT8 weight matrix
+      with per-group-of-32 float32 scale factors (Q8_0-class format). Compression is ~4× vs fp32.
+      The forward kernel uses AVX2 fused int8→fp32 dot products — no temporary weight allocation.
+    </p>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">fromTensor</span>
+        <span class="method-sig">static (Tensor $w, int $groupSize = 32): self</span>
+      </div>
+      <div class="api-block-body">
+        <p>Quantizes a fp32 weight matrix to INT8. Each group of <code>$groupSize</code> elements shares a scale factor. Smaller groups → less quantization error, more scale overhead.</p>
+        <pre><code><span class="va">$qw</span> = <span class="ty">QuantizedTensor</span>::<span class="fn">fromTensor</span>(<span class="va">$weights</span>, groupSize: <span class="nu">32</span>);</code></pre>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">linear</span>
+        <span class="method-sig">(Tensor $X, ?Tensor $bias = null): Tensor</span>
+        <span class="return-type">Tensor</span>
+      </div>
+      <div class="api-block-body">
+        <p>Quantized linear forward: <code>Y = X @ W^T + bias</code>. Hot path for LLM decode — AVX2 fused, OpenMP-parallel over rows. No temporary fp32 weight buffer.</p>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">toTensor</span>
+        <span class="method-sig">(): Tensor</span>
+      </div>
+      <div class="api-block-body">
+        <p>Dequantizes back to fp32. Use only for checkpoint export — not in decode hot path.</p>
+      </div>
+    </div>
+
+    <table>
+      <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>rows()</code></td><td><code>int</code></td><td>Output dimension</td></tr>
+        <tr><td><code>cols()</code></td><td><code>int</code></td><td>Input dimension</td></tr>
+        <tr><td><code>groupSize()</code></td><td><code>int</code></td><td>Elements per quantization group</td></tr>
+        <tr><td><code>numGroups()</code></td><td><code>int</code></td><td>Total number of groups</td></tr>
+        <tr><td><code>memoryBytes()</code></td><td><code>int</code></td><td>Bytes used by data + scales (excludes struct header)</td></tr>
+        <tr><td><code>compressionRatio()</code></td><td><code>float</code></td><td>fp32 bytes ÷ INT8 bytes (typically ~3.9×)</td></tr>
+      </tbody>
+    </table>
+
+    <pre><code><span class="kw">use</span> <span class="ty">Pml\QuantizedTensor</span>;
+<span class="kw">use</span> <span class="ty">Pml\Tensor</span>;
+
+<span class="va">$W</span>   = <span class="ty">Tensor</span>::<span class="fn">randomNormal</span>([<span class="nu">4096</span>, <span class="nu">4096</span>]);   <span class="cm">// 64 MB fp32</span>
+<span class="va">$qW</span>  = <span class="ty">QuantizedTensor</span>::<span class="fn">fromTensor</span>(<span class="va">$W</span>, <span class="nu">32</span>);   <span class="cm">// ~16 MB INT8</span>
+<span class="va">$W</span>   = <span class="kw">null</span>;                                  <span class="cm">// free fp32</span>
+
+<span class="fn">printf</span>(<span class="st">"Compression: %.2f×\n"</span>, <span class="va">$qW</span>-><span class="fn">compressionRatio</span>());
+<span class="cm">// → Compression: 3.94×</span>
+
+<span class="va">$X</span>   = <span class="ty">Tensor</span>::<span class="fn">randomNormal</span>([<span class="nu">1</span>, <span class="nu">4096</span>]);
+<span class="va">$out</span> = <span class="va">$qW</span>-><span class="fn">linear</span>(<span class="va">$X</span>);                       <span class="cm">// AVX2 fused kernel</span></code></pre>
+
+    <div class="callout callout-warn">
+      <strong>Backward not supported</strong>
+      Once a layer is quantized it is permanently in inference mode. Calling <code>backward()</code> on a quantized Dense layer throws <code>LogicException</code>.
+    </div>
+
+  </div>
+
+  <footer>
+    <span>PML Framework</span>
+    <span>Next: <a href="dataset.html">Dataset &amp; DataFrame →</a></span>
+  </footer>
+</div>
+
+<script>
+function toggleGroup(el) {
+  el.classList.toggle('open');
+  el.nextElementSibling.classList.toggle('open');
+}
+document.getElementById('nav-search').addEventListener('input', function () {
+  const q = this.value.toLowerCase();
+  document.querySelectorAll('.nav-link').forEach(function (a) {
+    a.style.display = a.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+});
+</script>
+</body>
+</html>

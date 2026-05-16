@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vision — PML Framework</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav id="sidebar">
+  <div class="sidebar-header">
+    <a href="index.html" class="logo">PML Framework</a>
+    <div class="version">v7.0 · PHP 8.2+ · FFI/C Backend</div>
+  </div>
+  <div class="sidebar-search"><input type="text" id="nav-search" placeholder="Filter pages..." autocomplete="off"></div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Overview</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="index.html" class="nav-link">Home</a>
+      <a href="getting-started.html" class="nav-link">Getting Started</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Core</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="tensor.html" class="nav-link">Tensor</a>
+      <a href="dataset.html" class="nav-link">Dataset &amp; DataFrame</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Estimators</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="estimators.html#classifiers" class="nav-link">Classifiers</a>
+      <a href="estimators.html#regressors" class="nav-link">Regressors</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Transformers</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="transformers.html" class="nav-link">All Transformers</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Neural Networks</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="neural-network.html" class="nav-link">Sequential &amp; Layers</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Training</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="training.html" class="nav-link">Trainer &amp; Args</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Inference &amp; LLM</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="inference.html" class="nav-link">InferenceSession</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Vision</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="vision.html#image" class="nav-link active">Image</a>
+      <a href="vision.html#models" class="nav-link active">Models</a>
+      <a href="vision.html#detection" class="nav-link active">Detection</a>
+      <a href="vision.html#segmentation" class="nav-link active">Segmentation</a>
+      <a href="vision.html#augment" class="nav-link active">Augmentation</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Pipeline &amp; CV</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="pipeline.html" class="nav-link">Pipeline &amp; CV</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Roadmap</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="roadmap.html" class="nav-link">Vulkan GPU Support</a></div>
+  </div>
+</nav>
+
+<div id="main">
+  <div class="topbar">
+    <div class="topbar-breadcrumb"><a href="index.html">PML</a> / Vision</div>
+    <div class="topbar-links"><a href="pipeline.html">Pipeline →</a></div>
+  </div>
+
+  <div class="content">
+    <div class="page-hero">
+      <span class="page-tag">Vision</span>
+      <h1>Vision Module</h1>
+      <p class="page-lead">
+        A complete computer vision pipeline: image I/O, transforms, augmentation,
+        classification (MobileNetV3), and object detection (YOLO11n, NanoDet, PicoDet, SSDLite).
+        Backed by <code>libvision.so</code> — 106 C functions across 8 source files.
+      </p>
+    </div>
+
+    <div class="toc-inline">
+      <h5>On this page</h5>
+      <ol>
+        <li><a href="#backend">Backend &amp; Enums</a></li>
+        <li><a href="#image">Image</a></li>
+        <li><a href="#augment">Augmentation</a></li>
+        <li><a href="#models">Classification Models</a></li>
+        <li><a href="#detection">Object Detection</a></li>
+        <li><a href="#segmentation">Segmentation</a></li>
+        <li><a href="#example">Example: Detect + Classify</a></li>
+      </ol>
+    </div>
+
+    <!-- ── Backend ───────────────────────────────────────────── -->
+    <h2 id="backend">Backend &amp; Enums</h2>
+    <p>
+      <code>Pml\Lib\VisionEngine</code> is the FFI singleton for <code>libvision.so</code>.
+      All Vision classes call it via <code>VisionEngine::get()</code>.
+      Build: see <a href="getting-started.html#build-vision">Getting Started → Building libvision.so</a>.
+    </p>
+    <table>
+      <thead><tr><th>Enum class</th><th>Constants</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>Interp</code></td><td><code>NEAREST, BILINEAR, BICUBIC, AREA</code></td><td>Interpolation modes for resize/rotate</td></tr>
+        <tr><td><code>ColorSpace</code></td><td><code>RGB, BGR, GRAY, HSV, LAB, YUV</code></td><td>Color space identifiers</td></tr>
+        <tr><td><code>PixelFormat</code></td><td><code>UINT8, FLOAT32</code></td><td>Pixel data type</td></tr>
+        <tr><td><code>Layout</code></td><td><code>HWC, CHW</code></td><td>Memory layout for tensor export</td></tr>
+        <tr><td><code>Border</code></td><td><code>CONSTANT, REFLECT, REPLICATE</code></td><td>Padding border mode</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Image ─────────────────────────────────────────────── -->
+    <h2 id="image">Image</h2>
+    <p>
+      <code>Pml\Vision\Image</code> wraps a <code>VisionImage*</code> C struct.
+      All operations return <code>$this</code> for fluent chaining and are zero-copy where possible.
+    </p>
+
+    <h3>Loading</h3>
+    <pre><code><span class="kw">use</span> <span class="ty">Pml\Vision\Image</span>;
+
+<span class="va">$img</span> = <span class="ty">Image</span>::<span class="fn">fromFile</span>(<span class="st">'photo.jpg'</span>);       <span class="cm">// JPEG/PNG/BMP/TIFF</span>
+<span class="va">$img</span> = <span class="ty">Image</span>::<span class="fn">fromTensor</span>(<span class="va">$tensor</span>);          <span class="cm">// wrap a [H, W, C] or [C, H, W] Tensor</span>
+<span class="va">$img</span> = <span class="ty">Image</span>::<span class="fn">blank</span>(width: <span class="nu">224</span>, height: <span class="nu">224</span>, channels: <span class="nu">3</span>);</code></pre>
+
+    <h3>Metadata</h3>
+    <table>
+      <thead><tr><th>Method</th><th>Returns</th></tr></thead>
+      <tbody>
+        <tr><td><code>width(): int</code></td><td>Pixel width</td></tr>
+        <tr><td><code>height(): int</code></td><td>Pixel height</td></tr>
+        <tr><td><code>channels(): int</code></td><td>Number of channels (1, 3, or 4)</td></tr>
+        <tr><td><code>format(): int</code></td><td>PixelFormat constant</td></tr>
+        <tr><td><code>layout(): int</code></td><td>Layout constant (HWC or CHW)</td></tr>
+        <tr><td><code>colorSpace(): int</code></td><td>ColorSpace constant</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Transforms (all return self)</h3>
+    <table>
+      <thead><tr><th>Method</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>resize(int $w, int $h, int $interp)</code></td><td>Resize to exact dimensions</td></tr>
+        <tr><td><code>resizeLongEdge(int $edge, int $interp)</code></td><td>Resize so longest edge = $edge, preserving aspect ratio</td></tr>
+        <tr><td><code>crop(int $x, int $y, int $w, int $h)</code></td><td>Crop a region</td></tr>
+        <tr><td><code>centerCrop(int $w, int $h)</code></td><td>Center crop</td></tr>
+        <tr><td><code>pad(int $top, int $bot, int $left, int $right, array $color, int $mode)</code></td><td>Add border padding</td></tr>
+        <tr><td><code>flipHorizontal()</code></td><td>Mirror left-right</td></tr>
+        <tr><td><code>flipVertical()</code></td><td>Mirror top-bottom</td></tr>
+        <tr><td><code>rotate90(int $k = 1)</code></td><td>Rotate 90° × k</td></tr>
+        <tr><td><code>rotate(float $angle, int $interp, array $border)</code></td><td>Arbitrary rotation</td></tr>
+        <tr><td><code>toGrayscale()</code></td><td>Convert to 1-channel gray</td></tr>
+        <tr><td><code>rgbToBgr()</code></td><td>Swap R and B channels</td></tr>
+        <tr><td><code>toFloat32(float $scale = 1/255.0)</code></td><td>Cast pixels to float and scale</td></tr>
+        <tr><td><code>toUint8(float $scale = 255.0)</code></td><td>Cast back to uint8</td></tr>
+        <tr><td><code>toHWC()</code></td><td>Ensure HWC memory layout</td></tr>
+        <tr><td><code>toCHW()</code></td><td>Transpose to CHW layout (PyTorch-style)</td></tr>
+        <tr><td><code>normalize(array $mean, array $stdDev)</code></td><td>Per-channel (x − μ) / σ. <code>$mean</code> and <code>$stdDev</code> are float arrays [C].</td></tr>
+        <tr><td><code>adjustBrightness(float $delta)</code></td><td>Add constant to all pixels</td></tr>
+        <tr><td><code>adjustContrast(float $factor)</code></td><td>Scale contrast around 128</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Export</h3>
+    <table>
+      <thead><tr><th>Method</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>toTensor(): Tensor</code></td><td>Export to a Tensor (shares C memory — zero-copy)</td></tr>
+        <tr><td><code>toArray(): array</code></td><td>Copy to PHP array (slow — avoid in hot paths)</td></tr>
+        <tr><td><code>save(string $path): void</code></td><td>Save to JPEG/PNG (by extension)</td></tr>
+        <tr><td><code>encode(string $ext = '.png'): string</code></td><td>Encode to in-memory byte string</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Augmentation ──────────────────────────────────────── -->
+    <h2 id="augment">Augmentation</h2>
+    <p>
+      <code>Pml\Vision\Augmentation</code> chains random transforms.
+      It is callable — pass an <code>Image</code> to <code>__invoke()</code> to apply the chain.
+    </p>
+
+    <pre><code><span class="kw">use</span> <span class="ty">Pml\Vision\Augmentation</span>;
+
+<span class="va">$aug</span> = (<span class="kw">new</span> <span class="ty">Augmentation</span>(seed: <span class="nu">42</span>))
+    -><span class="fn">randomFlipH</span>(prob: <span class="nu">0.5</span>)
+    -><span class="fn">randomResizeCrop</span>(<span class="nu">224</span>, <span class="nu">224</span>, minScale: <span class="nu">0.8</span>, maxScale: <span class="nu">1.0</span>)
+    -><span class="fn">randomBrightness</span>(maxDelta: <span class="nu">0.2</span>)
+    -><span class="fn">randomContrast</span>(<span class="nu">0.8</span>, <span class="nu">1.2</span>)
+    -><span class="fn">randomHue</span>(maxDelta: <span class="nu">0.1</span>);
+
+<span class="kw">foreach</span> (<span class="va">$images</span> <span class="kw">as</span> <span class="va">$img</span>) {
+    <span class="va">$augmented</span> = <span class="va">$aug</span>(<span class="va">$img</span>);
+}</code></pre>
+
+    <table>
+      <thead><tr><th>Method</th><th>Parameters</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>randomFlipH(float $prob)</code></td><td>prob=0.5</td><td>Horizontal flip with probability</td></tr>
+        <tr><td><code>randomFlipV(float $prob)</code></td><td>prob=0.5</td><td>Vertical flip</td></tr>
+        <tr><td><code>randomCrop(int $w, int $h)</code></td><td>—</td><td>Random crop to size</td></tr>
+        <tr><td><code>randomResizeCrop(int $w, int $h, float $minScale, float $maxScale)</code></td><td>—</td><td>Random scale then crop (torchvision-style)</td></tr>
+        <tr><td><code>randomBrightness(float $maxDelta)</code></td><td>0.2</td><td>Random ±brightness</td></tr>
+        <tr><td><code>randomContrast(float $lo, float $hi)</code></td><td>0.8, 1.2</td><td>Random contrast multiplier</td></tr>
+        <tr><td><code>randomHue(float $maxDelta)</code></td><td>0.1</td><td>Random hue shift in HSV</td></tr>
+        <tr><td><code>randomRotation(float $maxAngle, int $interp, array $border)</code></td><td>15°</td><td>Random ±rotation</td></tr>
+        <tr><td><code>cutout(int $nHoles, int $holeSize, float $fill)</code></td><td>1, 16, 0.0</td><td>CutOut regularization</td></tr>
+        <tr><td><code>mixup(Image $a, Image $b, float $alpha)</code></td><td>alpha=0.2</td><td>MixUp augmentation — returns [Image, float $lambda]</td></tr>
+        <tr><td><code>cutmix(Image $a, Image $b, float $alpha)</code></td><td>alpha=1.0</td><td>CutMix — returns [Image, float $lambda]</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Models ────────────────────────────────────────────── -->
+    <h2 id="models">Classification Models</h2>
+
+    <h3>MobileNetV3</h3>
+    <pre><code><span class="kw">use</span> <span class="ty">Pml\Vision\MobileNetV3</span>;
+
+<span class="va">$net</span> = <span class="kw">new</span> <span class="ty">MobileNetV3</span>(variant: <span class="st">'large'</span>, numClasses: <span class="nu">1000</span>);
+<span class="va">$net</span>-><span class="fn">loadWeights</span>(<span class="st">'models/mobilenetv3_large.safetensors'</span>);
+
+<span class="va">$img</span> = <span class="ty">Image</span>::<span class="fn">fromFile</span>(<span class="st">'cat.jpg'</span>)
+    -><span class="fn">resize</span>(<span class="nu">224</span>, <span class="nu">224</span>)
+    -><span class="fn">toFloat32</span>()
+    -><span class="fn">normalize</span>([<span class="nu">0.485</span>, <span class="nu">0.456</span>, <span class="nu">0.406</span>], [<span class="nu">0.229</span>, <span class="nu">0.224</span>, <span class="nu">0.225</span>])
+    -><span class="fn">toCHW</span>();
+
+<span class="va">$topK</span> = <span class="va">$net</span>-><span class="fn">classify</span>(<span class="va">$img</span>);   <span class="cm">// returns [['class' => 281, 'score' => 0.92], ...]</span></code></pre>
+
+    <table>
+      <thead><tr><th>Method</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>forward(Tensor $x): Tensor</code></td><td>Full forward pass → [batch, numClasses] logits</td></tr>
+        <tr><td><code>extract(Tensor $x): Tensor</code></td><td>Extract feature vector before classification head</td></tr>
+        <tr><td><code>preprocess(Image $img): Tensor</code></td><td>Resize + normalize in one call</td></tr>
+        <tr><td><code>classify(Image $img): array</code></td><td>Top-5 class predictions with scores</td></tr>
+        <tr><td><code>loadWeights(string $path): void</code></td><td>Load SafeTensors checkpoint</td></tr>
+        <tr><td><code>parameters(): array</code></td><td>All parameter tensors (for fine-tuning)</td></tr>
+        <tr><td><code>featDim(): int</code></td><td>Feature vector dimension before head</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Detection ─────────────────────────────────────────── -->
+    <h2 id="detection">Object Detection</h2>
+    <p>All detectors follow the same interface: <code>detect(Image $img): array</code> returning <code>[['bbox' =&gt; [x, y, w, h], 'score' =&gt; float, 'class' =&gt; int], ...]</code>.</p>
+
+    <table>
+      <thead><tr><th>Class</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>Yolo11n</code></td>
+          <td>YOLOv11 nano variant. Fastest. ~640×640 input. COCO 80 classes.</td>
+        </tr>
+        <tr>
+          <td><code>NanoDet</code></td>
+          <td>NanoDet-Plus. Very lightweight, mobile-friendly. 320×320 input.</td>
+        </tr>
+        <tr>
+          <td><code>PicoDet</code></td>
+          <td>PicoDet (Baidu PaddleDetection). Excellent accuracy-per-FLOP for mobile.</td>
+        </tr>
+        <tr>
+          <td><code>SSDLite</code></td>
+          <td>SSD with MobileNetV3 backbone. Multi-scale detection with 6 detection heads.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <pre><code><span class="kw">use</span> <span class="ty">Pml\Vision\Yolo11n</span>;
+
+<span class="va">$yolo</span> = <span class="kw">new</span> <span class="ty">Yolo11n</span>();
+<span class="va">$yolo</span>-><span class="fn">loadWeights</span>(<span class="st">'models/yolo11n.safetensors'</span>);
+
+<span class="va">$img</span>  = <span class="ty">Image</span>::<span class="fn">fromFile</span>(<span class="st">'street.jpg'</span>);
+<span class="va">$dets</span> = <span class="va">$yolo</span>-><span class="fn">detect</span>(<span class="va">$img</span>);
+
+<span class="kw">foreach</span> (<span class="va">$dets</span> <span class="kw">as</span> <span class="va">$d</span>) {
+    <span class="fn">printf</span>(<span class="st">"Class %d @ %.1f%% [%d,%d %dx%d]\n"</span>,
+        <span class="va">$d</span>[<span class="st">'class'</span>], <span class="va">$d</span>[<span class="st">'score'</span>] * <span class="nu">100</span>,
+        ...<span class="va">$d</span>[<span class="st">'bbox'</span>]
+    );
+}</code></pre>
+
+    <!-- ── Segmentation ──────────────────────────────────────── -->
+    <h2 id="segmentation">Segmentation</h2>
+    <table>
+      <thead><tr><th>Class</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>FastSAM</code></td>
+          <td>FastSAM (Segment Anything Model, fast variant). Instance segmentation. Returns binary masks per detected object.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <pre><code><span class="kw">use</span> <span class="ty">Pml\Vision\FastSAM</span>;
+
+<span class="va">$sam</span>   = <span class="kw">new</span> <span class="ty">FastSAM</span>(<span class="st">'models/fastsam.safetensors'</span>);
+<span class="va">$masks</span> = <span class="va">$sam</span>-><span class="fn">segment</span>(<span class="va">$img</span>);  <span class="cm">// returns [Tensor $masks [N, H, W], array $scores]</span></code></pre>
+
+    <!-- ── Example ─────────────────────────────────────────────── -->
+    <h2 id="example">Example: Detect + Classify Pipeline</h2>
+    <pre><code><span class="kw">use</span> <span class="ty">Pml\Vision\{Image, Yolo11n, MobileNetV3, Augmentation}</span>;
+
+<span class="va">$detector</span> = <span class="kw">new</span> <span class="ty">Yolo11n</span>();
+<span class="va">$detector</span>-><span class="fn">loadWeights</span>(<span class="st">'models/yolo11n.safetensors'</span>);
+
+<span class="va">$classifier</span> = <span class="kw">new</span> <span class="ty">MobileNetV3</span>(<span class="st">'small'</span>, <span class="nu">1000</span>);
+<span class="va">$classifier</span>-><span class="fn">loadWeights</span>(<span class="st">'models/mobilenetv3_small.safetensors'</span>);
+
+<span class="va">$img</span> = <span class="ty">Image</span>::<span class="fn">fromFile</span>(<span class="st">'scene.jpg'</span>);
+<span class="va">$dets</span> = <span class="va">$detector</span>-><span class="fn">detect</span>(<span class="va">$img</span>);
+
+<span class="kw">foreach</span> (<span class="va">$dets</span> <span class="kw">as</span> <span class="va">$det</span>) {
+    [<span class="va">$x</span>, <span class="va">$y</span>, <span class="va">$w</span>, <span class="va">$h</span>] = <span class="va">$det</span>[<span class="st">'bbox'</span>];
+    <span class="va">$crop</span>  = <span class="va">$img</span>-><span class="fn">crop</span>(<span class="va">$x</span>, <span class="va">$y</span>, <span class="va">$w</span>, <span class="va">$h</span>);
+    <span class="va">$label</span> = <span class="va">$classifier</span>-><span class="fn">classify</span>(<span class="va">$crop</span>)[<span class="nu">0</span>];
+    <span class="fn">printf</span>(<span class="st">"Detected class %d (fine-grained: %d @ %.2f)\n"</span>,
+        <span class="va">$det</span>[<span class="st">'class'</span>], <span class="va">$label</span>[<span class="st">'class'</span>], <span class="va">$label</span>[<span class="st">'score'</span>]);
+}</code></pre>
+
+  </div>
+
+  <footer>
+    <span>PML Framework</span>
+    <span>Next: <a href="pipeline.html">Pipeline &amp; Cross-Validation →</a></span>
+  </footer>
+</div>
+
+<script>
+function toggleGroup(el) {
+  el.classList.toggle('open');
+  el.nextElementSibling.classList.toggle('open');
+}
+document.getElementById('nav-search').addEventListener('input', function () {
+  const q = this.value.toLowerCase();
+  document.querySelectorAll('.nav-link').forEach(function (a) {
+    a.style.display = a.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+});
+</script>
+</body>
+</html>

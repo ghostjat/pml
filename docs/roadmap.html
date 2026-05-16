@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vulkan GPU Roadmap — PML Framework</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav id="sidebar">
+  <div class="sidebar-header">
+    <a href="index.html" class="logo">PML Framework</a>
+    <div class="version">v7.0 · PHP 8.2+ · FFI/C Backend</div>
+  </div>
+  <div class="sidebar-search"><input type="text" id="nav-search" placeholder="Filter pages..." autocomplete="off"></div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Overview</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="index.html" class="nav-link">Home</a>
+      <a href="getting-started.html" class="nav-link">Getting Started</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Core</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="tensor.html" class="nav-link">Tensor</a>
+      <a href="dataset.html" class="nav-link">Dataset &amp; DataFrame</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Estimators</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="estimators.html#classifiers" class="nav-link">Classifiers</a>
+      <a href="estimators.html#regressors" class="nav-link">Regressors</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Transformers</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="transformers.html" class="nav-link">All Transformers</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Neural Networks</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="neural-network.html" class="nav-link">Sequential &amp; Layers</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Training</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="training.html" class="nav-link">Trainer &amp; Args</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Inference &amp; LLM</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="inference.html" class="nav-link">InferenceSession</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Vision</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="vision.html" class="nav-link">Vision Module</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Pipeline &amp; CV</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="pipeline.html" class="nav-link">Pipeline &amp; CV</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Roadmap</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="roadmap.html" class="nav-link active">Vulkan GPU Support</a>
+    </div>
+  </div>
+</nav>
+
+<div id="main">
+  <div class="topbar">
+    <div class="topbar-breadcrumb"><a href="index.html">PML</a> / Roadmap</div>
+    <div class="topbar-links"><a href="index.html">← Home</a></div>
+  </div>
+
+  <div class="content">
+    <div class="page-hero">
+      <span class="page-tag">Roadmap</span>
+      <h1>Universal GPU Support via Vulkan</h1>
+      <p class="page-lead">
+        The planned GPU backend replaces OpenBLAS + AVX2 with Vulkan compute shaders.
+        No CUDA. No ROCm. No Metal. One C backend for every GPU that supports Vulkan —
+        NVIDIA, AMD, Intel, Mali, Adreno, Apple M-series (via MoltenVK).
+      </p>
+    </div>
+
+    <div class="toc-inline">
+      <h5>On this page</h5>
+      <ol>
+        <li><a href="#why">Why Vulkan</a></li>
+        <li><a href="#architecture">Proposed Architecture</a></li>
+        <li><a href="#memory">GPU Memory Model</a></li>
+        <li><a href="#kernels">SPIR-V Compute Kernels</a></li>
+        <li><a href="#dispatch">Dispatch Strategy</a></li>
+        <li><a href="#php-api">PHP API (unchanged)</a></li>
+        <li><a href="#phases">Implementation Phases</a></li>
+        <li><a href="#perf">Expected Performance</a></li>
+        <li><a href="#current">Current Limitations to Resolve First</a></li>
+      </ol>
+    </div>
+
+    <!-- ── Why Vulkan ─────────────────────────────────────────── -->
+    <h2 id="why">Why Vulkan</h2>
+
+    <div class="card-grid">
+      <div class="card-sm">
+        <h4>Cross-vendor GPU support</h4>
+        <p class="text-muted" style="font-size:0.82rem;">
+          CUDA only runs on NVIDIA. ROCm only on AMD. Metal only on Apple.
+          Vulkan runs on all three — plus Intel, Qualcomm Adreno, ARM Mali,
+          and every WebGPU-capable browser via WebAssembly.
+        </p>
+      </div>
+      <div class="card-sm">
+        <h4>Stable ABI</h4>
+        <p class="text-muted" style="font-size:0.82rem;">
+          Vulkan exposes a stable C ABI via <code>vulkan.h</code>.
+          No Python runtime, no driver SDK installation required.
+          Ships as a single <code>libgpu.so</code> loaded by TensorEngine.
+        </p>
+      </div>
+      <div class="card-sm">
+        <h4>FFI-compatible</h4>
+        <p class="text-muted" style="font-size:0.82rem;">
+          The existing FFI boundary stays identical.
+          PHP calls the same functions (<code>tensor_matmul</code>, <code>tensor_softmax</code>).
+          The C layer decides which backend executes the kernel.
+        </p>
+      </div>
+      <div class="card-sm">
+        <h4>Expected speedup</h4>
+        <p class="text-muted" style="font-size:0.82rem;">
+          Training a 7B model: CPU ~1–3 t/s, GPU (RTX 4090) ~80–120 t/s.
+          Dense matmul: 30–100× faster than AVX2 OpenBLAS on mid-range GPU.
+        </p>
+      </div>
+    </div>
+
+    <!-- ── Architecture ───────────────────────────────────────── -->
+    <h2 id="architecture">Proposed Architecture</h2>
+    <div class="arch-box">
+PHP (unchanged)
+  └─ Tensor::matmul(), Sequential::train(), etc.
+         │  FFI — same signatures as today
+         ▼
+src/Lib/gpu_backend.c   (new file)
+  ├─ gpu_init()          — VkInstance, VkDevice, VkQueue
+  ├─ gpu_tensor_alloc()  — VkBuffer + VkDeviceMemory
+  ├─ gpu_upload()        — CPU → GPU (VkCommandBuffer copy)
+  ├─ gpu_download()      — GPU → CPU (sync download)
+  └─ gpu_dispatch()      — load SPIR-V, vkCmdDispatch
+
+src/Lib/kernels/        (GLSL compute shaders → SPIR-V)
+  ├─ matmul.comp         → matmul.spv
+  ├─ softmax.comp        → softmax.spv
+  ├─ relu.comp           → relu.spv
+  ├─ layer_norm.comp     → layer_norm.spv
+  ├─ attention.comp      → attention.spv
+  ├─ adam_step.comp      → adam_step.spv
+  └─ ...                 (one .spv per hot-path operator)
+
+src/Lib/tensor.c (modified)
+  ├─ #ifdef PML_GPU_VULKAN
+  │    call gpu_backend.c functions
+  │  #else
+  │    existing AVX2 / OpenBLAS implementation
+  │  #endif
+    </div>
+
+    <!-- ── Memory Model ──────────────────────────────────────── -->
+    <h2 id="memory">GPU Memory Model</h2>
+    <p>
+      Tensors that are moved to the GPU will have two representations:
+    </p>
+
+    <div class="arch-box">
+TensorC struct (C)
+  float* data_cpu;          // host-side buffer (nullable when on GPU)
+  VkBuffer vk_buffer;       // device buffer handle
+  VkDeviceMemory vk_memory; // device memory
+  uint8_t on_gpu;           // 1 if resident on GPU
+  uint32_t dirty_cpu;       // 1 if CPU copy is stale (needs download)
+    </div>
+
+    <p>Key design decisions:</p>
+    <ul>
+      <li><strong>Lazy transfer</strong> — data is uploaded to GPU only when first needed by a GPU kernel. PHP code never triggers a transfer explicitly.</li>
+      <li><strong>Unified weight memory for LLMs</strong> — model weights reside permanently on GPU after the first forward pass. No round-trip per token.</li>
+      <li><strong>Activation tensors</strong> — intermediate activations are created on GPU, freed after the backward pass. Never touch CPU RAM.</li>
+      <li><strong>Gradient synchronization</strong> — optimizer step runs on GPU. Updated weights stay on GPU. Only loss scalar and metrics cross the PCIe bus.</li>
+    </ul>
+
+    <!-- ── SPIR-V Kernels ─────────────────────────────────────── -->
+    <h2 id="kernels">SPIR-V Compute Kernels</h2>
+    <p>
+      Each C tensor operator (<code>tensor_matmul</code>, <code>tensor_softmax</code>, etc.)
+      will have a corresponding GLSL compute shader that compiles to SPIR-V via <code>glslc</code>.
+      SPIR-V binaries are embedded into <code>libgpu.so</code> at build time.
+    </p>
+
+    <h3>Example: GEMM kernel (matmul.comp)</h3>
+    <pre><code>#version 450
+<span class="cm">// Tiled GEMM: each workgroup handles a 16×16 output tile</span>
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) readonly buffer MatA { float A[]; };
+layout(set = 0, binding = 1) readonly buffer MatB { float B[]; };
+layout(set = 0, binding = 2) writeonly buffer MatC { float C[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M; uint N; uint K;
+    float alpha; float beta;
+};
+
+shared float tileA[16][16];
+shared float tileB[16][16];
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    uint col = gl_GlobalInvocationID.y;
+    float acc = 0.0;
+
+    for (uint t = 0; t < (K + 15) / 16; t++) {
+        tileA[gl_LocalInvocationID.x][gl_LocalInvocationID.y] =
+            (row < M && t*16+gl_LocalInvocationID.y < K)
+            ? A[row * K + t*16 + gl_LocalInvocationID.y] : 0.0;
+        tileB[gl_LocalInvocationID.x][gl_LocalInvocationID.y] =
+            (t*16+gl_LocalInvocationID.x < K && col < N)
+            ? B[(t*16+gl_LocalInvocationID.x) * N + col] : 0.0;
+        barrier();
+        for (uint k = 0; k < 16; k++)
+            acc += tileA[gl_LocalInvocationID.x][k]
+                 * tileB[k][gl_LocalInvocationID.y];
+        barrier();
+    }
+    if (row < M && col < N)
+        C[row * N + col] = alpha * acc + beta * C[row * N + col];
+}</code></pre>
+
+    <h3>Priority kernel list</h3>
+    <table>
+      <thead><tr><th>Kernel</th><th>Maps to C function</th><th>Priority</th></tr></thead>
+      <tbody>
+        <tr><td><code>matmul.spv</code></td><td><code>tensor_matmul</code></td><td><span class="tag tag-red">Critical</span></td></tr>
+        <tr><td><code>linear.spv</code></td><td><code>tensor_linear</code></td><td><span class="tag tag-red">Critical</span></td></tr>
+        <tr><td><code>qlinear.spv</code></td><td><code>qweight_linear</code></td><td><span class="tag tag-red">Critical</span></td></tr>
+        <tr><td><code>attention.spv</code></td><td><code>mkvca_attend</code></td><td><span class="tag tag-red">Critical</span></td></tr>
+        <tr><td><code>softmax.spv</code></td><td><code>tensor_softmax</code></td><td><span class="tag tag-orange">High</span></td></tr>
+        <tr><td><code>layer_norm.spv</code></td><td><code>tensor_layer_norm</code></td><td><span class="tag tag-orange">High</span></td></tr>
+        <tr><td><code>adam_step.spv</code></td><td><code>tensor_fused_adam_step</code></td><td><span class="tag tag-orange">High</span></td></tr>
+        <tr><td><code>adamw_step.spv</code></td><td><code>tensor_fused_adamw_step</code></td><td><span class="tag tag-orange">High</span></td></tr>
+        <tr><td><code>elementwise.spv</code></td><td>add/mul/relu/sigmoid/etc.</td><td><span class="tag tag-blue">Medium</span></td></tr>
+        <tr><td><code>reduce.spv</code></td><td>sum/mean/max along axis</td><td><span class="tag tag-blue">Medium</span></td></tr>
+        <tr><td><code>conv2d.spv</code></td><td><code>tensor_conv2d</code></td><td><span class="tag tag-blue">Medium</span></td></tr>
+        <tr><td><code>embedding.spv</code></td><td>gather/scatter</td><td><span class="tag tag-blue">Medium</span></td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Dispatch ────────────────────────────────────────────── -->
+    <h2 id="dispatch">Dispatch Strategy</h2>
+    <p>
+      Vulkan compute shaders are dispatched via <code>vkCmdDispatch()</code>.
+      The workgroup size is tuned per operator:
+    </p>
+    <table>
+      <thead><tr><th>Operator class</th><th>Workgroup layout</th><th>Tiles</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>GEMM</td>
+          <td><code>local_size = (16, 16, 1)</code></td>
+          <td>16×16 output tiles, shared-memory tiling for L1 reuse</td>
+        </tr>
+        <tr>
+          <td>Attention (per head)</td>
+          <td><code>local_size = (32, 1, 1)</code></td>
+          <td>32 threads per row of Q — online softmax reduction in shared memory</td>
+        </tr>
+        <tr>
+          <td>Element-wise</td>
+          <td><code>local_size = (256, 1, 1)</code></td>
+          <td>1 invocation per element, vectorized 4-float loads</td>
+        </tr>
+        <tr>
+          <td>Reduction</td>
+          <td><code>local_size = (256, 1, 1)</code></td>
+          <td>Tree-reduction in shared memory, two-pass for large arrays</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      For batched GEMM (LLM prefill), workgroups are dispatched in a 3-D grid:
+      <code>dispatchX = ceil(M/16), dispatchY = ceil(N/16), dispatchZ = batch</code>.
+      This maps batch → Z and keeps the tile loop identical to single-batch.
+    </p>
+
+    <!-- ── PHP API ────────────────────────────────────────────── -->
+    <h2 id="php-api">PHP API — Unchanged</h2>
+    <p>
+      The entire PHP API is <strong>100% backward-compatible</strong> with the CPU backend.
+      The GPU backend is selected at TensorEngine initialization time by an environment variable or config flag.
+      All <code>Tensor</code>, <code>Sequential</code>, <code>InferenceSession</code>, etc. calls remain identical.
+    </p>
+
+    <pre><code><span class="cm">// No PHP changes required — backend selected by env var</span>
+<span class="cm">// PML_BACKEND=vulkan php train.php</span>
+<span class="cm">// PML_BACKEND=cpu php train.php  (default)</span>
+
+<span class="va">$model</span>-><span class="fn">train</span>(<span class="va">$dataset</span>, epochs: <span class="nu">20</span>);  <span class="cm">// same call — GPU if available</span>
+<span class="va">$preds</span> = <span class="va">$model</span>-><span class="fn">predict</span>(<span class="va">$test</span>);      <span class="cm">// same call</span></code></pre>
+
+    <p>
+      Optionally, explicit device placement will be exposed:
+    </p>
+    <pre><code><span class="cm">// Future API (not yet implemented)</span>
+<span class="ty">Tensor</span>::<span class="fn">setDefaultDevice</span>(<span class="st">'gpu'</span>);
+<span class="va">$t</span> = <span class="ty">Tensor</span>::<span class="fn">randomNormal</span>([<span class="nu">4096</span>, <span class="nu">4096</span>]);  <span class="cm">// allocated on GPU VRAM</span>
+<span class="va">$t</span>-><span class="fn">to</span>(<span class="st">'cpu'</span>);                                <span class="cm">// explicit download</span></code></pre>
+
+    <!-- ── Phases ─────────────────────────────────────────────── -->
+    <h2 id="phases">Implementation Phases</h2>
+
+    <div class="card">
+      <h4>Phase 1 — Vulkan foundation + GEMM (3–4 weeks)</h4>
+      <ul>
+        <li>Add <code>gpu_backend.c</code>: VkInstance, VkPhysicalDevice selection, VkDevice, compute queue</li>
+        <li>GPU tensor allocation via VkBuffer + VkDeviceMemory (host-visible + device-local)</li>
+        <li>Lazy CPU→GPU upload and GPU→CPU download</li>
+        <li>SPIR-V GEMM kernel with shared-memory tiling (16×16)</li>
+        <li>Route <code>tensor_matmul</code> through GPU when both tensors are on-device</li>
+        <li>Benchmark: validate correctness vs OpenBLAS, measure speedup</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h4>Phase 2 — LLM inference kernels (2–3 weeks)</h4>
+      <ul>
+        <li>GPU attention: <code>mkvca_attend</code> → Vulkan online-softmax attention kernel</li>
+        <li>GPU layer-norm, RMSNorm, SwiGLU (combined activation + gate MLP)</li>
+        <li>GPU RoPE encoding</li>
+        <li>GPU INT8 quantized linear (<code>qweight_linear</code>)</li>
+        <li>End-to-end benchmark: LLaMA-3 8B token decode t/s on RTX 3090 / 4090</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h4>Phase 3 — Training kernels (2–3 weeks)</h4>
+      <ul>
+        <li>GPU Adam / AdamW fused step kernel</li>
+        <li>GPU softmax cross-entropy backward</li>
+        <li>GPU Conv2D forward + backward</li>
+        <li>GPU BatchNorm forward + backward</li>
+        <li>End-to-end benchmark: Sequential::train() on MNIST/CIFAR-10</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h4>Phase 4 — Platform breadth (4–6 weeks)</h4>
+      <ul>
+        <li>MoltenVK integration for Apple M-series (macOS / iOS)</li>
+        <li>fp16 (VK_EXT_shader_float16) kernel variants for 2× memory + throughput</li>
+        <li>Multi-GPU sharding via VkQueue per device</li>
+        <li>Memory pool: VkDeviceMemory slab allocator to reduce allocation overhead</li>
+        <li>Async GPU-CPU overlap: prefetch next batch to GPU while current batch computes</li>
+      </ul>
+    </div>
+
+    <!-- ── Performance ────────────────────────────────────────── -->
+    <h2 id="perf">Expected Performance</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Operation</th>
+          <th>CPU (8-core AVX2)</th>
+          <th>GPU (RTX 3080, Vulkan fp32)</th>
+          <th>GPU (RTX 4090, Vulkan fp16)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Dense 4096×4096 GEMM</td>
+          <td>~18 ms</td>
+          <td>~0.6 ms</td>
+          <td>~0.15 ms</td>
+        </tr>
+        <tr>
+          <td>LLaMA-3 8B decode (1 token)</td>
+          <td>~280 ms (3.6 t/s)</td>
+          <td>~12 ms (83 t/s)</td>
+          <td>~5 ms (200 t/s)</td>
+        </tr>
+        <tr>
+          <td>Sequential train 1 epoch MNIST (60k, bs=256)</td>
+          <td>~4.2 s</td>
+          <td>~0.3 s</td>
+          <td>~0.12 s</td>
+        </tr>
+        <tr>
+          <td>Conv2D 224×224 ResNet-50 fwd</td>
+          <td>~120 ms</td>
+          <td>~4 ms</td>
+          <td>~1.5 ms</td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="text-muted" style="font-size:0.83rem;">Estimates based on operator FLOP counts and hardware peak throughput (TFLOPS). Actual results depend on memory bandwidth, kernel launch overhead, and occupancy.</p>
+
+    <!-- ── Current Limitations ───────────────────────────────── -->
+    <h2 id="current">Current Limitations to Resolve First</h2>
+    <p>Before the Vulkan backend can be integrated, these CPU-side items should be addressed:</p>
+
+    <table>
+      <thead><tr><th>Issue</th><th>Impact on GPU backend</th><th>Priority</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>fp16 storage not implemented</td>
+          <td>GPU backend will want to keep weights in fp16 to halve VRAM. Current TensorC only stores fp32.</td>
+          <td><span class="tag tag-red">High</span></td>
+        </tr>
+        <tr>
+          <td><code>tensor.c</code> is a 1500-line monolith</td>
+          <td>Must split into modules (<code>tensor_math.c</code>, <code>tensor_nn.c</code>, <code>tensor_io.c</code>) before adding a parallel GPU dispatch path.</td>
+          <td><span class="tag tag-orange">Medium</span></td>
+        </tr>
+        <tr>
+          <td>No mmap weight loading for LLM weights</td>
+          <td>GPU backend needs <code>vkMapMemory</code> zero-copy path; currently SafeTensors does a full memcpy.</td>
+          <td><span class="tag tag-orange">Medium</span></td>
+        </tr>
+        <tr>
+          <td>LSTM/attention not in single C call</td>
+          <td>GPU dispatch requires all LSTM state in one kernel; currently split over multiple PHP-driven steps.</td>
+          <td><span class="tag tag-blue">Low-medium</span></td>
+        </tr>
+        <tr>
+          <td>Flash Attention not implemented</td>
+          <td>Standard attention allocates O(T²) scores. GPU backend should use Flash Attention 2 / 3 to keep memory O(T).</td>
+          <td><span class="tag tag-orange">Medium</span></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="callout callout-tip">
+      <strong>Bottom line</strong>
+      The Vulkan backend adds roughly 2,000 lines of C (backend + kernels) and zero changes to PHP.
+      The FFI boundary already exists and is the correct abstraction point.
+      The hard part is kernel tuning — not architecture.
+    </div>
+
+  </div>
+
+  <footer>
+    <span>PML Framework — Vulkan GPU Roadmap</span>
+    <span><a href="index.html">← Back to Docs</a></span>
+  </footer>
+</div>
+
+<script>
+function toggleGroup(el) {
+  el.classList.toggle('open');
+  el.nextElementSibling.classList.toggle('open');
+}
+document.getElementById('nav-search').addEventListener('input', function () {
+  const q = this.value.toLowerCase();
+  document.querySelectorAll('.nav-link').forEach(function (a) {
+    a.style.display = a.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+});
+</script>
+</body>
+</html>

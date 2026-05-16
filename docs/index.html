@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PML Framework — Documentation</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ── Sidebar ─────────────────────────────────────────────── -->
+<nav id="sidebar">
+  <div class="sidebar-header">
+    <a href="index.html" class="logo">PML Framework</a>
+    <div class="version">v7.0 · PHP 8.2+ · FFI/C Backend</div>
+  </div>
+  <div class="sidebar-search">
+    <input type="text" id="nav-search" placeholder="Filter pages..." autocomplete="off">
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)">
+      <span>Overview</span><span class="arrow">▶</span>
+    </div>
+    <div class="nav-group-items open">
+      <a href="index.html" class="nav-link active">Home</a>
+      <a href="getting-started.html" class="nav-link">Getting Started</a>
+    </div>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)">
+      <span>Core</span><span class="arrow">▶</span>
+    </div>
+    <div class="nav-group-items open">
+      <a href="tensor.html" class="nav-link">Tensor</a>
+      <a href="dataset.html" class="nav-link">Dataset &amp; DataFrame</a>
+      <a href="tensor.html#arena" class="nav-link">Arena (Memory Pool)</a>
+      <a href="tensor.html#quantized" class="nav-link">QuantizedTensor</a>
+    </div>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)">
+      <span>Estimators</span><span class="arrow">▶</span>
+    </div>
+    <div class="nav-group-items open">
+      <a href="estimators.html#classifiers" class="nav-link">Classifiers <span class="badge">19</span></a>
+      <a href="estimators.html#regressors" class="nav-link">Regressors <span class="badge">15</span></a>
+      <a href="estimators.html#anomaly" class="nav-link">Anomaly Detectors <span class="badge">6</span></a>
+      <a href="estimators.html#clusterers" class="nav-link">Clusterers <span class="badge">5</span></a>
+      <a href="estimators.html#decomposition" class="nav-link">Decomposition</a>
+      <a href="estimators.html#meta" class="nav-link">Meta Estimators</a>
+    </div>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)">
+      <span>Transformers</span><span class="arrow">▶</span>
+    </div>
+    <div class="nav-group-items open">
+      <a href="transformers.html#scalers" class="nav-link">Scalers &amp; Normalizers</a>
+      <a href="transformers.html#encoding" class="nav-link">Encoding</a>
+      <a href="transformers.html#text" class="nav-link">Text</a>
+      <a href="transformers.html#image" class="nav-link">Image</a>
+      <a href="transformers.html#feature" class="nav-link">Feature Selection</a>
+      <a href="transformers.html#imputers" class="nav-link">Imputers</a>
+      <a href="transformers.html#imbalance" class="nav-link">Class Imbalance</a>
+      <a href="transformers.html#other" class="nav-link">Other</a>
+    </div>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)">
+      <span>Neural Networks</span><span class="arrow">▶</span>
+    </div>
+    <div class="nav-group-items open">
+      <a href="neural-network.html#sequential" class="nav-link">Sequential</a>
+      <a href="neural-network.html#layers" class="nav-link">Layers <span class="badge">29</span></a>
+      <a href="neural-network.html#optimizers" class="nav-link">Optimizers <span class="badge">9</span></a>
+      <a href="neural-network.html#losses" class="nav-link">Loss Functions <span class="badge">5</span></a>
+      <a href="neural-network.html#quantize" class="nav-link">Quantization (INT8)</a>
+      <a href="neural-network.html#initializers" class="nav-link">Initializers</a>
+      <a href="neural-network.html#activations" class="nav-link">Activations</a>
+    </div>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)">
+      <span>Training</span><span class="arrow">▶</span>
+    </div>
+    <div class="nav-group-items open">
+      <a href="training.html#trainer" class="nav-link">Trainer</a>
+      <a href="training.html#args" class="nav-link">TrainingArguments</a>
+      <a href="training.html#lr" class="nav-link">LR Scheduler</a>
+      <a href="training.html#scaler" class="nav-link">GradScaler</a>
+      <a href="training.html#early" class="nav-link">Early Stopping</a>
+    </div>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)">
+      <span>Inference &amp; LLM</span><span class="arrow">▶</span>
+    </div>
+    <div class="nav-group-items open">
+      <a href="inference.html#session" class="nav-link">InferenceSession</a>
+      <a href="inference.html#kvcache" class="nav-link">KVCache</a>
+      <a href="inference.html#tokenizer" class="nav-link">Tokenizer (BPE)</a>
+      <a href="inference.html#modelconfig" class="nav-link">ModelConfig</a>
+    </div>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)">
+      <span>Vision</span><span class="arrow">▶</span>
+    </div>
+    <div class="nav-group-items open">
+      <a href="vision.html#image" class="nav-link">Image</a>
+      <a href="vision.html#models" class="nav-link">Models</a>
+      <a href="vision.html#detection" class="nav-link">Detection</a>
+      <a href="vision.html#segmentation" class="nav-link">Segmentation</a>
+      <a href="vision.html#augment" class="nav-link">Augmentation</a>
+    </div>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)">
+      <span>Pipeline &amp; CV</span><span class="arrow">▶</span>
+    </div>
+    <div class="nav-group-items open">
+      <a href="pipeline.html#pipeline" class="nav-link">Pipeline</a>
+      <a href="pipeline.html#cv" class="nav-link">Cross-Validation</a>
+      <a href="pipeline.html#ensemble" class="nav-link">Ensemble</a>
+      <a href="pipeline.html#autograd" class="nav-link">Autograd</a>
+    </div>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)">
+      <span>Roadmap</span><span class="arrow">▶</span>
+    </div>
+    <div class="nav-group-items open">
+      <a href="roadmap.html" class="nav-link">Vulkan GPU Support</a>
+    </div>
+  </div>
+</nav>
+
+<!-- ── Main ─────────────────────────────────────────────────── -->
+<div id="main">
+  <div class="topbar">
+    <div class="topbar-breadcrumb">PML Framework Docs</div>
+    <div class="topbar-links">
+      <a href="getting-started.html">Quick Start</a>
+      <a href="roadmap.html">Roadmap</a>
+    </div>
+  </div>
+
+  <div class="content">
+
+    <div class="page-hero">
+      <span class="page-tag">Documentation</span>
+      <h1>PML Framework</h1>
+      <p class="page-lead">
+        A high-performance machine learning framework for PHP 8.2+.<br>
+        All tensor math runs in a C engine (<code>libtensor.so</code>) via FFI — PHP orchestrates,
+        C computes. OpenBLAS + AVX2 + OpenMP + LAPACKE. No Python. No ONNX. No wrappers.
+      </p>
+    </div>
+
+    <!-- Architecture diagram -->
+    <h2>Architecture</h2>
+    <div class="arch-box">
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          PHP Application                                │
+│  Pipeline · Sequential · Trainer · InferenceSession · AutoML            │
+└───────────────────────────────┬─────────────────────────────────────────┘
+                                │  PHP FFI  (zero-copy Tensor* handles)
+┌───────────────────────────────▼─────────────────────────────────────────┐
+│                        TensorEngine.php                                 │
+│  Singleton cdef bridge  ─  TensorFFI  ─  QuantEngine  ─  VisionEngine  │
+└──┬─────────────────┬─────────────────┬──────────────────────────────────┘
+   │                 │                 │
+   ▼                 ▼                 ▼
+libtensor.so.7   libquant.so.1   libvision.so
+  tensor.c          quant.c         8 C files
+  dataset_io.c    (INT8 AVX2)    (106 vision ops)
+  inference.c
+  autograd.c
+  graph.c
+  tokenizer.c
+  OpenBLAS · LAPACKE · AVX2/AVX512 · OpenMP
+    </div>
+
+    <h2>Key Properties</h2>
+    <div class="card-grid">
+      <div class="card-sm">
+        <h4>Zero-Copy FFI</h4>
+        <p class="text-muted" style="font-size:0.83rem;">PHP holds <code>TensorC*</code> C pointers. No PHP-side float arrays. All math crosses the FFI boundary once per operator.</p>
+      </div>
+      <div class="card-sm">
+        <h4>OpenBLAS + AVX2</h4>
+        <p class="text-muted" style="font-size:0.83rem;">GEMM via OpenBLAS. Element-wise ops via 256-bit AVX2 SIMD. OpenMP multi-threading. LAPACKE for SVD/eigendecomp.</p>
+      </div>
+      <div class="card-sm">
+        <h4>INT8 Quantization</h4>
+        <p class="text-muted" style="font-size:0.83rem;">Dense layers quantize to INT8 block format (Q8_0). 4× memory reduction. AVX2 fused int8→fp32 dot kernel. 7B model in ~7 GB RAM.</p>
+      </div>
+      <div class="card-sm">
+        <h4>KV-Cache</h4>
+        <p class="text-muted" style="font-size:0.83rem;">Multi-head KV cache for autoregressive decode. Milakov online-softmax. O(1) decode per token vs O(T²) recompute.</p>
+      </div>
+      <div class="card-sm">
+        <h4>SafeTensors I/O</h4>
+        <p class="text-muted" style="font-size:0.83rem;">HuggingFace-compatible checkpoint format. <code>mmap()</code>-backed zero-copy weight loading. No PHP <code>serialize()</code>.</p>
+      </div>
+      <div class="card-sm">
+        <h4>Full ML Stack</h4>
+        <p class="text-muted" style="font-size:0.83rem;">19 classifiers · 15 regressors · 6 anomaly detectors · 5 clusterers · 44 transformers · 29 NN layers · Vision module.</p>
+      </div>
+    </div>
+
+    <h2>Documentation Pages</h2>
+    <div class="index-grid">
+      <a href="getting-started.html" class="index-card">
+        <div class="index-card-icon">&#128640;</div>
+        <h3>Getting Started</h3>
+        <p>Installation, building libtensor.so, your first model, quick examples.</p>
+      </a>
+      <a href="tensor.html" class="index-card">
+        <div class="index-card-icon">&#9632;</div>
+        <h3>Tensor</h3>
+        <p>Core tensor class: creation, arithmetic, BLAS, reduction, shape ops, Arena, QuantizedTensor.</p>
+      </a>
+      <a href="dataset.html" class="index-card">
+        <div class="index-card-icon">&#128202;</div>
+        <h3>Dataset &amp; DataFrame</h3>
+        <p>Dataset container, DataFrame for tabular data, DataLoader for streaming batches.</p>
+      </a>
+      <a href="estimators.html" class="index-card">
+        <div class="index-card-icon">&#129504;</div>
+        <h3>Estimators</h3>
+        <p>All 45 estimators: classifiers, regressors, anomaly detectors, clusterers, decomposition, meta.</p>
+      </a>
+      <a href="transformers.html" class="index-card">
+        <div class="index-card-icon">&#9881;</div>
+        <h3>Transformers</h3>
+        <p>44 data transformers: scalers, encoders, text vectorizers, image transforms, feature selection.</p>
+      </a>
+      <a href="neural-network.html" class="index-card">
+        <div class="index-card-icon">&#128236;</div>
+        <h3>Neural Networks</h3>
+        <p>Sequential model, 29 layers, 9 optimizers, 5 loss functions, INT8 quantization.</p>
+      </a>
+      <a href="training.html" class="index-card">
+        <div class="index-card-icon">&#128200;</div>
+        <h3>Training System</h3>
+        <p>Trainer, TrainingArguments, LR schedulers, GradScaler, EarlyStopping, callbacks.</p>
+      </a>
+      <a href="inference.html" class="index-card">
+        <div class="index-card-icon">&#128161;</div>
+        <h3>Inference &amp; LLM</h3>
+        <p>InferenceSession for LLaMA-style GQA, KV-cache, BPE tokenizer, ModelConfig.</p>
+      </a>
+      <a href="vision.html" class="index-card">
+        <div class="index-card-icon">&#128247;</div>
+        <h3>Vision</h3>
+        <p>Image I/O, object detection (YOLO, NanoDet), segmentation, MobileNetV3, augmentation.</p>
+      </a>
+      <a href="pipeline.html" class="index-card">
+        <div class="index-card-icon">&#128274;</div>
+        <h3>Pipeline &amp; CV</h3>
+        <p>Pipeline, cross-validation strategies, ensemble methods, autograd.</p>
+      </a>
+      <a href="roadmap.html" class="index-card">
+        <div class="index-card-icon">&#127775;</div>
+        <h3>Vulkan GPU Roadmap</h3>
+        <p>Plan for universal GPU support via Vulkan compute shaders replacing AVX2/OpenBLAS.</p>
+      </a>
+    </div>
+
+    <h2>Namespace Map</h2>
+    <table>
+      <thead><tr><th>Namespace</th><th>Location</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>Pml\</code></td><td><code>src/</code></td><td>Root: Tensor, Dataset, DataFrame, Pipeline, Arena, QuantizedTensor</td></tr>
+        <tr><td><code>Pml\Estimators\Classifiers\</code></td><td><code>src/Estimators/Classifiers/</code></td><td>19 classification estimators</td></tr>
+        <tr><td><code>Pml\Estimators\Regression\</code></td><td><code>src/Estimators/Regression/</code></td><td>15 regression estimators</td></tr>
+        <tr><td><code>Pml\Estimators\AnomalyDetectors\</code></td><td><code>src/Estimators/AnomalyDetectors/</code></td><td>6 anomaly detectors</td></tr>
+        <tr><td><code>Pml\Estimators\Clusterers\</code></td><td><code>src/Estimators/Clusterers/</code></td><td>5 clustering algorithms</td></tr>
+        <tr><td><code>Pml\Transformers\</code></td><td><code>src/Transformers/</code></td><td>44 data transformers</td></tr>
+        <tr><td><code>Pml\NeuralNetwork\</code></td><td><code>src/NeuralNetwork/</code></td><td>Sequential, layers, optimizers, activations, initializers</td></tr>
+        <tr><td><code>Pml\Losses\</code></td><td><code>src/Losses/</code></td><td>Loss functions</td></tr>
+        <tr><td><code>Pml\Training\</code></td><td><code>src/Training/</code></td><td>Trainer, LRScheduler, GradScaler, callbacks</td></tr>
+        <tr><td><code>Pml\Inference\</code></td><td><code>src/Inference/</code></td><td>InferenceSession, ModelConfig, Tokenizer</td></tr>
+        <tr><td><code>Pml\Vision\</code></td><td><code>src/Vision/</code></td><td>Image, detection, segmentation, augmentation, models</td></tr>
+        <tr><td><code>Pml\Interfaces\</code></td><td><code>src/Interfaces/</code></td><td>15 contracts used across the framework</td></tr>
+        <tr><td><code>Pml\Lib\</code></td><td><code>src/Lib/</code></td><td>TensorEngine, QuantEngine, VisionEngine, Arena, ModelStore, SafeTensorsIO</td></tr>
+        <tr><td><code>Pml\Autograd\</code></td><td><code>src/Autograd/</code></td><td>Variable, Tape — automatic differentiation</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Interface Hierarchy</h2>
+    <div class="arch-box">
+Estimator
+  └─ Learner           (train + predict)
+       └─ TrainableWithOptions  (named-arg variadic options)
+  └─ Transformer       (fit + transform + fitTransform)
+  └─ Probabilistic     (predictProba)
+  └─ Scoring           (score)
+  └─ Online            (partial_fit — streaming)
+  └─ RanksFeatures     (featureImportances)
+  └─ Verbose           (setLogger)
+  └─ Persistable       (save + load)
+  └─ Stateful          (getStateDict + loadStateDict)
+  └─ Saveable          (getConfig + fromConfig)
+  └─ Quantizable       (quantize + isQuantized)
+  └─ FitTransformable  (fitTransform shortcut)
+    </div>
+
+  </div><!-- .content -->
+
+  <footer>
+    <span>PML Framework &mdash; PHP Machine Learning via FFI/C</span>
+    <span>Built with OpenBLAS · LAPACKE · AVX2 · OpenMP</span>
+  </footer>
+</div><!-- #main -->
+
+<script>
+function toggleGroup(el) {
+  el.classList.toggle('open');
+  const items = el.nextElementSibling;
+  items.classList.toggle('open');
+}
+
+document.getElementById('nav-search').addEventListener('input', function () {
+  const q = this.value.toLowerCase();
+  document.querySelectorAll('.nav-link').forEach(function (link) {
+    const match = link.textContent.toLowerCase().includes(q);
+    link.style.display = match ? '' : 'none';
+  });
+  if (!q) {
+    document.querySelectorAll('.nav-group-items').forEach(function (g) { g.style.display = ''; });
+  }
+});
+
+// Mark active link
+const cur = location.pathname.split('/').pop() || 'index.html';
+document.querySelectorAll('.nav-link').forEach(function (a) {
+  const href = a.getAttribute('href').split('#')[0];
+  if (href === cur) { a.classList.add('active'); }
+});
+</script>
+</body>
+</html>

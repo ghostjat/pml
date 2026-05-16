@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dataset &amp; DataFrame — PML Framework</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav id="sidebar">
+  <div class="sidebar-header">
+    <a href="index.html" class="logo">PML Framework</a>
+    <div class="version">v7.0 · PHP 8.2+ · FFI/C Backend</div>
+  </div>
+  <div class="sidebar-search"><input type="text" id="nav-search" placeholder="Filter pages..." autocomplete="off"></div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Overview</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="index.html" class="nav-link">Home</a>
+      <a href="getting-started.html" class="nav-link">Getting Started</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Core</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="tensor.html" class="nav-link">Tensor</a>
+      <a href="dataset.html" class="nav-link active">Dataset &amp; DataFrame</a>
+      <a href="tensor.html#arena" class="nav-link">Arena (Memory Pool)</a>
+      <a href="tensor.html#quantized" class="nav-link">QuantizedTensor</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Estimators</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="estimators.html#classifiers" class="nav-link">Classifiers</a>
+      <a href="estimators.html#regressors" class="nav-link">Regressors</a>
+      <a href="estimators.html#anomaly" class="nav-link">Anomaly Detectors</a>
+      <a href="estimators.html#clusterers" class="nav-link">Clusterers</a>
+      <a href="estimators.html#decomposition" class="nav-link">Decomposition</a>
+      <a href="estimators.html#meta" class="nav-link">Meta Estimators</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Transformers</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="transformers.html" class="nav-link">All Transformers</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Neural Networks</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="neural-network.html" class="nav-link">Sequential &amp; Layers</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Training</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="training.html" class="nav-link">Trainer &amp; Args</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Inference &amp; LLM</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="inference.html" class="nav-link">InferenceSession</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Vision</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="vision.html" class="nav-link">Vision Module</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Pipeline &amp; CV</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="pipeline.html" class="nav-link">Pipeline &amp; Cross-Validation</a></div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Roadmap</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open"><a href="roadmap.html" class="nav-link">Vulkan GPU Support</a></div>
+  </div>
+</nav>
+
+<div id="main">
+  <div class="topbar">
+    <div class="topbar-breadcrumb"><a href="index.html">PML</a> / <a href="dataset.html">Core</a> / Dataset &amp; DataFrame</div>
+    <div class="topbar-links"><a href="estimators.html">Estimators →</a></div>
+  </div>
+
+  <div class="content">
+    <div class="page-hero">
+      <span class="page-tag">Core</span>
+      <h1>Dataset &amp; DataFrame</h1>
+      <p class="page-lead">
+        <code>Dataset</code> is the universal data container used by every estimator and transformer.
+        <code>DataFrame</code> is a typed tabular store (C-backed) for ETL operations.
+        <code>DataLoader</code> wraps a Dataset for mini-batch streaming.
+      </p>
+    </div>
+
+    <div class="toc-inline">
+      <h5>On this page</h5>
+      <ol>
+        <li><a href="#dataset-overview">Dataset Overview</a></li>
+        <li><a href="#dataset-creation">Creating Datasets</a></li>
+        <li><a href="#dataset-access">Accessing Data</a></li>
+        <li><a href="#dataset-splitting">Splitting &amp; Folding</a></li>
+        <li><a href="#dataset-transforms">Transforms &amp; Utilities</a></li>
+        <li><a href="#dataset-batching">Batching</a></li>
+        <li><a href="#dataframe">DataFrame</a></li>
+        <li><a href="#dataloader">DataLoader</a></li>
+        <li><a href="#streaming">StreamingDataset</a></li>
+      </ol>
+    </div>
+
+    <!-- ── Dataset Overview ────────────────────────────────────── -->
+    <h2 id="dataset-overview">Dataset Overview</h2>
+    <p>
+      A <code>Dataset</code> operates in two modes:
+    </p>
+    <div class="card-grid">
+      <div class="card-sm">
+        <h4>Tensor mode</h4>
+        <p class="text-muted" style="font-size:0.82rem;">
+          Holds a <code>Tensor</code> for samples (shape [N, D]) and optionally a label Tensor ([N] or [N, C]).
+          All estimators and neural networks require Tensor mode.
+        </p>
+      </div>
+      <div class="card-sm">
+        <h4>ETL / DataFrame mode</h4>
+        <p class="text-muted" style="font-size:0.82rem;">
+          Holds a C-backed <code>DataFrameC*</code> pointer. Supports heterogeneous column types (float, string, category).
+          Call <code>materialize()</code> to convert to Tensor mode.
+        </p>
+      </div>
+    </div>
+    <div class="callout callout-warn">
+      <strong>Never load large CSVs into PHP memory.</strong>
+      Use <code>Dataset::fromCSV()</code> or <code>Dataset::load()</code> — both use
+      <code>tensor_dataset_from_csv()</code> which mmap's the file and never allocates a PHP array of rows.
+    </div>
+
+    <!-- ── Dataset Creation ───────────────────────────────────── -->
+    <h2 id="dataset-creation">Creating Datasets</h2>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">fromCSV</span>
+        <span class="method-sig">static (string $path, string|int $labelColumn = -1, bool $hasHeader = true): self</span>
+      </div>
+      <div class="api-block-body">
+        <p>Loads a CSV via <code>mmap()</code>. The label column can be specified by name (if header present) or by integer index. Returns a Dataset in ETL mode; call <code>materialize()</code> to get Tensors.</p>
+        <pre><code><span class="va">$ds</span> = <span class="ty">Dataset</span>::<span class="fn">fromCSV</span>(<span class="st">'data/housing.csv'</span>, labelColumn: <span class="st">'price'</span>);
+<span class="va">$ds</span> = <span class="va">$ds</span>-><span class="fn">materialize</span>();  <span class="cm">// convert ETL → Tensor mode</span></code></pre>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">fromArray</span>
+        <span class="method-sig">static (array $samples, ?array $labels = null): self</span>
+      </div>
+      <div class="api-block-body">
+        <p>Constructs a Tensor-mode Dataset from PHP arrays. Copies data into C memory once. Use only for small datasets; prefer CSV loading for production.</p>
+        <pre><code><span class="va">$ds</span> = <span class="ty">Dataset</span>::<span class="fn">fromArray</span>(
+    [[<span class="nu">1.0</span>, <span class="nu">2.0</span>], [<span class="nu">3.0</span>, <span class="nu">4.0</span>]],
+    [<span class="st">'cat'</span>, <span class="st">'dog'</span>]
+);</code></pre>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">__construct</span>
+        <span class="method-sig">(Tensor $samples, ?Tensor $labels = null)</span>
+      </div>
+      <div class="api-block-body">
+        <p>Build a Dataset directly from existing Tensors. Both tensors remain zero-copy — Dataset wraps the pointers, not copies.</p>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">seed</span>
+        <span class="method-sig">static (?int $seed): void</span>
+      </div>
+      <div class="api-block-body">
+        <p>Set the global RNG seed used for shuffling and splits. Pass <code>null</code> for non-deterministic behavior.</p>
+      </div>
+    </div>
+
+    <!-- ── Dataset Access ────────────────────────────────────── -->
+    <h2 id="dataset-access">Accessing Data</h2>
+    <table>
+      <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>samples()</code></td><td><code>Tensor</code></td><td>Feature matrix [N, D]</td></tr>
+        <tr><td><code>labels()</code></td><td><code>?Tensor</code></td><td>Label vector [N] or label matrix [N, C]</td></tr>
+        <tr><td><code>numRows()</code></td><td><code>int</code></td><td>Number of samples N</td></tr>
+        <tr><td><code>numColumns()</code></td><td><code>int</code></td><td>Feature dimensionality D</td></tr>
+        <tr><td><code>isLabeled()</code></td><td><code>bool</code></td><td>Whether labels are present</td></tr>
+        <tr><td><code>schema()</code></td><td><code>array</code></td><td>Column names and types (ETL mode)</td></tr>
+        <tr><td><code>categories(int $colIdx)</code></td><td><code>string[]</code></td><td>Unique string values in a categorical column (ETL mode)</td></tr>
+        <tr><td><code>describe()</code></td><td><code>array</code></td><td>Per-column statistics: mean, std, min, max, median</td></tr>
+        <tr><td><code>toArray()</code></td><td><code>array</code></td><td>Copies to PHP array — avoid on large datasets</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Splitting ─────────────────────────────────────────── -->
+    <h2 id="dataset-splitting">Splitting &amp; Folding</h2>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">split</span>
+        <span class="method-sig">(float $ratio = 0.8): array</span>
+        <span class="return-type">[Dataset, Dataset]</span>
+      </div>
+      <div class="api-block-body">
+        <p>Splits into <code>[$train, $test]</code> with no shuffle. Use <code>randomize()</code> first for random splits.</p>
+        <pre><code>[<span class="va">$train</span>, <span class="va">$test</span>] = <span class="va">$ds</span>-><span class="fn">randomize</span>()-><span class="fn">split</span>(<span class="nu">0.8</span>);</code></pre>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">stratifiedSplit</span>
+        <span class="method-sig">(float $ratio = 0.8): array</span>
+        <span class="return-type">[Dataset, Dataset]</span>
+      </div>
+      <div class="api-block-body">
+        <p>Stratified split preserving class proportions. Required for imbalanced classification.</p>
+      </div>
+    </div>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">fold</span>
+        <span class="method-sig">(int $k = 10): Generator</span>
+      </div>
+      <div class="api-block-body">
+        <p>Yields <code>k</code> <code>[$train, $val]</code> pairs for K-fold cross-validation.</p>
+        <pre><code><span class="kw">foreach</span> (<span class="va">$ds</span>-><span class="fn">fold</span>(<span class="nu">5</span>) <span class="kw">as</span> [<span class="va">$train</span>, <span class="va">$val</span>]) {
+    <span class="va">$model</span>-><span class="fn">train</span>(<span class="va">$train</span>);
+    <span class="va">$score</span> = <span class="va">$model</span>-><span class="fn">score</span>(<span class="va">$val</span>);
+}</code></pre>
+      </div>
+    </div>
+
+    <table>
+      <thead><tr><th>Method</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>head(int $n)</code></td><td>First N rows</td></tr>
+        <tr><td><code>tail(int $n)</code></td><td>Last N rows</td></tr>
+        <tr><td><code>take(int $n)</code></td><td>Take first N (alias of head)</td></tr>
+        <tr><td><code>leave(int $n)</code></td><td>Drop first N rows</td></tr>
+        <tr><td><code>slice(int $offset, int $length)</code></td><td>Slice N rows starting at offset</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Transforms ─────────────────────────────────────────── -->
+    <h2 id="dataset-transforms">Transforms &amp; Utilities</h2>
+    <table>
+      <thead><tr><th>Method</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>randomize()</code></td><td>Shuffle rows in-place (Fisher-Yates, C-level). Returns self.</td></tr>
+        <tr><td><code>standardize()</code></td><td>Standardize features to zero mean, unit variance in-place. Returns self.</td></tr>
+        <tr><td><code>dropNans()</code></td><td>Remove rows containing NaN in either samples or labels. Returns new Dataset.</td></tr>
+        <tr><td><code>filterByMask(Tensor $mask)</code></td><td>Keep rows where mask == 1.0. Returns new Dataset.</td></tr>
+        <tr><td><code>select(array $columns)</code></td><td>Keep only the specified column indices (ETL mode: column names). Returns self.</td></tr>
+        <tr><td><code>drop(array $columns)</code></td><td>Remove columns by index or name. Returns self.</td></tr>
+        <tr><td><code>stack(Dataset $other)</code></td><td>Concatenate two datasets row-wise (same number of columns required). Returns new Dataset.</td></tr>
+        <tr><td><code>join(Dataset $other)</code></td><td>Concatenate column-wise (same number of rows required). Returns new Dataset.</td></tr>
+        <tr><td><code>apply(callable $fn)</code></td><td>Apply a PHP closure to samples Tensor, returns new Dataset. Use sparingly (crosses FFI boundary per call).</td></tr>
+        <tr><td><code>sortByColumn(int $col)</code></td><td>Sort rows ascending by feature column index.</td></tr>
+        <tr><td><code>oneHotEncode(int $colIdx)</code></td><td>One-hot expand an integer column. Returns new Dataset with expanded features.</td></tr>
+        <tr><td><code>withLabelColumn(int $col)</code></td><td>Move a feature column to labels, remove it from samples. Returns new Dataset.</td></tr>
+        <tr><td><code>materialize(?int $labelCol = null)</code></td><td>Convert ETL mode → Tensor mode. Pass label column index to extract labels.</td></tr>
+        <tr><td><code>toCSV(string $path)</code></td><td>Write to CSV file. Works in both modes.</td></tr>
+        <tr><td><code>bagOfWords(int|string $col, ?int $maxFeatures)</code></td><td>Vectorize a text column using bag-of-words. Returns new Dataset with BoW features appended.</td></tr>
+        <tr><td><code>isEtlMode()</code></td><td>Returns true if Dataset is in ETL / DataFrame mode.</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── Batching ─────────────────────────────────────────────── -->
+    <h2 id="dataset-batching">Batching</h2>
+
+    <div class="api-block">
+      <div class="api-block-header">
+        <span class="method-name">batches</span>
+        <span class="method-sig">(int $batchSize): Generator</span>
+      </div>
+      <div class="api-block-body">
+        <p>Yields <code>Dataset</code> objects of up to <code>$batchSize</code> rows. Each yielded Dataset wraps a view (no copy) into the parent's Tensor. The last batch may be smaller.</p>
+        <pre><code><span class="kw">foreach</span> (<span class="va">$dataset</span>-><span class="fn">batches</span>(<span class="nu">64</span>) <span class="kw">as</span> <span class="va">$batch</span>) {
+    <span class="va">$X</span> = <span class="va">$batch</span>-><span class="fn">samples</span>();   <span class="cm">// Tensor view [64, D]</span>
+    <span class="va">$y</span> = <span class="va">$batch</span>-><span class="fn">labels</span>();    <span class="cm">// Tensor view [64]</span>
+    <span class="va">$model</span>-><span class="fn">stepOnBatch</span>(<span class="va">$batch</span>);
+}</code></pre>
+      </div>
+    </div>
+
+    <!-- ── DataFrame ────────────────────────────────────────────── -->
+    <h2 id="dataframe">DataFrame</h2>
+    <p>
+      <code>Pml\Data\DataFrame</code> is a pure C-backed columnar store. It supports mixed column types
+      (float32, int32, string/category) and is used for ETL pipelines that need named columns,
+      <code>where</code> filtering, groupby, and join operations before converting to a training Tensor.
+    </p>
+
+    <h3>Construction</h3>
+    <table>
+      <thead><tr><th>Method</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>DataFrame::fromCSV(string $path, bool $hasHeader = true)</code></td><td>mmap CSV load. Headers become column names.</td></tr>
+        <tr><td><code>DataFrame::fromTensor(Tensor $t, array $colNames)</code></td><td>Wrap an existing Tensor as a named-column DataFrame.</td></tr>
+        <tr><td><code>copy()</code></td><td>Deep copy — allocates new C memory for all columns.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Metadata</h3>
+    <table>
+      <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>shape()</code></td><td><code>[int, int]</code></td><td>[rows, cols]</td></tr>
+        <tr><td><code>numRows()</code></td><td><code>int</code></td><td></td></tr>
+        <tr><td><code>numCols()</code></td><td><code>int</code></td><td></td></tr>
+        <tr><td><code>columns()</code></td><td><code>string[]</code></td><td>Column names</td></tr>
+        <tr><td><code>dtypes()</code></td><td><code>array</code></td><td>Map of column name → dtype string</td></tr>
+        <tr><td><code>describe()</code></td><td><code>Tensor</code></td><td>Summary statistics (mean, std, min, max per numeric column)</td></tr>
+        <tr><td><code>categories(string $col)</code></td><td><code>string[]</code></td><td>Unique values of a categorical column</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Selection &amp; Filtering</h3>
+    <table>
+      <thead><tr><th>Method</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>head(int $n = 5)</code></td><td>First N rows → new DataFrame</td></tr>
+        <tr><td><code>tail(int $n = 5)</code></td><td>Last N rows → new DataFrame</td></tr>
+        <tr><td><code>iloc(int $offset, int $length)</code></td><td>Row slice</td></tr>
+        <tr><td><code>select(array $cols)</code></td><td>Keep named columns</td></tr>
+        <tr><td><code>drop(array $cols)</code></td><td>Remove named columns</td></tr>
+        <tr><td><code>col(string $name)</code></td><td>Get a column as a Tensor</td></tr>
+        <tr><td><code>where(string $col, string $op, float|string $val)</code></td><td>Filter rows. Ops: <code>'='</code>, <code>'!='</code>, <code>'&lt;'</code>, <code>'&gt;'</code>, <code>'&lt;='</code>, <code>'&gt;='</code></td></tr>
+        <tr><td><code>dropNulls()</code></td><td>Remove rows with any null/NaN</td></tr>
+        <tr><td><code>sample(int $n, bool $replace, ?int $seed)</code></td><td>Random row sampling</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Mutation</h3>
+    <table>
+      <thead><tr><th>Method</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>rename(array $mapping)</code></td><td>Rename columns: <code>['old' =&gt; 'new']</code></td></tr>
+        <tr><td><code>withColumn(string $name, Tensor $data)</code></td><td>Add or replace a column with a Tensor</td></tr>
+        <tr><td><code>castToFloat(string $col)</code></td><td>Cast column to float32 in-place</td></tr>
+        <tr><td><code>fillNull(string $col, float $val)</code></td><td>Fill nulls with a constant</td></tr>
+        <tr><td><code>oneHotEncode(string $col)</code></td><td>Expand categorical column into binary indicator columns</td></tr>
+        <tr><td><code>sortBy(string $col, bool $ascending)</code></td><td>Sort all rows by a column</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Aggregation &amp; Join</h3>
+    <table>
+      <thead><tr><th>Method</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>valueCounts(string $col)</code></td><td>Count occurrences per unique value → new DataFrame</td></tr>
+        <tr><td><code>groupBy(string $col)</code></td><td>Returns a <code>GroupBy</code> object for aggregation</td></tr>
+        <tr><td><code>join(DataFrame $right, string $on, string $how = 'inner')</code></td><td>SQL-style join on a common key column. How: <code>'inner'</code>, <code>'left'</code>, <code>'right'</code></td></tr>
+        <tr><td><code>concat(DataFrame[] $frames)</code></td><td>Row-wise concatenation of multiple DataFrames</td></tr>
+        <tr><td><code>toTensor(?array $cols = null)</code></td><td>Extract numeric columns to a Tensor [N, D]</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Target Encoding (C-accelerated)</h3>
+    <pre><code><span class="cm">// Fit on training data</span>
+<span class="va">$enc</span> = <span class="va">$trainDf</span>-><span class="fn">targetEncodeFit</span>(<span class="st">'category_col'</span>, <span class="va">$trainLabels</span>, smoothing: <span class="nu">10.0</span>);
+
+<span class="cm">// Apply to test data</span>
+<span class="va">$testDf</span>-><span class="fn">targetEncodeTransform</span>(<span class="st">'category_col'</span>, <span class="va">$enc</span>);</code></pre>
+
+    <!-- ── DataLoader ─────────────────────────────────────────── -->
+    <h2 id="dataloader">DataLoader</h2>
+    <p>
+      <code>Pml\Data\DataLoader</code> wraps a <code>Dataset</code> with shuffle-per-epoch,
+      drop-last, and prefetch options. Suitable for large training loops using <code>Sequential::stepOnBatch()</code>.
+    </p>
+
+    <pre><code><span class="kw">use</span> <span class="ty">Pml\Data\DataLoader</span>;
+
+<span class="va">$loader</span> = <span class="kw">new</span> <span class="ty">DataLoader</span>(
+    dataset:   <span class="va">$trainDataset</span>,
+    batchSize: <span class="nu">128</span>,
+    shuffle:   <span class="kw">true</span>,
+    dropLast:  <span class="kw">true</span>,
+);
+
+<span class="fn">echo</span> <span class="st">"Steps per epoch: "</span> . <span class="va">$loader</span>-><span class="fn">steps</span>() . <span class="st">"\n"</span>;
+
+<span class="kw">foreach</span> (<span class="va">$loader</span>-><span class="fn">batches</span>() <span class="kw">as</span> <span class="va">$batch</span>) {
+    <span class="va">$loss</span> = <span class="va">$model</span>-><span class="fn">stepOnBatch</span>(<span class="va">$batch</span>, clipGradNorm: <span class="nu">1.0</span>);
+}</code></pre>
+
+    <table>
+      <thead><tr><th>Method</th><th>Returns</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>batches()</code></td><td><code>Generator&lt;Dataset&gt;</code></td><td>Yields one batch per step. Shuffles at start of each call if enabled.</td></tr>
+        <tr><td><code>steps()</code></td><td><code>int</code></td><td>Number of batches per epoch</td></tr>
+        <tr><td><code>batchSize()</code></td><td><code>int</code></td><td></td></tr>
+        <tr><td><code>dataset()</code></td><td><code>Dataset</code></td><td>The underlying Dataset</td></tr>
+      </tbody>
+    </table>
+
+    <!-- ── StreamingDataset ──────────────────────────────────── -->
+    <h2 id="streaming">StreamingDataset</h2>
+    <p>
+      <code>Pml\Data\StreamingDataset</code> reads a large CSV file in fixed-size chunks without
+      loading the entire file. Each chunk is a <code>Dataset</code> in Tensor mode.
+      Use with <code>Sequential::stepOnBatch()</code> for datasets that exceed RAM.
+    </p>
+
+    <pre><code><span class="kw">use</span> <span class="ty">Pml\Data\StreamingDataset</span>;
+
+<span class="va">$stream</span> = <span class="kw">new</span> <span class="ty">StreamingDataset</span>(
+    filepath:    <span class="st">'data/huge.csv'</span>,
+    chunkSize:   <span class="nu">10_000</span>,     <span class="cm">// rows per chunk</span>
+    labelColumn: <span class="nu">-1</span>,          <span class="cm">// last column</span>
+    hasHeader:   <span class="kw">true</span>,
+);
+
+<span class="kw">for</span> (<span class="va">$epoch</span> = <span class="nu">1</span>; <span class="va">$epoch</span> &lt;= <span class="nu">10</span>; <span class="va">$epoch</span>++) {
+    <span class="kw">foreach</span> (<span class="va">$stream</span>-><span class="fn">chunks</span>() <span class="kw">as</span> <span class="va">$chunk</span>) {
+        <span class="kw">foreach</span> (<span class="va">$chunk</span>-><span class="fn">batches</span>(<span class="nu">128</span>) <span class="kw">as</span> <span class="va">$batch</span>) {
+            <span class="va">$model</span>-><span class="fn">stepOnBatch</span>(<span class="va">$batch</span>);
+        }
+    }
+}
+<span class="va">$model</span>-><span class="fn">markTrained</span>();</code></pre>
+
+  </div>
+
+  <footer>
+    <span>PML Framework</span>
+    <span>Next: <a href="estimators.html">Estimators →</a></span>
+  </footer>
+</div>
+
+<script>
+function toggleGroup(el) {
+  el.classList.toggle('open');
+  el.nextElementSibling.classList.toggle('open');
+}
+document.getElementById('nav-search').addEventListener('input', function () {
+  const q = this.value.toLowerCase();
+  document.querySelectorAll('.nav-link').forEach(function (a) {
+    a.style.display = a.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+});
+</script>
+</body>
+</html>

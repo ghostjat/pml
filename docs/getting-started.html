@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Getting Started — PML Framework</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav id="sidebar">
+  <div class="sidebar-header">
+    <a href="index.html" class="logo">PML Framework</a>
+    <div class="version">v7.0 · PHP 8.2+ · FFI/C Backend</div>
+  </div>
+  <div class="sidebar-search"><input type="text" id="nav-search" placeholder="Filter pages..." autocomplete="off"></div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Overview</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="index.html" class="nav-link">Home</a>
+      <a href="getting-started.html" class="nav-link active">Getting Started</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Core</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="tensor.html" class="nav-link">Tensor</a>
+      <a href="dataset.html" class="nav-link">Dataset &amp; DataFrame</a>
+      <a href="tensor.html#arena" class="nav-link">Arena (Memory Pool)</a>
+      <a href="tensor.html#quantized" class="nav-link">QuantizedTensor</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Estimators</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="estimators.html#classifiers" class="nav-link">Classifiers</a>
+      <a href="estimators.html#regressors" class="nav-link">Regressors</a>
+      <a href="estimators.html#anomaly" class="nav-link">Anomaly Detectors</a>
+      <a href="estimators.html#clusterers" class="nav-link">Clusterers</a>
+      <a href="estimators.html#decomposition" class="nav-link">Decomposition</a>
+      <a href="estimators.html#meta" class="nav-link">Meta Estimators</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Transformers</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="transformers.html" class="nav-link">All Transformers</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Neural Networks</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="neural-network.html" class="nav-link">Sequential &amp; Layers</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Training</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="training.html" class="nav-link">Trainer &amp; Args</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Inference &amp; LLM</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="inference.html" class="nav-link">InferenceSession</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Vision</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="vision.html" class="nav-link">Vision Module</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Pipeline &amp; CV</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="pipeline.html" class="nav-link">Pipeline &amp; Cross-Validation</a>
+    </div>
+  </div>
+  <div class="nav-section">
+    <div class="nav-group-toggle open" onclick="toggleGroup(this)"><span>Roadmap</span><span class="arrow">▶</span></div>
+    <div class="nav-group-items open">
+      <a href="roadmap.html" class="nav-link">Vulkan GPU Support</a>
+    </div>
+  </div>
+</nav>
+
+<div id="main">
+  <div class="topbar">
+    <div class="topbar-breadcrumb"><a href="index.html">PML</a> / Getting Started</div>
+    <div class="topbar-links">
+      <a href="tensor.html">Tensor API →</a>
+    </div>
+  </div>
+
+  <div class="content">
+    <div class="page-hero">
+      <span class="page-tag">Getting Started</span>
+      <h1>Installation &amp; Quick Start</h1>
+      <p class="page-lead">
+        Get PML running in minutes. You need PHP 8.2+, Composer, and a Linux x86-64 host with OpenBLAS.
+      </p>
+    </div>
+
+    <div class="toc-inline">
+      <h5>On this page</h5>
+      <ol>
+        <li><a href="#requirements">Requirements</a></li>
+        <li><a href="#install">Installation</a></li>
+        <li><a href="#build-tensor">Building libtensor.so</a></li>
+        <li><a href="#build-quant">Building libquant.so</a></li>
+        <li><a href="#build-vision">Building libvision.so</a></li>
+        <li><a href="#verify">Verification</a></li>
+        <li><a href="#quickstart-classic">Quick Start: Classic ML</a></li>
+        <li><a href="#quickstart-nn">Quick Start: Neural Network</a></li>
+        <li><a href="#quickstart-llm">Quick Start: LLM Inference</a></li>
+        <li><a href="#php-ini">PHP INI Settings</a></li>
+      </ol>
+    </div>
+
+    <h2 id="requirements">Requirements</h2>
+    <table>
+      <thead><tr><th>Dependency</th><th>Version</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>PHP</td><td>8.2+</td><td>FFI extension must be enabled (<code>ffi.enable=true</code>)</td></tr>
+        <tr><td>Composer</td><td>2.x</td><td>PSR-4 autoloading</td></tr>
+        <tr><td>GCC</td><td>11+</td><td>AVX2 + OpenMP + C11</td></tr>
+        <tr><td>OpenBLAS</td><td>0.3+</td><td><code>libopenblas-dev</code></td></tr>
+        <tr><td>LAPACKE</td><td>any</td><td><code>liblapacke-dev</code></td></tr>
+        <tr><td>Linux x86-64</td><td>—</td><td>AVX2 CPU required (Intel Haswell / AMD Ryzen+)</td></tr>
+        <tr><td>Redis</td><td>6+</td><td>Only for the AutoML platform (<code>core/</code>), not for <code>src/</code></td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="install">Installation</h2>
+    <pre><code><span class="cm"># 1. Install system dependencies (Debian/Ubuntu)</span>
+sudo apt install gcc libopenblas-dev liblapacke-dev php8.2-cli php8.2-ffi
+
+<span class="cm"># 2. Clone the repo</span>
+git clone https://github.com/yourorg/pml-framework.git
+cd pml-framework
+
+<span class="cm"># 3. Install PHP dependencies</span>
+composer install</code></pre>
+
+    <h2 id="build-tensor">Building libtensor.so</h2>
+    <div class="callout callout-warn">
+      <strong>Important</strong>
+      <code>quant.c</code> is compiled into a separate <code>libquant.so</code> — do NOT include it in the libtensor.so build command.
+    </div>
+    <pre><code>cd src/Lib
+
+gcc -O3 -march=native -mtune=native -mfma \
+    -fno-math-errno -funsafe-math-optimizations \
+    -fopenmp -funroll-loops -fomit-frame-pointer \
+    -D_GNU_SOURCE -shared -fPIC \
+    -o libtensor.so.7 \
+    tensor.c dataset_io.c inference.c autograd.c graph.c tokenizer.c \
+    -lopenblas -llapacke -lm
+
+ln -sf libtensor.so.7 libtensor.so</code></pre>
+
+    <p>Verify the build:</p>
+    <pre><code>nm -D libtensor.so | grep tensor_ | head -20
+<span class="cm"># Should show: tensor_create, tensor_matmul, tensor_softmax, tensor_col_stats, etc.</span></code></pre>
+
+    <h2 id="build-quant">Building libquant.so</h2>
+    <pre><code>cd src/Lib
+
+gcc -O3 -march=native -mtune=native -mfma \
+    -fno-math-errno -funsafe-math-optimizations \
+    -fopenmp -funroll-loops -fomit-frame-pointer \
+    -D_GNU_SOURCE -shared -fPIC \
+    -o libquant.so.1 quant.c \
+    -lopenblas -lm
+
+ln -sf libquant.so.1 libquant.so</code></pre>
+    <pre><code>nm -D libquant.so | grep qweight_
+<span class="cm"># Should show: qweight_quantize, qweight_dequantize, qweight_linear, qweight_memory, qweight_free</span></code></pre>
+
+    <h2 id="build-vision">Building libvision.so</h2>
+    <pre><code>cd src/Lib
+
+gcc -O3 -march=native -mtune=native -mfma \
+    -fopenmp -funroll-loops -D_GNU_SOURCE -shared -fPIC \
+    -o libvision.so \
+    vision_core.c vision_io.c vision_transform.c vision_augment.c \
+    vision_detect.c vision_segment.c vision_feature.c vision_model.c \
+    -lopenblas -lm -ljpeg -lpng
+
+ln -sf libvision.so libvision.so</code></pre>
+
+    <h2 id="verify">Verification</h2>
+    <pre><code><span class="cm"># Quick smoke test</span>
+php -r "
+require 'vendor/autoload.php';
+use Pml\Lib\TensorEngine;
+use Pml\Tensor;
+
+<span class="va">\$a</span> = Tensor::randomNormal([<span class="nu">64</span>, <span class="nu">128</span>]);
+<span class="va">\$b</span> = Tensor::randomNormal([<span class="nu">128</span>, <span class="nu">32</span>]);
+<span class="va">\$c</span> = <span class="va">\$a</span>->matmul(<span class="va">\$b</span>);
+echo <span class="va">\$c</span>->shape()[<span class="nu">0</span>] . 'x' . <span class="va">\$c</span>->shape()[<span class="nu">1</span>] . PHP_EOL;
+<span class="cm">// → 64x32</span>
+"</code></pre>
+
+    <h2 id="quickstart-classic">Quick Start: Classic ML</h2>
+    <p>Train a GBDT classifier on tabular data:</p>
+    <pre><code><span class="kw">&lt;?php</span>
+<span class="kw">require</span> <span class="st">'vendor/autoload.php'</span>;
+
+<span class="kw">use</span> <span class="ty">Pml\Dataset</span>;
+<span class="kw">use</span> <span class="ty">Pml\Estimators\Classifiers\GBDTClassifier</span>;
+<span class="kw">use</span> <span class="ty">Pml\Transformers\StandardScaler</span>;
+<span class="kw">use</span> <span class="ty">Pml\Pipeline</span>;
+
+<span class="cm">// Load dataset from CSV (mmap — no PHP heap allocation)</span>
+<span class="va">$dataset</span> = <span class="ty">Dataset</span>::<span class="fn">fromCsv</span>(<span class="st">'data/iris.csv'</span>, labelColumn: <span class="st">'species'</span>);
+[<span class="va">$train</span>, <span class="va">$test</span>] = <span class="va">$dataset</span>-><span class="fn">stratifiedSplit</span>(<span class="nu">0.8</span>);
+
+<span class="cm">// Build pipeline: scaler + classifier</span>
+<span class="va">$pipeline</span> = <span class="kw">new</span> <span class="ty">Pipeline</span>([
+    <span class="kw">new</span> <span class="ty">StandardScaler</span>(),
+    <span class="kw">new</span> <span class="ty">GBDTClassifier</span>(
+        estimators: <span class="nu">200</span>,
+        learningRate: <span class="nu">0.1</span>,
+        maxDepth: <span class="nu">5</span>,
+    ),
+]);
+
+<span class="va">$pipeline</span>-><span class="fn">train</span>(<span class="va">$train</span>);
+<span class="va">$predictions</span> = <span class="va">$pipeline</span>-><span class="fn">predict</span>(<span class="va">$test</span>);
+
+<span class="cm">// Accuracy</span>
+<span class="va">$correct</span> = <span class="nu">0</span>;
+<span class="kw">foreach</span> (<span class="va">$test</span>-><span class="fn">labels</span>() <span class="kw">as</span> <span class="va">$i</span> => <span class="va">$label</span>) {
+    <span class="kw">if</span> (<span class="va">$predictions</span>[<span class="va">$i</span>] === <span class="va">$label</span>) <span class="va">$correct</span>++;
+}
+<span class="fn">echo</span> <span class="st">"Accuracy: "</span> . (<span class="va">$correct</span> / <span class="fn">count</span>(<span class="va">$test</span>)) * <span class="nu">100</span> . <span class="st">"%\n"</span>;</code></pre>
+
+    <h2 id="quickstart-nn">Quick Start: Neural Network</h2>
+    <p>Build and train a deep MLP with the Sequential API:</p>
+    <pre><code><span class="kw">&lt;?php</span>
+<span class="kw">require</span> <span class="st">'vendor/autoload.php'</span>;
+
+<span class="kw">use</span> <span class="ty">Pml\Dataset</span>;
+<span class="kw">use</span> <span class="ty">Pml\NeuralNetwork\Sequential</span>;
+<span class="kw">use</span> <span class="ty">Pml\NeuralNetwork\Layers\Dense</span>;
+<span class="kw">use</span> <span class="ty">Pml\NeuralNetwork\Layers\Dropout</span>;
+<span class="kw">use</span> <span class="ty">Pml\NeuralNetwork\Layers\BatchNormalization</span>;
+<span class="kw">use</span> <span class="ty">Pml\NeuralNetwork\Layers\ReLU</span>;
+<span class="kw">use</span> <span class="ty">Pml\NeuralNetwork\Layers\Softmax</span>;
+<span class="kw">use</span> <span class="ty">Pml\NeuralNetwork\Optimizers\AdamW</span>;
+<span class="kw">use</span> <span class="ty">Pml\Losses\CategoricalCrossEntropy</span>;
+<span class="kw">use</span> <span class="ty">Pml\Transformers\StandardScaler</span>;
+<span class="kw">use</span> <span class="ty">Psr\Log\NullLogger</span>;
+
+<span class="va">$dataset</span> = <span class="ty">Dataset</span>::<span class="fn">fromCsv</span>(<span class="st">'data/mnist_train.csv'</span>, labelColumn: <span class="st">'label'</span>);
+[<span class="va">$train</span>, <span class="va">$val</span>] = <span class="va">$dataset</span>-><span class="fn">stratifiedSplit</span>(<span class="nu">0.9</span>);
+
+<span class="va">$scaler</span> = <span class="kw">new</span> <span class="ty">StandardScaler</span>();
+<span class="va">$train</span> = <span class="va">$scaler</span>-><span class="fn">fitTransform</span>(<span class="va">$train</span>);
+<span class="va">$val</span>   = <span class="va">$scaler</span>-><span class="fn">transform</span>(<span class="va">$val</span>);
+
+<span class="va">$model</span> = <span class="kw">new</span> <span class="ty">Sequential</span>(
+    layers: [
+        <span class="kw">new</span> <span class="ty">Dense</span>(<span class="nu">784</span>, <span class="nu">512</span>),
+        <span class="kw">new</span> <span class="ty">BatchNormalization</span>(),
+        <span class="kw">new</span> <span class="ty">ReLU</span>(),
+        <span class="kw">new</span> <span class="ty">Dropout</span>(<span class="nu">0.3</span>),
+        <span class="kw">new</span> <span class="ty">Dense</span>(<span class="nu">512</span>, <span class="nu">256</span>),
+        <span class="kw">new</span> <span class="ty">ReLU</span>(),
+        <span class="kw">new</span> <span class="ty">Dropout</span>(<span class="nu">0.2</span>),
+        <span class="kw">new</span> <span class="ty">Dense</span>(<span class="nu">256</span>, <span class="nu">10</span>),
+        <span class="kw">new</span> <span class="ty">Softmax</span>(),
+    ],
+    lossFn: <span class="kw">new</span> <span class="ty">CategoricalCrossEntropy</span>(),
+    optimizer: <span class="kw">new</span> <span class="ty">AdamW</span>(lr: <span class="nu">3e-4</span>, weightDecay: <span class="nu">1e-4</span>),
+);
+
+<span class="va">$model</span>-><span class="fn">setLogger</span>(<span class="kw">new</span> <span class="ty">YourPsrLogger</span>());
+
+<span class="va">$model</span>-><span class="fn">train</span>(<span class="va">$train</span>,
+    epochs:       <span class="nu">30</span>,
+    batchSize:    <span class="nu">128</span>,
+    validation:   <span class="va">$val</span>,
+    patience:     <span class="nu">5</span>,
+    minDelta:     <span class="nu">1e-4</span>,
+    clipGradNorm: <span class="nu">1.0</span>,
+);
+
+<span class="cm">// Save to directory (config.json + model.safetensors)</span>
+<span class="va">$model</span>-><span class="fn">save</span>(<span class="st">'checkpoints/mnist'</span>);
+
+<span class="cm">// Inference (reload and quantize for 4× faster decode)</span>
+<span class="va">$loaded</span> = <span class="ty">Sequential</span>::<span class="fn">load</span>(<span class="st">'checkpoints/mnist'</span>);
+<span class="va">$loaded</span>-><span class="fn">quantize</span>(groupSize: <span class="nu">32</span>); <span class="cm">// INT8 block quantization</span>
+<span class="va">$preds</span>  = <span class="va">$loaded</span>-><span class="fn">predict</span>(<span class="va">$val</span>);</code></pre>
+
+    <h2 id="quickstart-llm">Quick Start: LLM Inference</h2>
+    <p>Run a LLaMA-style model using the built-in GQA inference engine:</p>
+    <pre><code><span class="kw">&lt;?php</span>
+<span class="kw">require</span> <span class="st">'vendor/autoload.php'</span>;
+
+<span class="kw">use</span> <span class="ty">Pml\Inference\InferenceSession</span>;
+<span class="kw">use</span> <span class="ty">Pml\Inference\ModelConfig</span>;
+<span class="kw">use</span> <span class="ty">Pml\Inference\Tokenizer</span>;
+
+<span class="cm">// Load model config from model directory (config.json + model.safetensors)</span>
+<span class="va">$config</span>  = <span class="ty">ModelConfig</span>::<span class="fn">fromFile</span>(<span class="st">'models/brain-slm/config.json'</span>);
+<span class="va">$session</span> = <span class="kw">new</span> <span class="ty">InferenceSession</span>(<span class="va">$config</span>);
+<span class="va">$tok</span>     = <span class="ty">Tokenizer</span>::<span class="fn">fromFile</span>(<span class="st">'models/brain-slm/tokenizer.json'</span>);
+
+<span class="va">$prompt</span>  = <span class="st">"Explain gradient descent in one paragraph:"</span>;
+<span class="va">$tokenIds</span>= <span class="va">$tok</span>-><span class="fn">encode</span>(<span class="va">$prompt</span>);
+
+<span class="cm">// Prefill + autoregressive decode with KV-cache</span>
+<span class="va">$session</span>-><span class="fn">prefill</span>(<span class="va">$tokenIds</span>);
+
+<span class="va">$output</span> = <span class="st">''</span>;
+<span class="kw">for</span> (<span class="va">$i</span> = <span class="nu">0</span>; <span class="va">$i</span> &lt; <span class="nu">200</span>; <span class="va">$i</span>++) {
+    <span class="va">$nextId</span> = <span class="va">$session</span>-><span class="fn">decodeStep</span>();     <span class="cm">// 2 FFI crossings, O(1)</span>
+    <span class="kw">if</span> (<span class="va">$nextId</span> === <span class="va">$tok</span>-><span class="fn">eosId</span>()) <span class="kw">break</span>;
+    <span class="va">$output</span> .= <span class="va">$tok</span>-><span class="fn">decode</span>([$nextId]);
+}
+
+<span class="fn">echo</span> <span class="va">$output</span>;</code></pre>
+
+    <h2 id="php-ini">PHP INI Settings</h2>
+    <div class="callout callout-info">
+      <strong>Required</strong>
+      FFI must be enabled in your <code>php.ini</code>. For production, use <code>ffi.enable=preload</code> with an opcache preload script for best performance.
+    </div>
+    <pre><code><span class="cm">; php.ini</span>
+ffi.enable = true
+memory_limit = 4G           <span class="cm">; large models need headroom</span>
+opcache.enable = 1
+opcache.jit = tracing
+opcache.jit_buffer_size = 256M
+
+<span class="cm">; Optional: preload TensorEngine cdef at server start (avoids parsing overhead)</span>
+opcache.preload = /path/to/src/preload.php
+opcache.preload_user = www-data</code></pre>
+
+    <div class="callout callout-tip">
+      <strong>Performance Tip</strong>
+      Set <code>OPENBLAS_NUM_THREADS</code> equal to your physical core count, not the HyperThread count.
+      For an 8-core machine: <code>OPENBLAS_NUM_THREADS=8 php your_script.php</code>
+    </div>
+
+  </div>
+
+  <footer>
+    <span>PML Framework</span>
+    <span>Next: <a href="tensor.html">Tensor API →</a></span>
+  </footer>
+</div>
+
+<script>
+function toggleGroup(el) {
+  el.classList.toggle('open');
+  el.nextElementSibling.classList.toggle('open');
+}
+document.getElementById('nav-search').addEventListener('input', function () {
+  const q = this.value.toLowerCase();
+  document.querySelectorAll('.nav-link').forEach(function (a) {
+    a.style.display = a.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+});
+</script>
+</body>
+</html>
